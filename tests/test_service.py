@@ -9,6 +9,7 @@ from tests.fixtures import write_article_fixture
 from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.service import (
     PipelineLockedError,
+    index_only,
     pipeline_lock,
     run_incremental,
 )
@@ -99,3 +100,14 @@ def test_existing_lock_prevents_concurrent_mutation(tmp_path: Path) -> None:
         pass
 
     assert not lock_path.exists()
+
+
+def test_manual_index_rebuild_respects_pipeline_lock(tmp_path: Path) -> None:
+    config = service_config(tmp_path)
+    lock_path = config.output_root / "state" / "pipeline.lock"
+
+    with (
+        pipeline_lock(lock_path),
+        pytest.raises(PipelineLockedError, match="already running"),
+    ):
+        index_only(config)

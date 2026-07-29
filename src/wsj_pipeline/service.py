@@ -234,6 +234,13 @@ def publish_all(config: PipelineConfig) -> dict[str, object]:
         }
 
 
+def index_only(config: PipelineConfig) -> IndexSummary:
+    """Rebuild the query index without racing another mutating command."""
+
+    with pipeline_lock(config.output_root / "state" / "pipeline.lock"):
+        return build_index(config, "manual-index")
+
+
 def run_smoke() -> RunSummary:
     """Run the whole pipeline against a generated temporary archive."""
 

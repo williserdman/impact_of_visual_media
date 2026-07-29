@@ -9,8 +9,8 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from wsj_pipeline.config import PipelineConfig
-from wsj_pipeline.index import build_index
 from wsj_pipeline.service import (
+    index_only,
     inventory_sources,
     process_only,
     publish_all,
@@ -79,7 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "publish":
             result = publish_all(config)
         elif args.command == "index":
-            result = build_index(config, "manual-index")
+            result = index_only(config)
         elif args.command == "validate":
             result = validate_outputs(config)
         elif args.command == "run":
