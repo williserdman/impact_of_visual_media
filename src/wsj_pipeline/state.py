@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import asdict, dataclass
@@ -13,6 +12,7 @@ from uuid import uuid4
 
 import duckdb
 
+from wsj_pipeline.canonical import derive_article_key
 from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.extract import EXTRACTOR_VERSION, ExtractionError, extract_article
 from wsj_pipeline.models import ExtractedArticle, SourceCandidate
@@ -267,7 +267,11 @@ class PipelineState:
         candidate: SourceCandidate,
         article: ExtractedArticle,
     ) -> str:
-        article_key = _provisional_article_key(article)
+        article_key = derive_article_key(
+            article.wsj_article_id,
+            article.canonical_url,
+            article.source_html_sha256,
+        )
         payload_json = json.dumps(
             _json_compatible(asdict(article)),
             ensure_ascii=False,
@@ -464,15 +468,6 @@ def _take(iterator: Iterator[SourceCandidate], count: int) -> Iterator[SourceCan
             yield next(iterator)
         except StopIteration:
             return
-
-
-def _provisional_article_key(article: ExtractedArticle) -> str:
-    if article.wsj_article_id:
-        return f"wsj:{article.wsj_article_id.strip()}"
-    if article.canonical_url:
-        digest = hashlib.sha256(article.canonical_url.encode()).hexdigest()
-        return f"url:{digest}"
-    return f"html:{article.source_html_sha256}"
 
 
 def _json_compatible(value: Any) -> Any:
