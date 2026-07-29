@@ -63,7 +63,7 @@
 - Produces: `main(argv: Sequence[str] | None = None) -> int`
 - Produces: `require_processing_scope(limit: int | None, full: bool) -> None`
 
-- [ ] **Step 1: Write failing configuration tests**
+- [x] **Step 1: Write failing configuration tests**
 
 ```python
 def test_config_resolves_relative_paths_from_project_root(tmp_path: Path) -> None:
@@ -77,13 +77,13 @@ def test_config_resolves_relative_paths_from_project_root(tmp_path: Path) -> Non
     assert config.output_root == tmp_path / "data/processed/wsj"
 ```
 
-- [ ] **Step 2: Run the configuration test and confirm it fails**
+- [x] **Step 2: Run the configuration test and confirm it fails**
 
 Run: `python -m pytest tests/test_config.py -v`
 
 Expected: import failure because `wsj_pipeline.config` does not exist.
 
-- [ ] **Step 3: Implement the package metadata and validated configuration**
+- [x] **Step 3: Implement the package metadata and validated configuration**
 
 Define a frozen `PipelineConfig` with `source_root`, `output_root`,
 `state_db`, `parquet_root`, `index_db`, `staging_root`, and positive
@@ -108,13 +108,13 @@ class PipelineConfig:
         return self.output_root / "state" / "pipeline.duckdb"
 ```
 
-- [ ] **Step 4: Run configuration tests**
+- [x] **Step 4: Run configuration tests**
 
 Run: `python -m pytest tests/test_config.py -v`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Write failing CLI safety tests**
+- [x] **Step 5: Write failing CLI safety tests**
 
 ```python
 @pytest.mark.parametrize("command", ["process", "run"])
@@ -130,7 +130,7 @@ def test_limit_and_full_are_mutually_exclusive() -> None:
     assert exc.value.code == 2
 ```
 
-- [ ] **Step 6: Implement the CLI parser and scope guard**
+- [x] **Step 6: Implement the CLI parser and scope guard**
 
 Add `inventory`, `process`, `publish`, `index`, `validate`, `run`, and `smoke`
 subcommands. `process` and `run` must use a required mutually exclusive group
@@ -151,7 +151,7 @@ scope.add_argument("--limit", type=positive_int)
 scope.add_argument("--full", action="store_true")
 ```
 
-- [ ] **Step 7: Run task tests and lint**
+- [x] **Step 7: Run task tests and lint**
 
 Run: `python -m pytest tests/test_config.py tests/test_cli_safety.py -v`
 
@@ -159,7 +159,7 @@ Run: `ruff check src tests`
 
 Expected: all tests and lint checks pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add pyproject.toml config src tests
@@ -178,7 +178,7 @@ git commit -m "build: scaffold safe WSJ pipeline CLI"
 - Produces: `discover_sources(source_root: Path, limit: int | None = None) -> Iterator[SourceCandidate]`
 - Consumes: `PipelineConfig.source_root`
 
-- [ ] **Step 1: Write failing discovery tests**
+- [x] **Step 1: Write failing discovery tests**
 
 Create a temporary archive with direct 2016 files, nested `2024/2024` files,
 hidden directories, `__MACOSX`, `backup`, a missing image, and two competing
@@ -195,13 +195,13 @@ assert candidates[0].relative_image_path == "2016/story_main_image.jpg"
 assert candidates[1].relative_image_path is None
 ```
 
-- [ ] **Step 2: Run discovery tests and confirm they fail**
+- [x] **Step 2: Run discovery tests and confirm they fail**
 
 Run: `python -m pytest tests/test_discovery.py -v`
 
 Expected: import failure for `wsj_pipeline.discovery`.
 
-- [ ] **Step 3: Implement focused data models and discovery**
+- [x] **Step 3: Implement focused data models and discovery**
 
 Use `os.walk` with excluded directory names removed in-place, accept
 case-insensitive `.html`, match sibling images against the exact
@@ -222,7 +222,7 @@ def discover_sources(
         yield _candidate_for(source_root, html_path)
 ```
 
-- [ ] **Step 4: Run discovery tests and lint**
+- [x] **Step 4: Run discovery tests and lint**
 
 Run: `python -m pytest tests/test_discovery.py -v`
 
@@ -230,7 +230,7 @@ Run: `ruff check src/wsj_pipeline/models.py src/wsj_pipeline/discovery.py tests/
 
 Expected: all checks pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/wsj_pipeline/models.py src/wsj_pipeline/discovery.py tests/test_discovery.py
@@ -253,7 +253,7 @@ git commit -m "feat: discover and pair WSJ archive sources"
 - Produces: `derive_publication_dates(published_at_utc: datetime) -> PublicationDates`
 - Consumes: `SourceCandidate` from Task 2.
 
-- [ ] **Step 1: Generate representative fixture helpers**
+- [x] **Step 1: Generate representative fixture helpers**
 
 Implement `write_article_fixture(...)` to create UTF-8 WSJ-like HTML with
 meta tags, JSON-LD, an `<article>` containing `p[data-type="paragraph"]`,
@@ -273,7 +273,7 @@ def write_article_fixture(
 ) -> Path: ...
 ```
 
-- [ ] **Step 2: Write failing metadata/body extraction tests**
+- [x] **Step 2: Write failing metadata/body extraction tests**
 
 Assert extraction of article ID, normalized canonical URL, headlines, summary,
 authors, keywords, section/type, ordered paragraphs, joined body text, source
@@ -281,13 +281,13 @@ SHA-256, JSON-LD caption/credit, relative image path, and warnings. Assert
 author-bio, related-card, advertisement, caption, and dynamic-inset paragraphs
 are excluded.
 
-- [ ] **Step 3: Run extraction tests and confirm they fail**
+- [x] **Step 3: Run extraction tests and confirm they fail**
 
 Run: `python -m pytest tests/test_extract.py -v`
 
 Expected: import failure for `wsj_pipeline.extract`.
 
-- [ ] **Step 4: Implement HTML extraction**
+- [x] **Step 4: Implement HTML extraction**
 
 Parse HTML bytes once with Beautiful Soup’s `lxml` parser while updating the
 SHA-256. Prefer WSJ meta fields, use JSON-LD fallbacks, restrict body extraction
@@ -308,13 +308,13 @@ def extract_article(
     return _build_article(candidate, html_sha256, metadata, json_ld, paragraphs)
 ```
 
-- [ ] **Step 5: Run extraction tests**
+- [x] **Step 5: Run extraction tests**
 
 Run: `python -m pytest tests/test_extract.py -v`
 
 Expected: all extraction tests pass.
 
-- [ ] **Step 6: Write failing timestamp and timezone tests**
+- [x] **Step 6: Write failing timestamp and timezone tests**
 
 Cover `Z`, explicit offsets, invalid/missing timestamps, UTC/New York date
 differences, 2024 spring-forward, and 2024 fall-back. Assert the authoritative
@@ -329,7 +329,7 @@ assert dates.publication_date_utc.isoformat() == "2024-01-01"
 assert dates.publication_date_new_york.isoformat() == "2023-12-31"
 ```
 
-- [ ] **Step 7: Implement date parsing and derivation**
+- [x] **Step 7: Implement date parsing and derivation**
 
 Use `datetime.fromisoformat` after translating terminal `Z` to `+00:00`,
 normalize to `timezone.utc`, and convert with
@@ -350,7 +350,7 @@ def parse_wsj_timestamp(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 ```
 
-- [ ] **Step 8: Run extraction/date tests and lint**
+- [x] **Step 8: Run extraction/date tests and lint**
 
 Run: `python -m pytest tests/test_extract.py tests/test_dates.py -v`
 
@@ -358,7 +358,7 @@ Run: `ruff check src/wsj_pipeline/extract.py tests/fixtures.py tests/test_extrac
 
 Expected: all checks pass.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add src/wsj_pipeline/extract.py tests/fixtures.py tests/test_extract.py tests/test_dates.py
@@ -380,19 +380,19 @@ git commit -m "feat: extract normalized WSJ article records"
 - Produces: `PipelineState.store_failure(run_id: str, candidate: SourceCandidate, error: ExtractionError) -> None`
 - Produces: `process_candidates(config: PipelineConfig, candidates: Iterable[SourceCandidate], run_id: str) -> ProcessSummary`
 
-- [ ] **Step 1: Write failing state-schema and run-lifecycle tests**
+- [x] **Step 1: Write failing state-schema and run-lifecycle tests**
 
 Assert first-open schema creation, UUID run IDs, timestamps, successful and
 failed run completion, context-manager cleanup, and rejection of incompatible
 schema versions.
 
-- [ ] **Step 2: Run state tests and confirm they fail**
+- [x] **Step 2: Run state tests and confirm they fail**
 
 Run: `python -m pytest tests/test_state.py -v`
 
 Expected: import failure for `wsj_pipeline.state`.
 
-- [ ] **Step 3: Implement the DuckDB state schema**
+- [x] **Step 3: Implement the DuckDB state schema**
 
 Create `metadata`, `runs`, `source_manifest`, `extracted_sources`, `failures`,
 `canonical_sources`, and `duplicates` tables. Store normalized article payloads
@@ -416,20 +416,20 @@ class PipelineState:
     ) -> None: ...
 ```
 
-- [ ] **Step 4: Run state tests**
+- [x] **Step 4: Run state tests**
 
 Run: `python -m pytest tests/test_state.py -v`
 
 Expected: all state tests pass.
 
-- [ ] **Step 5: Write failing incremental-processing tests**
+- [x] **Step 5: Write failing incremental-processing tests**
 
 Test that a first run extracts all fixture candidates, an unchanged second run
 extracts zero, an mtime-only change with identical HTML hash updates manifest
 metadata without replacing the logical payload, a content change extracts one,
 and one malformed source records a failure without preventing later candidates.
 
-- [ ] **Step 6: Implement classification and bounded batch processing**
+- [x] **Step 6: Implement classification and bounded batch processing**
 
 Classify by relative path, stat tuple, and extractor version. For stat changes,
 extract and compare the content hash inside one transaction. Commit after the
@@ -449,7 +449,7 @@ def process_candidates(
     return _summarize_processing(config.state_db, run_id)
 ```
 
-- [ ] **Step 7: Run state/incremental tests and lint**
+- [x] **Step 7: Run state/incremental tests and lint**
 
 Run: `python -m pytest tests/test_state.py tests/test_incremental.py -v`
 
@@ -457,7 +457,7 @@ Run: `ruff check src/wsj_pipeline/state.py tests/test_state.py tests/test_increm
 
 Expected: all checks pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/wsj_pipeline/state.py tests/test_state.py tests/test_incremental.py
@@ -476,25 +476,25 @@ git commit -m "feat: persist incremental WSJ processing state"
 - Produces: `recompute_canonical(state: PipelineState, article_keys: Collection[str]) -> CanonicalSummary`
 - Consumes: typed ranking and payload columns in `PipelineState`.
 
-- [ ] **Step 1: Write failing identity tests**
+- [x] **Step 1: Write failing identity tests**
 
 Assert prefixed WSJ IDs are stable, URL normalization removes fragments and
 normalizes scheme/host/trailing slash, and HTML hash is the final fallback.
 
-- [ ] **Step 2: Write failing deterministic ranking tests**
+- [x] **Step 2: Write failing deterministic ranking tests**
 
 Construct duplicates varying one criterion at a time and verify the exact
 precedence: valid date, nonempty body, word count, metadata completeness,
 `updated_at_utc`, then lexical source path. Assert nonwinners record winner,
 rank, and a machine-readable reason.
 
-- [ ] **Step 3: Run canonicalization tests and confirm they fail**
+- [x] **Step 3: Run canonicalization tests and confirm they fail**
 
 Run: `python -m pytest tests/test_canonical.py -v`
 
 Expected: import failure for `wsj_pipeline.canonical`.
 
-- [ ] **Step 4: Implement identity, ranking, and affected-key recomputation**
+- [x] **Step 4: Implement identity, ranking, and affected-key recomputation**
 
 Make ranking pure and deterministic. Recompute only supplied article keys in a
 transaction, replacing their prior canonical/duplicate rows. Store old and new
@@ -513,7 +513,7 @@ def rank_candidate(article: ExtractedArticle) -> tuple[object, ...]:
     )
 ```
 
-- [ ] **Step 5: Run canonicalization tests and lint**
+- [x] **Step 5: Run canonicalization tests and lint**
 
 Run: `python -m pytest tests/test_canonical.py -v`
 
@@ -521,7 +521,7 @@ Run: `ruff check src/wsj_pipeline/canonical.py tests/test_canonical.py`
 
 Expected: all checks pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/wsj_pipeline/canonical.py tests/test_canonical.py
@@ -541,25 +541,25 @@ git commit -m "feat: canonicalize duplicate WSJ articles"
 - Produces: `publish_audits(state: PipelineState, config: PipelineConfig, run_id: str) -> None`
 - Consumes: canonical state and affected `PartitionKey(year: int, month: int)`.
 
-- [ ] **Step 1: Write failing schema tests**
+- [x] **Step 1: Write failing schema tests**
 
 Assert exact field names and types, including UTC timestamp timezone, New York
 timestamp timezone, date32 fields, list-of-string authors/keywords/paragraphs,
 nullable image fields, quality fields, and `schema_version`.
 
-- [ ] **Step 2: Write failing partition-publication tests**
+- [x] **Step 2: Write failing partition-publication tests**
 
 Publish fixtures spanning two New York months. Assert Hive-style directory
 names, one deterministically sorted `articles.parquet` per month, no duplicate
 article keys, correct date/partition agreement, and native list columns.
 
-- [ ] **Step 3: Run publication tests and confirm they fail**
+- [x] **Step 3: Run publication tests and confirm they fail**
 
 Run: `python -m pytest tests/test_publish.py -v`
 
 Expected: import failure for `wsj_pipeline.publish`.
 
-- [ ] **Step 4: Implement explicit Arrow conversion and affected partitions**
+- [x] **Step 4: Implement explicit Arrow conversion and affected partitions**
 
 Decode canonical payload JSON in bounded monthly groups, convert using
 `ARTICLE_SCHEMA`, sort by `(published_at_utc, article_key)`, write compressed
@@ -581,7 +581,7 @@ def publish_partitions(
     return PublishSummary(partitions_written=len(partitions))
 ```
 
-- [ ] **Step 5: Implement audit Parquet publication**
+- [x] **Step 5: Implement audit Parquet publication**
 
 Publish deterministic duplicates, failures, missing images, and runs datasets
 with explicit schemas. Audit rows contain keys, paths, codes, counts, and
@@ -596,7 +596,7 @@ AUDIT_EXPORTS = {
 }
 ```
 
-- [ ] **Step 6: Write and run atomicity tests**
+- [x] **Step 6: Write and run atomicity tests**
 
 Monkeypatch the replacement step to fail after staging. Assert the prior
 published file retains its checksum and can still be read. Then rerun normally
@@ -606,13 +606,13 @@ Run: `python -m pytest tests/test_publish.py tests/test_publish_atomicity.py -v`
 
 Expected: all tests pass.
 
-- [ ] **Step 7: Run lint**
+- [x] **Step 7: Run lint**
 
 Run: `ruff check src/wsj_pipeline/publish.py tests/test_publish.py tests/test_publish_atomicity.py`
 
 Expected: no findings.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/wsj_pipeline/publish.py tests/test_publish.py tests/test_publish_atomicity.py
@@ -632,20 +632,20 @@ git commit -m "feat: publish atomic partitioned Parquet datasets"
 - Produces: `validate_outputs(config: PipelineConfig) -> ValidationReport`
 - Produces: `ValidationReport.ok: bool` and `ValidationReport.issues: tuple[ValidationIssue, ...]`
 
-- [ ] **Step 1: Write failing index tests**
+- [x] **Step 1: Write failing index tests**
 
 From published fixture Parquet, assert `articles`, `publication_index`,
 `daily_publication_counts`, `duplicates`, `failures`, `missing_images`, and
 `runs` are queryable. Assert exact/range date queries return ordered keys and
 the materialized index contains no body column.
 
-- [ ] **Step 2: Run index tests and confirm they fail**
+- [x] **Step 2: Run index tests and confirm they fail**
 
 Run: `python -m pytest tests/test_index.py -v`
 
 Expected: import failure for `wsj_pipeline.index`.
 
-- [ ] **Step 3: Implement transactional index creation**
+- [x] **Step 3: Implement transactional index creation**
 
 Build a run-specific temporary DuckDB file, create Parquet-backed views with
 portable paths relative to the index location, materialize
@@ -665,19 +665,19 @@ FROM articles
 ORDER BY publication_date_new_york, published_at_utc, article_key;
 ```
 
-- [ ] **Step 4: Run index tests**
+- [x] **Step 4: Run index tests**
 
 Run: `python -m pytest tests/test_index.py -v`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Write failing validation tests**
+- [x] **Step 5: Write failing validation tests**
 
 Introduce duplicate article keys, mismatched partition dates, missing audit
 winner references, and a Parquet/index key mismatch one at a time. Assert each
 produces its documented stable issue code and a non-OK report.
 
-- [ ] **Step 6: Implement cross-artifact validation**
+- [x] **Step 6: Implement cross-artifact validation**
 
 Check schema version, unique/non-null keys, partition/date consistency, audit
 references, canonical Parquet versus index key equality, and UTC/New York date
@@ -693,7 +693,7 @@ class ValidationReport:
         return not self.issues
 ```
 
-- [ ] **Step 7: Run index/validation tests and lint**
+- [x] **Step 7: Run index/validation tests and lint**
 
 Run: `python -m pytest tests/test_index.py tests/test_validate.py -v`
 
@@ -701,7 +701,7 @@ Run: `ruff check src/wsj_pipeline/index.py src/wsj_pipeline/validate.py tests/te
 
 Expected: all checks pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/wsj_pipeline/index.py src/wsj_pipeline/validate.py tests/test_index.py tests/test_validate.py
@@ -721,7 +721,7 @@ git commit -m "feat: build and validate publication-date index"
 - Produces: concrete CLI handlers for every subcommand.
 - Consumes: discovery, extraction/state, canonicalization, publication, index, and validation interfaces from Tasks 2–7.
 
-- [ ] **Step 1: Write failing end-to-end service tests**
+- [x] **Step 1: Write failing end-to-end service tests**
 
 Run a fixture archive through the service and assert canonical/audit outputs.
 Run it unchanged and assert zero extractions and identical article Parquet
@@ -729,13 +729,13 @@ checksums. Add a `2025/2025` folder and assert only those sources are processed.
 Modify a duplicate winner and assert only its affected monthly partition
 changes.
 
-- [ ] **Step 2: Run service tests and confirm they fail**
+- [x] **Step 2: Run service tests and confirm they fail**
 
 Run: `python -m pytest tests/test_service.py -v`
 
 Expected: import failure for `wsj_pipeline.service`.
 
-- [ ] **Step 3: Implement orchestration and locking**
+- [x] **Step 3: Implement orchestration and locking**
 
 Add a filesystem lock created atomically under the output state directory.
 Begin/finish runs in `PipelineState`, process candidates, recompute affected
@@ -753,7 +753,7 @@ def run_incremental(
         return _run_stages(config, candidates, reconcile_missing=full)
 ```
 
-- [ ] **Step 4: Wire every CLI command**
+- [x] **Step 4: Wire every CLI command**
 
 Load configuration once, print resolved source/output roots and candidate scope,
 emit compact JSON summaries, map validation failures to exit code 1 and usage
@@ -768,7 +768,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 ```
 
-- [ ] **Step 5: Write and run CLI smoke tests**
+- [x] **Step 5: Write and run CLI smoke tests**
 
 Invoke `main(["smoke"])` and assert success. Invoke bounded `inventory` and
 `run --limit 2` on fixtures. Assert no command defaults to the real archive and
@@ -778,7 +778,7 @@ Run: `python -m pytest tests/test_service.py tests/test_smoke.py tests/test_cli_
 
 Expected: all tests pass.
 
-- [ ] **Step 6: Run the complete fixture-only suite**
+- [x] **Step 6: Run the complete fixture-only suite**
 
 Run: `python -m pytest -q`
 
@@ -787,7 +787,7 @@ Run: `ruff check .`
 Expected: all tests pass and Ruff reports no findings. Do not run an unbounded
 command against `data/wsj_archive`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/wsj_pipeline/service.py src/wsj_pipeline/cli.py tests/test_service.py tests/test_smoke.py
@@ -808,14 +808,14 @@ git commit -m "feat: orchestrate incremental WSJ pipeline"
   layouts, date semantics, DuckDB queries, recovery, and parser limitations.
 - Documents: mandatory safety/invariant rules for future coding agents.
 
-- [ ] **Step 1: Write README command examples and operational semantics**
+- [x] **Step 1: Write README command examples and operational semantics**
 
 Include commands for editable installation, `wsj-pipeline smoke`, bounded
 inventory/processing, deliberately authorized `--full` execution, validation,
 and DuckDB exact/range date queries. Explain that a real full run is expected
 to be long-running and is not performed during implementation.
 
-- [ ] **Step 2: Write project `AGENTS.md`**
+- [x] **Step 2: Write project `AGENTS.md`**
 
 State that agents must keep the raw archive immutable, never run `--full`
 without explicit current-task authorization, use fixture or small limited
@@ -823,19 +823,19 @@ smoke tests, keep all data ignored, preserve identity/date/idempotence
 invariants, add regression fixtures for parser changes, update schema/design
 docs when behavior changes, and avoid logging licensed article text.
 
-- [ ] **Step 3: Harden ignore and attribute rules**
+- [x] **Step 3: Harden ignore and attribute rules**
 
 Ensure `/data/`, `/artifacts/`, `/outputs/`, DuckDB, Parquet, Arrow, logs,
 caches, and local environments are ignored. Preserve text LF rules and binary
 image/data attributes. Do not stage any raw or generated dataset.
 
-- [ ] **Step 4: Reconcile design documentation with implementation**
+- [x] **Step 4: Reconcile design documentation with implementation**
 
 Compare actual commands, schemas, paths, and failure behavior against the
 design. Update concrete differences; do not weaken the raw-data, full-run,
 date, atomicity, audit, or idempotence requirements.
 
-- [ ] **Step 5: Verify tracked-file and data safety**
+- [x] **Step 5: Verify tracked-file and data safety**
 
 Run: `git status --short`
 
@@ -844,7 +844,7 @@ Run: `git ls-files | rg '^(data|artifacts|outputs)/'`
 Expected: the second command prints nothing; no generated database, Parquet,
 archive, image, or HTML file is staged.
 
-- [ ] **Step 6: Run final fixture-only verification**
+- [x] **Step 6: Run final fixture-only verification**
 
 Run: `python -m pytest -q`
 
@@ -854,7 +854,7 @@ Run: `wsj-pipeline smoke`
 
 Expected: all commands pass without reading `data/wsj_archive`.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add README.md AGENTS.md .gitignore .gitattributes docs/superpowers/specs
