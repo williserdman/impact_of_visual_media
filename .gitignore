@@ -1,0 +1,78 @@
+# Agent/tool local state and linked worktrees
+/.agent-ledgers/
+/.agents/
+/.codex/
+/.worktrees/
+
+# Local, licensed, broker, and derived data
+/data/
+/datasets/
+/raw/
+/staging/
+/private/
+/secrets/
+/credentials/
+/flex/
+/Jts/
+
+# Generated research/runtime state
+/artifacts/
+/checkpoints/
+/models/
+/outputs/
+/runs/
+/var/
+/object-store/
+/postgres-data/
+/vast-staging/
+/reports/generated/
+
+# Credentials and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+
+# Dataset/model/archive formats are never source fixtures in sprint 1
+*.parquet
+*.arrow
+*.feather
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.pickle
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Python/test/build/runtime caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+*.log
+*.sqlite*
+
+# Operating-system and editor-local metadata
+.DS_Store
+._*
+.idea/
+.vscode/
