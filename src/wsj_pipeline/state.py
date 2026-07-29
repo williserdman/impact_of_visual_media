@@ -17,7 +17,7 @@ from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.extract import EXTRACTOR_VERSION, ExtractionError, extract_article
 from wsj_pipeline.models import ExtractedArticle, SourceCandidate
 
-STATE_SCHEMA_VERSION = "1"
+STATE_SCHEMA_VERSION = "2"
 
 
 class StateError(RuntimeError):
@@ -47,6 +47,7 @@ class ProcessSummary:
     reprocessed: int = 0
     succeeded: int = 0
     failed: int = 0
+    removed: int = 0
     affected_article_keys: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
@@ -141,7 +142,8 @@ class PipelineState:
                 extractor_version VARCHAR NOT NULL,
                 status VARCHAR NOT NULL,
                 article_key VARCHAR,
-                last_run_id VARCHAR NOT NULL
+                last_run_id VARCHAR NOT NULL,
+                last_seen_run_id VARCHAR NOT NULL
             )
             """,
             """
@@ -190,6 +192,20 @@ class PipelineState:
                 reason VARCHAR NOT NULL,
                 run_id VARCHAR NOT NULL,
                 PRIMARY KEY (article_key, source_path)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS pending_article_keys (
+                article_key VARCHAR PRIMARY KEY,
+                enqueued_run_id VARCHAR NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS dirty_partitions (
+                publication_year_ny INTEGER NOT NULL,
+                publication_month_ny INTEGER NOT NULL,
+                enqueued_run_id VARCHAR NOT NULL,
+                PRIMARY KEY (publication_year_ny, publication_month_ny)
             )
             """,
         )
@@ -241,13 +257,16 @@ class PipelineState:
         row = self.connection.execute(
             """
             SELECT html_size, html_mtime_ns, image_path, image_size,
-                   image_mtime_ns, html_sha256, extractor_version, article_key
+                   image_mtime_ns, html_sha256, extractor_version, article_key,
+                   status
             FROM source_manifest
             WHERE source_path = ?
             """,
             [candidate.relative_html_path],
         ).fetchone()
         if row is None:
+            return CandidateStatus("new")
+        if row[8] == "missing":
             return CandidateStatus("new")
         old_hash = row[5]
         old_key = row[7]
@@ -322,6 +341,7 @@ class PipelineState:
             status="processed",
             article_key=article_key,
         )
+        self.enqueue_article_key(article_key, run_id)
         return article_key
 
     def store_failure(
@@ -374,6 +394,98 @@ class PipelineState:
             article_key=article_key,
         )
 
+    def mark_seen(self, source_path: str, run_id: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE source_manifest
+            SET last_seen_run_id = ?
+            WHERE source_path = ?
+            """,
+            [run_id, source_path],
+        )
+
+    def reconcile_missing(self, run_id: str) -> int:
+        """Remove extracted rows not observed during one complete inventory."""
+
+        missing = self.connection.execute(
+            """
+            SELECT source_path, article_key
+            FROM source_manifest
+            WHERE last_seen_run_id != ?
+              AND status != 'missing'
+            ORDER BY source_path
+            """,
+            [run_id],
+        ).fetchall()
+        self.connection.execute("BEGIN TRANSACTION")
+        try:
+            for source_path, article_key in missing:
+                if article_key:
+                    self.enqueue_article_key(article_key, run_id)
+                self.connection.execute(
+                    "DELETE FROM extracted_sources WHERE source_path = ?",
+                    [source_path],
+                )
+                self.connection.execute(
+                    """
+                    UPDATE source_manifest
+                    SET status = 'missing',
+                        article_key = NULL,
+                        last_run_id = ?
+                    WHERE source_path = ?
+                    """,
+                    [run_id, source_path],
+                )
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        else:
+            self.connection.execute("COMMIT")
+        return len(missing)
+
+    def enqueue_article_key(self, article_key: str, run_id: str) -> None:
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO pending_article_keys
+            VALUES (?, ?)
+            """,
+            [article_key, run_id],
+        )
+
+    def pending_keys(self) -> tuple[str, ...]:
+        return tuple(
+            row[0]
+            for row in self.connection.execute(
+                """
+                SELECT article_key
+                FROM pending_article_keys
+                ORDER BY article_key
+                """
+            ).fetchall()
+        )
+
+    def dirty_partition_keys(self) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (row[0], row[1])
+            for row in self.connection.execute(
+                """
+                SELECT publication_year_ny, publication_month_ny
+                FROM dirty_partitions
+                ORDER BY publication_year_ny, publication_month_ny
+                """
+            ).fetchall()
+        )
+
+    def clear_dirty_partition(self, year: int, month: int) -> None:
+        self.connection.execute(
+            """
+            DELETE FROM dirty_partitions
+            WHERE publication_year_ny = ?
+              AND publication_month_ny = ?
+            """,
+            [year, month],
+        )
+
     def _upsert_manifest(
         self,
         run_id: str,
@@ -385,8 +497,12 @@ class PipelineState:
     ) -> None:
         self.connection.execute(
             """
-            INSERT OR REPLACE INTO source_manifest VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            INSERT OR REPLACE INTO source_manifest (
+                source_path, html_size, html_mtime_ns, image_path,
+                image_size, image_mtime_ns, html_sha256, extractor_version,
+                status, article_key, last_run_id, last_seen_run_id
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             [
@@ -400,6 +516,7 @@ class PipelineState:
                 EXTRACTOR_VERSION,
                 status,
                 article_key,
+                run_id,
                 run_id,
             ],
         )
@@ -435,10 +552,12 @@ def process_candidates(
                     counters["discovered"] += 1
                     status = state.classify(candidate, EXTRACTOR_VERSION)
                     if status.kind == "unchanged":
+                        state.mark_seen(candidate.relative_html_path, run_id)
                         counters["unchanged"] += 1
                         continue
                     if status.kind == "stale_extractor":
                         if not reprocess_stale:
+                            state.mark_seen(candidate.relative_html_path, run_id)
                             counters["stale"] += 1
                             continue
                         counters["reprocessed"] += 1
@@ -449,6 +568,10 @@ def process_candidates(
                     except ExtractionError as error:
                         if status.old_article_key:
                             affected.add(status.old_article_key)
+                            state.enqueue_article_key(
+                                status.old_article_key,
+                                run_id,
+                            )
                         state.store_failure(run_id, candidate, error)
                         counters["failed"] += 1
                         continue
@@ -472,6 +595,10 @@ def process_candidates(
                         counters["changed"] += 1
                     if status.old_article_key:
                         affected.add(status.old_article_key)
+                        state.enqueue_article_key(
+                            status.old_article_key,
+                            run_id,
+                        )
                     affected.add(state.store_success(run_id, candidate, article))
                     counters["succeeded"] += 1
             except Exception:

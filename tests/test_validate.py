@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from tests.test_index import build_indexed_outputs
 from wsj_pipeline.validate import validate_outputs
@@ -75,3 +77,93 @@ def test_validation_detects_stale_index_keys(tmp_path: Path) -> None:
     report = validate_outputs(config)
 
     assert "index_key_mismatch" in {issue.code for issue in report.issues}
+
+
+def test_validation_detects_stale_index_values(tmp_path: Path) -> None:
+    config, _run_id, _summary = build_indexed_outputs(tmp_path)
+    with duckdb.connect(str(config.index_db)) as connection:
+        [published_at_utc] = connection.execute(
+            """
+            SELECT published_at_utc
+            FROM publication_index
+            WHERE article_key = 'wsj:JANUARY'
+            """
+        ).fetchone()
+        connection.execute(
+            """
+            UPDATE publication_index
+            SET published_at_utc = ?
+            WHERE article_key = 'wsj:JANUARY'
+            """,
+            [published_at_utc + timedelta(hours=1)],
+        )
+
+    report = validate_outputs(config)
+
+    assert "index_value_mismatch" in {issue.code for issue in report.issues}
+
+
+def test_validation_projects_article_columns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _run_id, _summary = build_indexed_outputs(tmp_path)
+    real_iter_batches = pq.ParquetFile.iter_batches
+    projected_columns: list[tuple[str, ...]] = []
+
+    def track_iter_batches(parquet_file, *args, **kwargs):
+        columns = tuple(kwargs["columns"])
+        projected_columns.append(columns)
+        return real_iter_batches(parquet_file, *args, **kwargs)
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", track_iter_batches)
+
+    report = validate_outputs(config)
+
+    assert report.ok
+    assert projected_columns
+    assert all("body_text" not in columns for columns in projected_columns)
+
+
+def test_validation_detects_null_article_key(tmp_path: Path) -> None:
+    config, _run_id, _summary = build_indexed_outputs(tmp_path)
+    january = article_files(config)[1]
+    table = pq.read_table(january, partitioning=None)
+    null_keys = pa.array([None] * table.num_rows, type=pa.string())
+    table = table.set_column(
+        table.schema.get_field_index("article_key"),
+        "article_key",
+        null_keys,
+    )
+    pq.write_table(table, january)
+
+    report = validate_outputs(config)
+
+    assert "null_article_key" in {issue.code for issue in report.issues}
+
+
+def test_duplicate_winner_must_match_same_article_key(tmp_path: Path) -> None:
+    config, _run_id, _summary = build_indexed_outputs(tmp_path)
+    duplicate_path = config.parquet_root / "audit" / "duplicates.parquet"
+    rows = pq.read_table(duplicate_path).to_pylist()
+    rows[0]["winner_source_path"] = "2023/late-utc.html"
+    pq.write_table(pa.Table.from_pylist(rows), duplicate_path)
+
+    report = validate_outputs(config)
+
+    assert "invalid_duplicate_winner" in {issue.code for issue in report.issues}
+
+
+def test_validation_detects_unpublished_operational_state(tmp_path: Path) -> None:
+    config, run_id, _summary = build_indexed_outputs(tmp_path)
+    with duckdb.connect(str(config.state_db)) as connection:
+        connection.execute(
+            "INSERT INTO dirty_partitions VALUES (2024, 1, ?)",
+            [run_id],
+        )
+
+    report = validate_outputs(config)
+
+    assert "unpublished_state_changes" in {
+        issue.code for issue in report.issues
+    }

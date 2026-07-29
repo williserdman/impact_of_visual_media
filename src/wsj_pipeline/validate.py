@@ -13,6 +13,18 @@ from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.extract import derive_publication_dates
 from wsj_pipeline.publish import ARTICLE_SCHEMA_VERSION
 
+ARTICLE_VALIDATION_COLUMNS = (
+    "schema_version",
+    "article_key",
+    "source_path",
+    "published_at_utc",
+    "publication_date_utc",
+    "published_at_new_york",
+    "publication_date_new_york",
+    "publication_year_ny",
+    "publication_month_ny",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ValidationIssue:
@@ -49,24 +61,34 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
         return ValidationReport(tuple(issues))
 
     for path in article_files:
-        table = pq.read_table(path, partitioning=None)
-        rows = table.to_pylist()
-        article_rows.extend(rows)
         directory_year, directory_month = _partition_from_path(path)
-        if any(
-            row["publication_year_ny"] != directory_year
-            or row["publication_month_ny"] != directory_month
-            or row["publication_date_new_york"].year != directory_year
-            or row["publication_date_new_york"].month != directory_month
-            for row in rows
+        partition_mismatch = False
+        schema_mismatch = False
+        parquet_file = pq.ParquetFile(path)
+        for batch in parquet_file.iter_batches(
+            columns=list(ARTICLE_VALIDATION_COLUMNS),
+            batch_size=65_536,
         ):
+            rows = batch.to_pylist()
+            article_rows.extend(rows)
+            partition_mismatch = partition_mismatch or any(
+                row["publication_year_ny"] != directory_year
+                or row["publication_month_ny"] != directory_month
+                or row["publication_date_new_york"].year != directory_year
+                or row["publication_date_new_york"].month != directory_month
+                for row in rows
+            )
+            schema_mismatch = schema_mismatch or any(
+                row["schema_version"] != ARTICLE_SCHEMA_VERSION for row in rows
+            )
+        if partition_mismatch:
             issues.append(
                 ValidationIssue(
                     "partition_date_mismatch",
                     f"{path.name} contains rows outside its year/month partition",
                 )
             )
-        if any(row["schema_version"] != ARTICLE_SCHEMA_VERSION for row in rows):
+        if schema_mismatch:
             issues.append(
                 ValidationIssue(
                     "schema_version_mismatch",
@@ -74,7 +96,8 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
                 )
             )
 
-    keys = [str(row["article_key"]) for row in article_rows]
+    raw_keys = [row["article_key"] for row in article_rows]
+    keys = [key for key in raw_keys if isinstance(key, str) and key]
     duplicate_keys = [key for key, count in Counter(keys).items() if count > 1]
     if duplicate_keys:
         issues.append(
@@ -83,7 +106,7 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
                 f"canonical Parquet contains {len(duplicate_keys)} duplicate keys",
             )
         )
-    if any(not key for key in keys):
+    if len(keys) != len(raw_keys):
         issues.append(
             ValidationIssue(
                 "null_article_key",
@@ -100,7 +123,8 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
         )
 
     _validate_duplicate_references(config, article_rows, issues)
-    _validate_index_keys(config, keys, issues)
+    _validate_index(config, article_rows, issues)
+    _validate_state_queues(config, issues)
     return ValidationReport(
         tuple(sorted(issues, key=lambda issue: (issue.code, issue.message)))
     )
@@ -118,9 +142,13 @@ def _partition_from_path(path: Path) -> tuple[int, int]:
 
 
 def _date_fields_match(row: dict[str, object]) -> bool:
-    derived = derive_publication_dates(row["published_at_utc"])
+    try:
+        derived = derive_publication_dates(row["published_at_utc"])
+    except (AttributeError, TypeError, ValueError):
+        return False
     return (
         derived.publication_date_utc == row["publication_date_utc"]
+        and derived.published_at_new_york == row["published_at_new_york"]
         and derived.publication_date_new_york == row["publication_date_new_york"]
         and derived.publication_year_ny == row["publication_year_ny"]
         and derived.publication_month_ny == row["publication_month_ny"]
@@ -133,12 +161,18 @@ def _validate_duplicate_references(
     issues: list[ValidationIssue],
 ) -> None:
     path = config.parquet_root / "audit" / "duplicates.parquet"
-    duplicate_rows = pq.read_table(path).to_pylist()
-    canonical_paths = {row["source_path"] for row in article_rows}
+    duplicate_rows = pq.read_table(
+        path,
+        columns=["article_key", "winner_source_path"],
+    ).to_pylist()
+    canonical_references = {
+        (row["article_key"], row["source_path"]) for row in article_rows
+    }
     invalid = [
         row
         for row in duplicate_rows
-        if row["winner_source_path"] not in canonical_paths
+        if (row["article_key"], row["winner_source_path"])
+        not in canonical_references
     ]
     if invalid:
         issues.append(
@@ -149,22 +183,61 @@ def _validate_duplicate_references(
         )
 
 
-def _validate_index_keys(
+def _validate_index(
     config: PipelineConfig,
-    parquet_keys: list[str],
+    article_rows: list[dict[str, object]],
     issues: list[ValidationIssue],
 ) -> None:
+    columns = (
+        "article_key",
+        "source_path",
+        "published_at_utc",
+        "publication_date_utc",
+        "published_at_new_york",
+        "publication_date_new_york",
+    )
+    parquet_values = [tuple(row[column] for column in columns) for row in article_rows]
     with duckdb.connect(str(config.index_db), read_only=True) as connection:
-        index_keys = [
-            row[0]
-            for row in connection.execute(
-                "SELECT article_key FROM publication_index"
-            ).fetchall()
-        ]
-    if set(parquet_keys) != set(index_keys) or len(parquet_keys) != len(index_keys):
+        index_values = connection.execute(
+            f"SELECT {', '.join(columns)} FROM publication_index"
+        ).fetchall()
+    parquet_keys = [row[0] for row in parquet_values]
+    index_keys = [row[0] for row in index_values]
+    if Counter(parquet_keys) != Counter(index_keys):
         issues.append(
             ValidationIssue(
                 "index_key_mismatch",
                 "canonical Parquet and publication_index keys differ",
+            )
+        )
+    elif Counter(parquet_values) != Counter(index_values):
+        issues.append(
+            ValidationIssue(
+                "index_value_mismatch",
+                "canonical Parquet and publication_index values differ",
+            )
+        )
+
+
+def _validate_state_queues(
+    config: PipelineConfig,
+    issues: list[ValidationIssue],
+) -> None:
+    with duckdb.connect(str(config.state_db), read_only=True) as connection:
+        pending, dirty = connection.execute(
+            """
+            SELECT
+                (SELECT count(*) FROM pending_article_keys),
+                (SELECT count(*) FROM dirty_partitions)
+            """
+        ).fetchone()
+    if pending or dirty:
+        issues.append(
+            ValidationIssue(
+                "unpublished_state_changes",
+                (
+                    f"operational state has {pending} pending keys "
+                    f"and {dirty} dirty partitions"
+                ),
             )
         )

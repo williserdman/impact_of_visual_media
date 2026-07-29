@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from tests.test_publish import build_published_state
 from wsj_pipeline.index import build_index
@@ -90,4 +91,14 @@ def test_rebuilt_index_replaces_prior_database(tmp_path: Path) -> None:
     with duckdb.connect(str(config.index_db), read_only=True) as connection:
         tables = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
     assert "stale_table" not in tables
+    assert list(config.staging_root.rglob("*.duckdb")) == []
+
+
+def test_failed_index_build_cleans_staged_database(tmp_path: Path) -> None:
+    config, run_id, _summary = build_indexed_outputs(tmp_path)
+    (config.parquet_root / "audit" / "duplicates.parquet").unlink()
+
+    with pytest.raises(duckdb.IOException):
+        build_index(config, f"{run_id}-failed")
+
     assert list(config.staging_root.rglob("*.duckdb")) == []

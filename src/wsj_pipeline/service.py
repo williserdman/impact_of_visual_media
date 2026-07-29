@@ -8,10 +8,10 @@ import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from wsj_pipeline.canonical import recompute_canonical
+from wsj_pipeline.canonical import PartitionKey, recompute_canonical
 from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.discovery import discover_sources
 from wsj_pipeline.index import IndexSummary, build_index
@@ -122,15 +122,25 @@ def run_incremental(
                 reprocess_stale=reprocess,
             )
             with PipelineState.open(config.state_db) as state:
-                canonical = recompute_canonical(
+                if full:
+                    processing = replace(
+                        processing,
+                        removed=state.reconcile_missing(run_id),
+                    )
+                pending_keys = state.pending_keys()
+                recompute_canonical(
                     state,
-                    processing.affected_article_keys,
+                    pending_keys,
                     run_id,
+                )
+                dirty_partitions = tuple(
+                    PartitionKey(year, month)
+                    for year, month in state.dirty_partition_keys()
                 )
                 publication = publish_partitions(
                     state,
                     config,
-                    canonical.affected_partitions,
+                    dirty_partitions,
                     run_id,
                 )
                 publish_audits(state, config, run_id)
@@ -185,6 +195,12 @@ def process_only(
                 run_id,
                 reprocess_stale=reprocess,
             )
+            if full:
+                with PipelineState.open(config.state_db) as state:
+                    summary = replace(
+                        summary,
+                        removed=state.reconcile_missing(run_id),
+                    )
         except Exception as error:
             with PipelineState.open(config.state_db) as state:
                 state.finish_run(
@@ -208,25 +224,43 @@ def publish_all(config: PipelineConfig) -> dict[str, object]:
     with pipeline_lock(config.output_root / "state" / "pipeline.lock"):
         with PipelineState.open(config.state_db) as state:
             run_id = state.begin_run("publish", "all-state")
-            article_keys = [
-                row[0]
-                for row in state.connection.execute(
-                    "SELECT DISTINCT article_key FROM extracted_sources"
-                ).fetchall()
-            ]
-            canonical = recompute_canonical(state, article_keys, run_id)
-            publication = publish_partitions(
-                state,
-                config,
-                canonical.affected_partitions,
-                run_id,
-            )
-            state.finish_run(
-                run_id,
-                status="succeeded",
-                summary=asdict(publication),
-            )
-            publish_audits(state, config, run_id)
+        try:
+            with PipelineState.open(config.state_db) as state:
+                article_keys = sorted(
+                    set(state.pending_keys())
+                    | {
+                        row[0]
+                        for row in state.connection.execute(
+                            "SELECT DISTINCT article_key FROM extracted_sources"
+                        ).fetchall()
+                    }
+                )
+                canonical = recompute_canonical(state, article_keys, run_id)
+                dirty_partitions = tuple(
+                    PartitionKey(year, month)
+                    for year, month in state.dirty_partition_keys()
+                )
+                publication = publish_partitions(
+                    state,
+                    config,
+                    dirty_partitions,
+                    run_id,
+                )
+                state.finish_run(
+                    run_id,
+                    status="succeeded",
+                    summary=asdict(publication),
+                )
+                publish_audits(state, config, run_id)
+        except Exception as error:
+            with suppress(Exception), PipelineState.open(config.state_db) as state:
+                state.finish_run(
+                    run_id,
+                    status="failed",
+                    summary={"error_type": type(error).__name__},
+                )
+                publish_audits(state, config, run_id)
+            raise
         return {
             "run_id": run_id,
             **asdict(publication),

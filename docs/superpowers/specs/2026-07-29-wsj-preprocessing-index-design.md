@@ -101,8 +101,10 @@ or a structured failure. It uses, in order:
 Body output includes both an ordered list of cleaned paragraphs and a
 double-newline-joined `body_text`. Whitespace and Unicode are normalized without
 lowercasing, stemming, sentence splitting, summarizing, or otherwise changing
-editorial meaning. Raw metadata selected during parsing is retained as compact
-JSON for forward compatibility. Raw full HTML is not copied into Parquet.
+editorial meaning. If no editorial paragraphs are found, the record is retained
+with an empty body and an `empty_body` warning; a later extractor version can
+reprocess it. Raw metadata selected during parsing is retained as compact JSON
+for forward compatibility. Raw full HTML is not copied into Parquet.
 
 Every extracted row records the extractor version, source content hash,
 extraction timestamp, extraction warnings, and source-relative paths.
@@ -168,7 +170,8 @@ timestamps. Schema versioning is explicit and checked before publication.
 ### Operational state and incremental publication
 
 `pipeline.duckdb` stores runs, the source manifest, extracted source records,
-failures, and duplicate decisions. A run:
+failures, duplicate decisions, pending article keys, and dirty publication
+partitions. A run:
 
 1. acquires an exclusive pipeline lock;
 2. inventories sources and identifies new, changed, and optionally missing
@@ -183,8 +186,18 @@ failures, and duplicate decisions. A run:
 8. records a run summary and releases the lock.
 
 An interrupted extraction can resume from committed batches. An interrupted
-publication leaves the previous partition intact. Re-running with no source or
-extractor-version changes is a no-op apart from a run record.
+publication leaves the previous partition intact. Each committed extraction
+change durably enqueues its article key. Canonical recomputation atomically
+replaces the decision, records its old and new month partitions as dirty, and
+then clears the pending key. A dirty partition is cleared only after its staged
+Parquet replacement succeeds. Therefore a retry drains committed work even
+when all discovered source fingerprints are unchanged.
+
+A successful `--full` inventory records every seen manifest path and marks
+previously known, unseen sources missing before canonicalization. This removal
+reconciliation is never performed for `--limit` runs or interrupted
+inventories. Re-running with no source, extractor-version, or pending-state
+changes is a no-op apart from a run record.
 
 A changed extractor/schema version does not trigger an accidental archive-wide
 run. The CLI reports those records as stale and requires an explicit
@@ -235,8 +248,12 @@ relationships.
 
 Fatal conditions stop publication: incompatible schema, corrupt operational
 state, lock contention, duplicate published article keys, partition/date
-mismatch, invalid timezone handling, or an index whose article keys differ
-from canonical Parquet.
+mismatch, invalid timezone handling, unpublished state queues, or an index
+whose article provenance/date values differ from canonical Parquet.
+
+Corpus validation iterates projected Parquet batches containing only schema,
+identity, provenance, and publication-date columns. It never loads article body
+columns into Python.
 
 Logs must not include article bodies, secrets, or licensed content excerpts.
 

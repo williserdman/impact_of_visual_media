@@ -4,11 +4,9 @@ import hashlib
 import json
 from pathlib import Path
 
-import pytest
-
 from tests.fixtures import write_article_fixture
 from wsj_pipeline.discovery import discover_sources
-from wsj_pipeline.extract import EXTRACTOR_VERSION, ExtractionError, extract_article
+from wsj_pipeline.extract import EXTRACTOR_VERSION, extract_article
 
 
 def extract_only_article(archive: Path):
@@ -109,7 +107,7 @@ def test_json_ld_supplies_authors_when_meta_author_is_absent(
     assert article.authors == ("Alice Reporter", "Bob Editor")
 
 
-def test_missing_body_raises_content_free_error(tmp_path: Path) -> None:
+def test_missing_body_is_retained_with_warning(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     html_path = write_article_fixture(
         archive,
@@ -126,8 +124,10 @@ def test_missing_body_raises_content_free_error(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(ExtractionError) as exc:
-        extract_only_article(archive)
+    article = extract_only_article(archive)
 
-    assert exc.value.code == "missing_body"
-    assert secret_text not in str(exc.value)
+    assert article.body_text == ""
+    assert article.body_paragraphs == ()
+    assert article.body_word_count == 0
+    assert "empty_body" in article.warnings
+    assert secret_text not in article.raw_metadata_json

@@ -26,6 +26,8 @@ changing pipeline behavior.
   snapshots, fixtures, documentation, or commits.
 - Missing header images are valid data and belong in the audit output, not a
   fatal error.
+- Empty extracted bodies are retained with an `empty_body` warning so they can
+  participate in deterministic ranking and future parser reprocessing.
 
 ## Archive facts
 
@@ -70,10 +72,17 @@ preprocessing package.
 - Parquet partitions use New York publication year/month and contain unique
   canonical article keys.
 - Unchanged runs do not re-extract or rewrite article partitions.
+- Committed extraction changes must enqueue durable article keys. Canonical
+  changes must enqueue durable old/new month partitions, and queues are cleared
+  only after their downstream transaction or atomic file replacement succeeds.
+- Only a completed `--full` inventory may mark previously known source paths
+  missing. A bounded `--limit` run must never reconcile unseen paths.
 - Changed partitions and the DuckDB index are staged, validated, and atomically
   replaced.
 - Duplicate, failure, missing-image, and run audits contain provenance but no
   article-body text.
+- Corpus validation must project only required provenance/date columns from
+  article Parquet; do not materialize body columns in Python.
 - `process` and `run` must continue to require exactly one of `--limit` or
   `--full`.
 

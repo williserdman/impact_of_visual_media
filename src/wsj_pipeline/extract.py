@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup, Tag
 
 from wsj_pipeline.models import ExtractedArticle, PublicationDates, SourceCandidate
 
-EXTRACTOR_VERSION = "1"
+EXTRACTOR_VERSION = "2"
 NEW_YORK = ZoneInfo("America/New_York")
 _WORD_PATTERN = re.compile(r"\b[\w\u2019'-]+\b", re.UNICODE)
 _EXCLUDED_ANCESTOR_TOKENS = (
@@ -89,10 +89,6 @@ def extract_article(
     image_object = _first_typed_object(json_ld, "ImageObject")
 
     paragraphs = _extract_body_paragraphs(soup)
-    if not paragraphs:
-        raise ExtractionError(
-            "missing_body", "no editorial article paragraphs were found"
-        )
 
     published = parse_wsj_timestamp(
         _first_value(metadata, "article.published", "datePublished")
@@ -108,6 +104,8 @@ def extract_article(
     body_text = "\n\n".join(paragraphs)
     body_word_count = len(_WORD_PATTERN.findall(body_text))
     warnings = list(candidate.warnings)
+    if not paragraphs:
+        warnings.append("empty_body")
     declared_word_count = _parse_int(_first_value(metadata, "article:word_count"))
     if declared_word_count is not None and abs(
         declared_word_count - body_word_count

@@ -150,6 +150,7 @@ def publish_partitions(
             / "articles.parquet"
         )
         _write_atomic_table(table, target, config.staging_root, run_id)
+        state.clear_dirty_partition(partition.year, partition.month)
         rows_written += table.num_rows
 
     return PublishSummary(

@@ -91,7 +91,13 @@ def recompute_canonical(
                 [article_key],
             ).fetchone()
             if old:
-                affected_partitions.add(PartitionKey(old[0], old[1]))
+                old_partition = PartitionKey(old[0], old[1])
+                affected_partitions.add(old_partition)
+                _mark_partition_dirty(
+                    state,
+                    old_partition,
+                    run_id,
+                )
 
             rows = state.connection.execute(
                 """
@@ -111,6 +117,10 @@ def recompute_canonical(
                 [article_key],
             )
             if not rows:
+                state.connection.execute(
+                    "DELETE FROM pending_article_keys WHERE article_key = ?",
+                    [article_key],
+                )
                 continue
 
             articles = [
@@ -118,12 +128,12 @@ def recompute_canonical(
             ]
             articles.sort(key=rank_candidate)
             winner = articles[0]
-            affected_partitions.add(
-                PartitionKey(
-                    winner.publication_year_ny,
-                    winner.publication_month_ny,
-                )
+            winner_partition = PartitionKey(
+                winner.publication_year_ny,
+                winner.publication_month_ny,
             )
+            affected_partitions.add(winner_partition)
+            _mark_partition_dirty(state, winner_partition, run_id)
             state.connection.execute(
                 "INSERT INTO canonical_sources VALUES (?, ?, ?, ?, ?)",
                 [
@@ -147,6 +157,10 @@ def recompute_canonical(
                     ],
                 )
                 duplicates_recorded += 1
+            state.connection.execute(
+                "DELETE FROM pending_article_keys WHERE article_key = ?",
+                [article_key],
+            )
     except Exception:
         state.connection.execute("ROLLBACK")
         raise
@@ -219,3 +233,17 @@ def _duplicate_reason(
     if winner.updated_at_utc != duplicate.updated_at_utc:
         return "older_update"
     return "lexical_tiebreak"
+
+
+def _mark_partition_dirty(
+    state: PipelineState,
+    partition: PartitionKey,
+    run_id: str,
+) -> None:
+    state.connection.execute(
+        """
+        INSERT OR REPLACE INTO dirty_partitions
+        VALUES (?, ?, ?)
+        """,
+        [partition.year, partition.month, run_id],
+    )

@@ -40,8 +40,9 @@ def build_index(config: PipelineConfig, run_id: str) -> IndexSummary:
     if staged.exists():
         staged.unlink()
 
-    connection = duckdb.connect(str(staged))
+    connection: duckdb.DuckDBPyConnection | None = None
     try:
+        connection = duckdb.connect(str(staged))
         connection.execute(
             f"""
             CREATE VIEW articles AS
@@ -108,12 +109,12 @@ def build_index(config: PipelineConfig, run_id: str) -> IndexSummary:
             last_publication_date_new_york=row[2],
         )
         connection.execute("CHECKPOINT")
-    finally:
         connection.close()
-
-    try:
+        connection = None
         os.replace(staged, config.index_db)
     finally:
+        if connection is not None:
+            connection.close()
         if staged.exists():
             staged.unlink()
         with suppress(OSError):

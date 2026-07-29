@@ -119,7 +119,7 @@ def test_content_change_replaces_one_extracted_payload(tmp_path: Path) -> None:
 
 def test_malformed_source_does_not_stop_later_candidate(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
-    write_article_fixture(archive, "2016/a-malformed.html", paragraphs=())
+    write_article_fixture(archive, "2016/a-malformed.html", published=None)
     write_article_fixture(archive, "2016/b-valid.html")
     config = config_for(tmp_path, archive)
 
@@ -134,7 +134,10 @@ def test_malformed_source_does_not_stop_later_candidate(tmp_path: Path) -> None:
         extracted_paths = connection.execute(
             "SELECT source_path FROM extracted_sources"
         ).fetchall()
-    assert failure[0:2] == ("2016/a-malformed.html", "missing_body")
+    assert failure[0:2] == (
+        "2016/a-malformed.html",
+        "missing_publication_timestamp",
+    )
     assert "First paragraph" not in failure[2]
     assert extracted_paths == [("2016/b-valid.html",)]
 

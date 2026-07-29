@@ -85,7 +85,10 @@ Use a durable terminal such as `tmux` for that operator-authorized run. This
 repository's implementation and verification did not launch it.
 
 On later `--full` runs, the pipeline inventories all paths but parses only new
-or changed sources. Add 2024–2026 folders under `data/wsj_archive`, then use:
+or changed sources. A completed full inventory also reconciles HTML files that
+were removed since the prior full run; bounded `--limit` runs never infer
+deletions from unseen paths. Add 2024–2026 folders under `data/wsj_archive`,
+then use:
 
 ```bash
 .venv/bin/wsj-pipeline inventory
@@ -216,13 +219,20 @@ Extraction commits bounded batches. Monthly Parquet and the query index are
 written to staging, reopened for validation, and atomically replaced. An
 interruption cannot partially overwrite a valid partition.
 
+Committed extraction work is recorded in a durable pending-key queue.
+Canonical changes similarly record durable dirty month partitions before
+publication. If a run stops between stages, rerunning the same command drains
+those queues even when every source file is otherwise unchanged.
+
 ```bash
 .venv/bin/wsj-pipeline validate
 ```
 
-Validation checks schema versions, unique article keys, partition/date
-agreement, UTC/New York derivations, duplicate-winner references, and equality
-between canonical Parquet and the materialized date index.
+Validation scans only compact provenance/date columns—not article bodies—and
+checks schema versions, unique article keys, partition/date agreement, UTC/New
+York derivations, duplicate-winner references, durable publication queues, and
+full provenance/date equality between canonical Parquet and the materialized
+date index.
 
 Mutating commands use `data/processed/wsj/state/pipeline.lock`. If a process
 dies without cleanup, first verify no pipeline process is active, then remove

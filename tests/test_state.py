@@ -7,10 +7,12 @@ from wsj_pipeline.state import PipelineState, StateError
 
 EXPECTED_TABLES = {
     "canonical_sources",
+    "dirty_partitions",
     "duplicates",
     "extracted_sources",
     "failures",
     "metadata",
+    "pending_article_keys",
     "runs",
     "source_manifest",
 }
@@ -29,7 +31,7 @@ def test_open_creates_versioned_operational_schema(tmp_path: Path) -> None:
         ).fetchone()[0]
 
     assert tables == EXPECTED_TABLES
-    assert schema_version == "1"
+    assert schema_version == "2"
 
 
 def test_run_lifecycle_records_scope_counts_and_status(tmp_path: Path) -> None:
