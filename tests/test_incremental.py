@@ -169,3 +169,34 @@ def test_stale_extractor_requires_explicit_reprocess(tmp_path: Path) -> None:
     assert skipped.succeeded == 0
     assert reprocessed.reprocessed == 1
     assert reprocessed.succeeded == 1
+
+
+def test_image_only_change_refreshes_extracted_image_fields(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2016/one.html",
+        with_image=False,
+    )
+    config = config_for(tmp_path, archive)
+    run_process(config)
+    html_path.with_name(f"{html_path.stem}_main_image.webp").write_bytes(
+        b"new-image"
+    )
+
+    summary = run_process(config)
+
+    with duckdb.connect(str(config.state_db), read_only=True) as connection:
+        payload = json.loads(
+            connection.execute(
+                "SELECT payload_json FROM extracted_sources"
+            ).fetchone()[0]
+        )
+    assert summary.changed == 1
+    assert summary.succeeded == 1
+    assert summary.metadata_only == 0
+    assert payload["image_present"] is True
+    assert payload["relative_image_path"] == "2016/one_main_image.webp"
+    assert payload["image_size_bytes"] == len(b"new-image")

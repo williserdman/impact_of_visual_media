@@ -31,6 +31,7 @@ class CandidateStatus:
     kind: str
     old_html_sha256: str | None = None
     old_article_key: str | None = None
+    image_changed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,7 +262,20 @@ class PipelineState:
         )
         if tuple(row[:5]) == current_fingerprint:
             return CandidateStatus("unchanged", old_hash, old_key)
-        return CandidateStatus("stat_changed", old_hash, old_key)
+        old_image_fingerprint = tuple(row[2:5])
+        current_image_fingerprint = (
+            candidate.relative_image_path,
+            candidate.image_size,
+            candidate.image_mtime_ns,
+        )
+        return CandidateStatus(
+            "stat_changed",
+            old_hash,
+            old_key,
+            image_changed=(
+                old_image_fingerprint != current_image_fingerprint
+            ),
+        )
 
     def store_success(
         self,
@@ -441,6 +455,7 @@ def process_candidates(
 
                     if (
                         status.kind != "stale_extractor"
+                        and not status.image_changed
                         and status.old_html_sha256
                         and article.source_html_sha256 == status.old_html_sha256
                     ):
