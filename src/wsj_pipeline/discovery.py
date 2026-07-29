@@ -27,8 +27,9 @@ def discover_sources(
         key=lambda path: path.relative_to(source_root).as_posix(),
     )
     selected = html_paths if limit is None else html_paths[:limit]
+    image_indexes: dict[Path, dict[str, list[Path]]] = {}
     for html_path in selected:
-        yield _candidate_for(source_root, html_path)
+        yield _candidate_for(source_root, html_path, image_indexes)
 
 
 def _walk_html(source_root: Path) -> Iterator[Path]:
@@ -44,9 +45,13 @@ def _walk_html(source_root: Path) -> Iterator[Path]:
                 yield root / file_name
 
 
-def _candidate_for(source_root: Path, html_path: Path) -> SourceCandidate:
+def _candidate_for(
+    source_root: Path,
+    html_path: Path,
+    image_indexes: dict[Path, dict[str, list[Path]]],
+) -> SourceCandidate:
     html_stat = html_path.stat()
-    image_paths = _matching_images(html_path)
+    image_paths = _matching_images(html_path, image_indexes)
     warnings: list[str] = []
 
     if not image_paths:
@@ -72,15 +77,23 @@ def _candidate_for(source_root: Path, html_path: Path) -> SourceCandidate:
     )
 
 
-def _matching_images(html_path: Path) -> list[Path]:
+def _matching_images(
+    html_path: Path,
+    image_indexes: dict[Path, dict[str, list[Path]]],
+) -> list[Path]:
     target_stem = f"{html_path.stem}_main_image".casefold()
-    matches = [
-        candidate
-        for candidate in html_path.parent.iterdir()
-        if candidate.is_file()
-        and candidate.stem.casefold() == target_stem
-        and candidate.suffix.casefold() in _IMAGE_PRIORITY
-    ]
+    if html_path.parent not in image_indexes:
+        directory_index: dict[str, list[Path]] = {}
+        for candidate in html_path.parent.iterdir():
+            if (
+                candidate.is_file()
+                and candidate.suffix.casefold() in _IMAGE_PRIORITY
+            ):
+                directory_index.setdefault(
+                    candidate.stem.casefold(), []
+                ).append(candidate)
+        image_indexes[html_path.parent] = directory_index
+    matches = image_indexes[html_path.parent].get(target_stem, [])
     return sorted(
         matches,
         key=lambda path: (

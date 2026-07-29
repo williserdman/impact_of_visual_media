@@ -83,3 +83,25 @@ def test_candidate_records_html_stat_fingerprint(tmp_path: Path) -> None:
 
     assert candidate.html_size == len(b"article bytes")
     assert candidate.html_mtime_ns == stat.st_mtime_ns
+
+
+def test_image_pairing_scans_each_source_directory_once(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    archive = tmp_path / "archive"
+    folder = archive / "2016"
+    for index in range(4):
+        create_file(folder / f"story-{index}.html")
+        create_file(folder / f"story-{index}_main_image.jpg")
+    real_iterdir = Path.iterdir
+    scanned_directories: list[Path] = []
+
+    def counted_iterdir(path: Path):
+        scanned_directories.append(path)
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", counted_iterdir)
+
+    assert len(list(discover_sources(archive))) == 4
+    assert scanned_directories.count(folder) == 1
