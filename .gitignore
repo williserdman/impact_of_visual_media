@@ -70,6 +70,8 @@ dist/
 *.egg-info/
 *.log
 *.sqlite*
+*.duckdb
+*.duckdb.wal
 
 # Operating-system and editor-local metadata
 .DS_Store

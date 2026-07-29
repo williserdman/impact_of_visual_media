@@ -24,6 +24,7 @@
 *.onnx binary
 *.p12 binary
 *.parquet binary
+*.duckdb binary
 *.pdf binary
 *.pfx binary
 *.pickle binary

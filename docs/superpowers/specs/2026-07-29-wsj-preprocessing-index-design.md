@@ -187,8 +187,8 @@ publication leaves the previous partition intact. Re-running with no source or
 extractor-version changes is a no-op apart from a run record.
 
 A changed extractor/schema version does not trigger an accidental archive-wide
-run. The CLI reports that records are stale and requires an explicit
-`--reprocess` scope.
+run. The CLI reports those records as stale and requires an explicit
+`--reprocess` switch in addition to the normal `--limit` or `--full` scope.
 
 ### DuckDB publication-date index
 
@@ -202,8 +202,10 @@ and contains:
 - views over duplicate, failure, missing-image, and run audits.
 
 The index stores article keys and dates rather than duplicating article bodies.
-Typical queries by exact date or bounded date range are documented in the
-README.
+Its Parquet-backed views use the resolved output location so they work
+regardless of the caller's current directory. Moving the output directory
+requires rerunning the inexpensive `index` command. Typical queries by exact
+date or bounded date range are documented in the README.
 
 ## CLI and Safety
 
