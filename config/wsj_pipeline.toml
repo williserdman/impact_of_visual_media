@@ -1,0 +1,6 @@
+[paths]
+source = "data/wsj_archive"
+output = "data/processed/wsj"
+
+[pipeline]
+batch_size = 250
