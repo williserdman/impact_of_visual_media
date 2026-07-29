@@ -54,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
         scope = command_parser.add_mutually_exclusive_group(required=True)
         scope.add_argument("--limit", type=positive_int)
         scope.add_argument("--full", action="store_true")
+        command_parser.add_argument("--reprocess", action="store_true")
 
     return parser
 
@@ -73,6 +74,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config,
                 limit=args.limit,
                 full=args.full,
+                reprocess=args.reprocess,
             )
         elif args.command == "publish":
             result = publish_all(config)
@@ -85,6 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config,
                 limit=args.limit,
                 full=args.full,
+                reprocess=args.reprocess,
             )
         else:
             raise AssertionError(f"unhandled command {args.command}")

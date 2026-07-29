@@ -22,6 +22,24 @@ def test_limit_and_full_are_mutually_exclusive() -> None:
     assert exc.value.code == 2
 
 
+def test_reprocess_still_requires_a_bounded_or_explicit_full_scope() -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["run", "--reprocess"])
+
+    assert exc.value.code == 2
+
+
+def test_reprocess_is_accepted_with_limit() -> None:
+    args = build_parser().parse_args(
+        ["run", "--limit", "3", "--reprocess"]
+    )
+
+    assert args.limit == 3
+    assert args.reprocess is True
+
+
 @pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
 def test_limit_must_be_a_positive_integer(value: str) -> None:
     parser = build_parser()

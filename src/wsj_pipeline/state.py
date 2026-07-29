@@ -42,6 +42,8 @@ class ProcessSummary:
     changed: int = 0
     metadata_only: int = 0
     unchanged: int = 0
+    stale: int = 0
+    reprocessed: int = 0
     succeeded: int = 0
     failed: int = 0
     affected_article_keys: tuple[str, ...] = ()
@@ -393,6 +395,8 @@ def process_candidates(
     config: PipelineConfig,
     candidates: Iterable[SourceCandidate],
     run_id: str,
+    *,
+    reprocess_stale: bool = False,
 ) -> ProcessSummary:
     """Extract candidates incrementally in bounded committed batches."""
 
@@ -402,6 +406,8 @@ def process_candidates(
         "changed": 0,
         "metadata_only": 0,
         "unchanged": 0,
+        "stale": 0,
+        "reprocessed": 0,
         "succeeded": 0,
         "failed": 0,
     }
@@ -418,8 +424,10 @@ def process_candidates(
                         counters["unchanged"] += 1
                         continue
                     if status.kind == "stale_extractor":
-                        counters["unchanged"] += 1
-                        continue
+                        if not reprocess_stale:
+                            counters["stale"] += 1
+                            continue
+                        counters["reprocessed"] += 1
                     if status.kind == "new":
                         counters["new"] += 1
                     try:
@@ -432,7 +440,8 @@ def process_candidates(
                         continue
 
                     if (
-                        status.old_html_sha256
+                        status.kind != "stale_extractor"
+                        and status.old_html_sha256
                         and article.source_html_sha256 == status.old_html_sha256
                     ):
                         state.update_metadata_only(

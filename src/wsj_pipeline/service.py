@@ -102,11 +102,14 @@ def run_incremental(
     *,
     limit: int | None,
     full: bool,
+    reprocess: bool = False,
 ) -> RunSummary:
     """Run incremental extraction through validated publication."""
 
     _require_scope(limit, full)
     scope = "full" if full else f"limit:{limit}"
+    if reprocess:
+        scope = f"{scope},reprocess"
     lock_path = config.output_root / "state" / "pipeline.lock"
     with pipeline_lock(lock_path):
         with PipelineState.open(config.state_db) as state:
@@ -116,6 +119,7 @@ def run_incremental(
                 config,
                 discover_sources(config.source_root, limit=limit),
                 run_id,
+                reprocess_stale=reprocess,
             )
             with PipelineState.open(config.state_db) as state:
                 canonical = recompute_canonical(
@@ -163,11 +167,14 @@ def process_only(
     *,
     limit: int | None,
     full: bool,
+    reprocess: bool = False,
 ) -> ProcessSummary:
     """Run only incremental inventory/extraction state updates."""
 
     _require_scope(limit, full)
     scope = "full" if full else f"limit:{limit}"
+    if reprocess:
+        scope = f"{scope},reprocess"
     with pipeline_lock(config.output_root / "state" / "pipeline.lock"):
         with PipelineState.open(config.state_db) as state:
             run_id = state.begin_run("process", scope)
@@ -176,6 +183,7 @@ def process_only(
                 config,
                 discover_sources(config.source_root, limit=limit),
                 run_id,
+                reprocess_stale=reprocess,
             )
         except Exception as error:
             with PipelineState.open(config.state_db) as state:

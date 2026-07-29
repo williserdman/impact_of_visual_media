@@ -137,3 +137,35 @@ def test_malformed_source_does_not_stop_later_candidate(tmp_path: Path) -> None:
     assert failure[0:2] == ("2016/a-malformed.html", "missing_body")
     assert "First paragraph" not in failure[2]
     assert extracted_paths == [("2016/b-valid.html",)]
+
+
+def test_stale_extractor_requires_explicit_reprocess(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2016/one.html")
+    config = config_for(tmp_path, archive)
+    run_process(config)
+    with duckdb.connect(str(config.state_db)) as connection:
+        connection.execute(
+            "UPDATE source_manifest SET extractor_version = 'older'"
+        )
+
+    with PipelineState.open(config.state_db) as state:
+        skipped_run_id = state.begin_run("process", "limit:fixture")
+    skipped = process_candidates(
+        config,
+        discover_sources(config.source_root),
+        skipped_run_id,
+    )
+    with PipelineState.open(config.state_db) as state:
+        reprocess_run_id = state.begin_run("process", "limit:fixture,reprocess")
+    reprocessed = process_candidates(
+        config,
+        discover_sources(config.source_root),
+        reprocess_run_id,
+        reprocess_stale=True,
+    )
+
+    assert skipped.stale == 1
+    assert skipped.succeeded == 0
+    assert reprocessed.reprocessed == 1
+    assert reprocessed.succeeded == 1
