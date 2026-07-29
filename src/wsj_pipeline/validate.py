@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import duckdb
@@ -49,7 +49,6 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
     """Return all detected invariant violations in deterministic order."""
 
     issues: list[ValidationIssue] = []
-    article_rows: list[dict[str, object]] = []
     article_files = sorted((config.parquet_root / "articles").rglob("articles.parquet"))
     if not article_files:
         issues.append(
@@ -64,22 +63,26 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
         directory_year, directory_month = _partition_from_path(path)
         partition_mismatch = False
         schema_mismatch = False
+        date_mismatch = False
         parquet_file = pq.ParquetFile(path)
         for batch in parquet_file.iter_batches(
             columns=list(ARTICLE_VALIDATION_COLUMNS),
             batch_size=65_536,
         ):
             rows = batch.to_pylist()
-            article_rows.extend(rows)
             partition_mismatch = partition_mismatch or any(
-                row["publication_year_ny"] != directory_year
-                or row["publication_month_ny"] != directory_month
-                or row["publication_date_new_york"].year != directory_year
-                or row["publication_date_new_york"].month != directory_month
+                not _row_matches_partition(
+                    row,
+                    directory_year,
+                    directory_month,
+                )
                 for row in rows
             )
             schema_mismatch = schema_mismatch or any(
                 row["schema_version"] != ARTICLE_SCHEMA_VERSION for row in rows
+            )
+            date_mismatch = date_mismatch or any(
+                not _date_fields_match(row) for row in rows
             )
         if partition_mismatch:
             issues.append(
@@ -95,35 +98,15 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
                     f"{path.name} contains an unsupported article schema",
                 )
             )
-
-    raw_keys = [row["article_key"] for row in article_rows]
-    keys = [key for key in raw_keys if isinstance(key, str) and key]
-    duplicate_keys = [key for key, count in Counter(keys).items() if count > 1]
-    if duplicate_keys:
-        issues.append(
-            ValidationIssue(
-                "duplicate_article_key",
-                f"canonical Parquet contains {len(duplicate_keys)} duplicate keys",
+        if date_mismatch:
+            issues.append(
+                ValidationIssue(
+                    "date_derivation_mismatch",
+                    f"{path.name} contains inconsistent UTC/New York date fields",
+                )
             )
-        )
-    if len(keys) != len(raw_keys):
-        issues.append(
-            ValidationIssue(
-                "null_article_key",
-                "canonical Parquet contains a null or empty article key",
-            )
-        )
 
-    if any(not _date_fields_match(row) for row in article_rows):
-        issues.append(
-            ValidationIssue(
-                "date_derivation_mismatch",
-                "stored UTC/New York date fields are inconsistent",
-            )
-        )
-
-    _validate_duplicate_references(config, article_rows, issues)
-    _validate_index(config, article_rows, issues)
+    _validate_global_relations(config, issues)
     _validate_state_queues(config, issues)
     return ValidationReport(
         tuple(sorted(issues, key=lambda issue: (issue.code, issue.message)))
@@ -155,39 +138,33 @@ def _date_fields_match(row: dict[str, object]) -> bool:
     )
 
 
-def _validate_duplicate_references(
-    config: PipelineConfig,
-    article_rows: list[dict[str, object]],
-    issues: list[ValidationIssue],
-) -> None:
-    path = config.parquet_root / "audit" / "duplicates.parquet"
-    duplicate_rows = pq.read_table(
-        path,
-        columns=["article_key", "winner_source_path"],
-    ).to_pylist()
-    canonical_references = {
-        (row["article_key"], row["source_path"]) for row in article_rows
-    }
-    invalid = [
-        row
-        for row in duplicate_rows
-        if (row["article_key"], row["winner_source_path"])
-        not in canonical_references
-    ]
-    if invalid:
-        issues.append(
-            ValidationIssue(
-                "invalid_duplicate_winner",
-                f"duplicate audit contains {len(invalid)} invalid winner references",
-            )
-        )
+def _row_matches_partition(
+    row: dict[str, object],
+    directory_year: int,
+    directory_month: int,
+) -> bool:
+    publication_date = row["publication_date_new_york"]
+    return (
+        isinstance(publication_date, date)
+        and row["publication_year_ny"] == directory_year
+        and row["publication_month_ny"] == directory_month
+        and publication_date.year == directory_year
+        and publication_date.month == directory_month
+    )
 
 
-def _validate_index(
+def _validate_global_relations(
     config: PipelineConfig,
-    article_rows: list[dict[str, object]],
     issues: list[ValidationIssue],
 ) -> None:
+    article_glob = (
+        config.parquet_root
+        / "articles"
+        / "publication_year_ny=*"
+        / "publication_month_ny=*"
+        / "articles.parquet"
+    )
+    duplicate_path = config.parquet_root / "audit" / "duplicates.parquet"
     columns = (
         "article_key",
         "source_path",
@@ -196,27 +173,127 @@ def _validate_index(
         "published_at_new_york",
         "publication_date_new_york",
     )
-    parquet_values = [tuple(row[column] for column in columns) for row in article_rows]
     with duckdb.connect(str(config.index_db), read_only=True) as connection:
-        index_values = connection.execute(
-            f"SELECT {', '.join(columns)} FROM publication_index"
-        ).fetchall()
-    parquet_keys = [row[0] for row in parquet_values]
-    index_keys = [row[0] for row in index_values]
-    if Counter(parquet_keys) != Counter(index_keys):
+        connection.execute(
+            f"""
+            CREATE TEMP VIEW validation_articles AS
+            SELECT {", ".join(ARTICLE_VALIDATION_COLUMNS)}
+            FROM read_parquet(
+                '{_sql_path(article_glob)}',
+                hive_partitioning = false,
+                union_by_name = true
+            )
+            """
+        )
+        null_keys, duplicate_keys = connection.execute(
+            """
+            SELECT
+                count(*) FILTER (
+                    WHERE article_key IS NULL OR article_key = ''
+                ),
+                (
+                    SELECT count(*)
+                    FROM (
+                        SELECT article_key
+                        FROM validation_articles
+                        WHERE article_key IS NOT NULL
+                          AND article_key != ''
+                        GROUP BY article_key
+                        HAVING count(*) > 1
+                    )
+                )
+            FROM validation_articles
+            """
+        ).fetchone()
+        invalid_winners = connection.execute(
+            f"""
+            SELECT count(*)
+            FROM read_parquet(
+                '{_sql_path(duplicate_path)}'
+            ) AS duplicate
+            LEFT JOIN validation_articles AS article
+              ON article.article_key = duplicate.article_key
+             AND article.source_path = duplicate.winner_source_path
+            WHERE article.article_key IS NULL
+            """
+        ).fetchone()[0]
+        key_differences = _difference_count(
+            connection,
+            ("article_key",),
+        )
+        value_differences = (
+            _difference_count(connection, columns)
+            if not key_differences
+            else 0
+        )
+
+    if duplicate_keys:
+        issues.append(
+            ValidationIssue(
+                "duplicate_article_key",
+                f"canonical Parquet contains {duplicate_keys} duplicate keys",
+            )
+        )
+    if null_keys:
+        issues.append(
+            ValidationIssue(
+                "null_article_key",
+                "canonical Parquet contains a null or empty article key",
+            )
+        )
+    if invalid_winners:
+        issues.append(
+            ValidationIssue(
+                "invalid_duplicate_winner",
+                (
+                    "duplicate audit contains "
+                    f"{invalid_winners} invalid winner references"
+                ),
+            )
+        )
+    if key_differences:
         issues.append(
             ValidationIssue(
                 "index_key_mismatch",
                 "canonical Parquet and publication_index keys differ",
             )
         )
-    elif Counter(parquet_values) != Counter(index_values):
+    elif value_differences:
         issues.append(
             ValidationIssue(
                 "index_value_mismatch",
                 "canonical Parquet and publication_index values differ",
             )
         )
+
+
+def _difference_count(
+    connection: duckdb.DuckDBPyConnection,
+    columns: tuple[str, ...],
+) -> int:
+    selection = ", ".join(columns)
+    return connection.execute(
+        f"""
+        SELECT count(*)
+        FROM (
+            (
+                SELECT {selection}
+                FROM validation_articles
+                EXCEPT ALL
+                SELECT {selection}
+                FROM publication_index
+            )
+            UNION ALL
+            (
+                SELECT {selection}
+                FROM publication_index
+                EXCEPT ALL
+                SELECT {selection}
+                FROM validation_articles
+            )
+        )
+        """
+    ).fetchone()[0]
 
 
 def _validate_state_queues(
@@ -241,3 +318,7 @@ def _validate_state_queues(
                 ),
             )
         )
+
+
+def _sql_path(path: Path) -> str:
+    return path.resolve().as_posix().replace("'", "''")

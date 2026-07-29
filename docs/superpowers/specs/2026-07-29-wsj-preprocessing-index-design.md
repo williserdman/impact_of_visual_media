@@ -253,7 +253,8 @@ whose article provenance/date values differ from canonical Parquet.
 
 Corpus validation iterates projected Parquet batches containing only schema,
 identity, provenance, and publication-date columns. It never loads article body
-columns into Python.
+columns into Python or retains projected rows across batches. Global uniqueness,
+duplicate-reference, and Parquet/index equality checks execute inside DuckDB.
 
 Logs must not include article bodies, secrets, or licensed content excerpts.
 

@@ -82,7 +82,8 @@ preprocessing package.
 - Duplicate, failure, missing-image, and run audits contain provenance but no
   article-body text.
 - Corpus validation must project only required provenance/date columns from
-  article Parquet; do not materialize body columns in Python.
+  article Parquet, keep Python scans batch-local, and perform global comparisons
+  in DuckDB; do not materialize the corpus or body columns in Python.
 - `process` and `run` must continue to require exactly one of `--limit` or
   `--full`.
 

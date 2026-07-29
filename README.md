@@ -232,7 +232,8 @@ Validation scans only compact provenance/date columns—not article bodies—and
 checks schema versions, unique article keys, partition/date agreement, UTC/New
 York derivations, duplicate-winner references, durable publication queues, and
 full provenance/date equality between canonical Parquet and the materialized
-date index.
+date index. Per-file checks are batch-local; global uniqueness and equality
+checks run inside DuckDB rather than accumulating corpus rows in Python.
 
 Mutating commands use `data/processed/wsj/state/pipeline.lock`. If a process
 dies without cleanup, first verify no pipeline process is active, then remove
