@@ -220,6 +220,37 @@ regardless of the caller's current directory. Moving the output directory
 requires rerunning the inexpensive `index` command. Typical queries by exact
 date or bounded date range are documented in the README.
 
+## Documentation Architecture
+
+The user-facing documentation has exactly two entry points:
+
+1. `README.md` is the concise operator landing page. It owns installation,
+   safety gates, the smoke-to-full workflow, common commands, output locations,
+   short query examples, and links to deeper material.
+2. `docs/architecture-crash-course.md` is the single deep guide. It teaches the
+   research motivation, end-to-end data flow, module boundaries, data
+   contracts, incremental state transitions, recovery properties, validation,
+   testing, extension procedures, and downstream research attachment points.
+
+The crash course is layered: a Python/SQL-literate researcher can stop after
+the conceptual walkthrough, while maintainers and coding agents can continue
+into tables, schemas, queues, atomicity, and change recipes. A Mermaid overview
+and compact tables are used only where relationships are clearer visually than
+in prose.
+
+`AGENTS.md` remains a control file for coding agents rather than a third
+user-facing guide. This design specification remains the authoritative record
+of architectural decisions, and the implementation plan remains a historical
+execution record. Both link readers to the current README and crash course but
+do not duplicate operational instructions.
+
+Documentation claims must be traceable to current code or smoke-scale tests.
+Verification checks every documented CLI command against `--help`, checks
+module/table/schema inventories against source, runs generated-fixture tests
+and the smoke command, validates internal Markdown links, and confirms Git
+tracks no raw or derived data. No documentation verification reads or processes
+the licensed corpus.
+
 ## CLI and Safety
 
 The package exposes `wsj-pipeline` with:
