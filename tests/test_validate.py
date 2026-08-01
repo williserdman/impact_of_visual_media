@@ -64,6 +64,13 @@ def _build_outputs(
             published="2024-01-15T15:30:00Z",
             paragraphs=("Short synthetic losing duplicate.",),
         )
+        write_article_fixture(
+            source_root,
+            "2024/january-copy-two.html",
+            article_id="WP-JANUARY",
+            published="2024-01-15T15:30:00Z",
+            paragraphs=("Tiny synthetic duplicate.",),
+        )
     config = PipelineConfig(source_root, tmp_path / "processed", batch_size=1)
     run_pipeline(config, limit=None, full=True)
     return config
@@ -293,6 +300,108 @@ def test_validation_detects_broken_duplicate_winner(tmp_path: Path) -> None:
     assert "broken_duplicate_winner" in _codes(config)
 
 
+def test_validation_detects_existing_candidate_selected_as_wrong_winner(
+    tmp_path: Path,
+) -> None:
+    config = _build_outputs(tmp_path, with_duplicate=True)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        [run_id] = connection.execute(
+            """
+            SELECT run_id
+            FROM duplicates
+            WHERE article_id = 'wsj:WP-JANUARY'
+            LIMIT 1
+            """
+        ).fetchone()
+        connection.execute(
+            """
+            UPDATE articles AS article
+            SET source_html_path = candidate.source_html_path,
+                header_image_path = candidate.header_image_path,
+                inline_image_urls = candidate.inline_image_urls,
+                published_at_utc = candidate.published_at_utc,
+                publication_date_new_york =
+                    candidate.publication_date_new_york
+            FROM candidates AS candidate
+            WHERE article.article_id = 'wsj:WP-JANUARY'
+              AND candidate.source_html_path = '2024/january-copy.html'
+            """
+        )
+        connection.execute(
+            """
+            DELETE FROM duplicates
+            WHERE article_id = 'wsj:WP-JANUARY'
+              AND source_html_path = '2024/january-copy.html'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE duplicates
+            SET winner_source_html_path = '2024/january-copy.html',
+                duplicate_rank = 3
+            WHERE article_id = 'wsj:WP-JANUARY'
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO duplicates VALUES (
+                'wsj:WP-JANUARY',
+                '2024/january.html',
+                '2024/january-copy.html',
+                2,
+                'lower_editorial_character_count',
+                ?
+            )
+            """,
+            [run_id],
+        )
+
+    assert "inconsistent_duplicate_audit" in _codes(config)
+
+
+@pytest.mark.parametrize("corruption", ["gap", "collision"])
+def test_validation_detects_duplicate_rank_gap_or_collision(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    config = _build_outputs(tmp_path, with_duplicate=True)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        if corruption == "gap":
+            connection.execute(
+                """
+                UPDATE duplicates
+                SET duplicate_rank = 4
+                WHERE article_id = 'wsj:WP-JANUARY'
+                  AND duplicate_rank = 2
+                """
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE duplicates
+                SET duplicate_rank = 2
+                WHERE article_id = 'wsj:WP-JANUARY'
+                """
+            )
+
+    assert "inconsistent_duplicate_audit" in _codes(config)
+
+
+def test_validation_detects_wrong_duplicate_reason(tmp_path: Path) -> None:
+    config = _build_outputs(tmp_path, with_duplicate=True)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(
+            """
+            UPDATE duplicates
+            SET reason = 'lexical_tiebreak'
+            WHERE article_id = 'wsj:WP-JANUARY'
+              AND duplicate_rank = 2
+            """
+        )
+
+    assert "inconsistent_duplicate_audit" in _codes(config)
+
+
 def test_validation_detects_inconsistent_manifest_winner(tmp_path: Path) -> None:
     config = _build_outputs(tmp_path)
     with duckdb.connect(str(config.catalog_db)) as connection:
@@ -305,6 +414,27 @@ def test_validation_detects_inconsistent_manifest_winner(tmp_path: Path) -> None
         )
 
     assert "inconsistent_manifest_winner" in _codes(config)
+
+
+def test_validation_detects_succeeded_manifest_without_candidate(
+    tmp_path: Path,
+) -> None:
+    config = _build_outputs(tmp_path)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(
+            """
+            DELETE FROM articles
+            WHERE article_id = 'wsj:WP-JANUARY'
+            """
+        )
+        connection.execute(
+            """
+            DELETE FROM candidates
+            WHERE article_id = 'wsj:WP-JANUARY'
+            """
+        )
+
+    assert "inconsistent_candidate_manifest" in _codes(config)
 
 
 def test_validation_detects_running_run(tmp_path: Path) -> None:

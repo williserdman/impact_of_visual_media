@@ -247,6 +247,24 @@ def _validate_relations(
            OR manifest.status <> 'succeeded'
         """,
     )
+    inconsistent_candidate_manifests += _count(
+        connection,
+        """
+        SELECT count(*)
+        FROM source_manifest AS manifest
+        LEFT JOIN candidates AS candidate
+          ON candidate.source_html_path = manifest.source_html_path
+         AND candidate.article_id IS NOT DISTINCT FROM manifest.article_id
+         AND candidate.source_html_sha256
+                IS NOT DISTINCT FROM manifest.source_html_sha256
+         AND candidate.extractor_version
+                IS NOT DISTINCT FROM manifest.extractor_version
+         AND candidate.header_image_path
+                IS NOT DISTINCT FROM manifest.header_image_path
+        WHERE manifest.status = 'succeeded'
+          AND candidate.source_html_path IS NULL
+        """,
+    )
     _append_count_issue(
         issues,
         "inconsistent_candidate_manifest",
@@ -321,6 +339,96 @@ def _validate_relations(
         "inconsistent_candidate_set",
         incomplete_duplicate_sets,
         "candidate winner and duplicate membership is inconsistent",
+    )
+
+    inconsistent_duplicate_audit = _count(
+        connection,
+        """
+        WITH ranked_candidates AS (
+            SELECT candidate.*,
+                   row_number() OVER (
+                       PARTITION BY article_id
+                       ORDER BY
+                           CASE
+                               WHEN editorial_character_count > 0 THEN 0
+                               ELSE 1
+                           END,
+                           editorial_character_count DESC,
+                           editorial_block_count DESC,
+                           metadata_completeness DESC,
+                           updated_at_utc DESC NULLS LAST,
+                           source_html_path
+                   ) AS expected_rank
+            FROM candidates AS candidate
+        ),
+        expected_duplicates AS (
+            SELECT duplicate.article_id,
+                   duplicate.source_html_path,
+                   winner.source_html_path AS winner_source_html_path,
+                   duplicate.expected_rank AS duplicate_rank,
+                   CASE
+                       WHEN (winner.editorial_character_count > 0)
+                            <> (duplicate.editorial_character_count > 0)
+                           THEN 'empty_content'
+                       WHEN winner.editorial_character_count
+                            <> duplicate.editorial_character_count
+                           THEN 'lower_editorial_character_count'
+                       WHEN winner.editorial_block_count
+                            <> duplicate.editorial_block_count
+                           THEN 'lower_editorial_block_count'
+                       WHEN winner.metadata_completeness
+                            <> duplicate.metadata_completeness
+                           THEN 'lower_metadata_completeness'
+                       WHEN winner.updated_at_utc
+                            IS DISTINCT FROM duplicate.updated_at_utc
+                           THEN 'older_update'
+                       ELSE 'lexical_tiebreak'
+                   END AS reason
+            FROM ranked_candidates AS duplicate
+            JOIN ranked_candidates AS winner
+              ON winner.article_id = duplicate.article_id
+             AND winner.expected_rank = 1
+            WHERE duplicate.expected_rank > 1
+        ),
+        audit_differences AS (
+            (
+                SELECT article_id, source_html_path,
+                       winner_source_html_path, duplicate_rank, reason
+                FROM expected_duplicates
+                EXCEPT ALL
+                SELECT article_id, source_html_path,
+                       winner_source_html_path, duplicate_rank, reason
+                FROM duplicates
+            )
+            UNION ALL
+            (
+                SELECT article_id, source_html_path,
+                       winner_source_html_path, duplicate_rank, reason
+                FROM duplicates
+                EXCEPT ALL
+                SELECT article_id, source_html_path,
+                       winner_source_html_path, duplicate_rank, reason
+                FROM expected_duplicates
+            )
+        )
+        SELECT
+            (
+                SELECT count(*)
+                FROM ranked_candidates AS winner
+                LEFT JOIN articles AS article
+                  ON article.article_id = winner.article_id
+                WHERE winner.expected_rank = 1
+                  AND article.source_html_path
+                        IS DISTINCT FROM winner.source_html_path
+            )
+            + (SELECT count(*) FROM audit_differences)
+        """,
+    )
+    _append_count_issue(
+        issues,
+        "inconsistent_duplicate_audit",
+        inconsistent_duplicate_audit,
+        "candidate rankings and duplicate audit rows are inconsistent",
     )
 
 
