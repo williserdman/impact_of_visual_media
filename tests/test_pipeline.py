@@ -370,3 +370,85 @@ def test_recompute_reextracts_alternative_only_when_no_current_object_exists(
     assert promoted is not None
     assert promoted.source_html_path == "2024/a.html"
     assert extracted_paths == ["2024/a.html"]
+
+
+def test_recompute_reranks_after_a_stored_alternative_degrades(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = PipelineConfig(tmp_path / "archive", tmp_path / "processed")
+    for relative_path in ("2024/a.html", "2024/b.html", "2024/c.html"):
+        raw_path = config.source_root / relative_path
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_text("Synthetic raw placeholder.", encoding="utf-8")
+
+    fallback = _article(
+        source_path="2024/a.html",
+        markdown_text="Second-ranked synthetic content.",
+        character_count=20,
+    )
+    original_winner = _article(
+        source_path="2024/b.html",
+        markdown_text="Initially winning synthetic content.",
+        character_count=30,
+    )
+    eventual_winner = _article(
+        source_path="2024/c.html",
+        markdown_text="Stable third synthetic content.",
+        character_count=10,
+    )
+    degraded_fallback = replace(
+        fallback,
+        markdown_text="x",
+        editorial_character_count=1,
+    )
+    extracted_paths: list[str] = []
+
+    def changed_extract(candidate, _source_root):
+        extracted_paths.append(candidate.relative_html_path)
+        if candidate.relative_html_path == fallback.relative_html_path:
+            return degraded_fallback
+        return eventual_winner
+
+    with Catalog.open(config.catalog_db) as catalog:
+        run_id = catalog.begin_run("run", "fixture")
+        recompute_article(
+            catalog,
+            config,
+            fallback.article_id,
+            run_id,
+            current_articles=(fallback, original_winner, eventual_winner),
+        )
+        monkeypatch.setattr("wsj_pipeline.pipeline.extract_article", changed_extract)
+
+        promoted = recompute_article(
+            catalog,
+            config,
+            fallback.article_id,
+            run_id,
+            current_articles=(),
+            invalid_source_paths=(original_winner.relative_html_path,),
+        )
+        duplicate = catalog.connection.execute(
+            """
+            SELECT source_html_path, winner_source_html_path,
+                   duplicate_rank, reason
+            FROM duplicates
+            """
+        ).fetchone()
+
+    assert promoted is not None
+    assert promoted.source_html_path == eventual_winner.relative_html_path
+    assert (
+        config.output_root / promoted.cleaned_markdown_path
+    ).read_text(encoding="utf-8") == eventual_winner.markdown_text
+    assert extracted_paths == [
+        fallback.relative_html_path,
+        eventual_winner.relative_html_path,
+    ]
+    assert duplicate == (
+        fallback.relative_html_path,
+        eventual_winner.relative_html_path,
+        2,
+        "lower_editorial_character_count",
+    )

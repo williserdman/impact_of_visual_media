@@ -95,32 +95,36 @@ def recompute_article(
         for article in current_by_path.values():
             catalog.replace_candidate(run_id, article)
 
-        candidates = tuple(
-            candidate
-            for candidate in catalog.candidates_for_article(article_id)
-            if candidate.source_html_path not in invalid_paths
-        )
-        if not candidates:
-            catalog.replace_duplicates(run_id, article_id, "", ())
-            return None
-
-        ranked = tuple(sorted(candidates, key=_stored_candidate_rank))
-        selected = ranked[0]
         existing = catalog.article_for_id(article_id)
-        winner_article = current_by_path.get(selected.source_html_path)
+        while True:
+            candidates = tuple(
+                candidate
+                for candidate in catalog.candidates_for_article(article_id)
+                if candidate.source_html_path not in invalid_paths
+            )
+            if not candidates:
+                catalog.replace_duplicates(run_id, article_id, "", ())
+                return None
 
-        if winner_article is None and _can_reuse_existing(existing, selected, config):
-            winner_record = existing
-        else:
-            if winner_article is None:
-                winner_article = _reextract(config, selected)
-                if winner_article.article_id != article_id:
-                    raise ValueError(
-                        "stored candidate identity changed during re-extraction"
-                    )
-                catalog.replace_candidate(run_id, winner_article)
-            winner_record = _publish_markdown(config, winner_article)
-            catalog.replace_article(winner_record)
+            ranked = tuple(sorted(candidates, key=_stored_candidate_rank))
+            selected = ranked[0]
+            winner_article = current_by_path.get(selected.source_html_path)
+
+            if winner_article is not None:
+                winner_record = _publish_markdown(config, winner_article)
+                catalog.replace_article(winner_record)
+                break
+            if _can_reuse_existing(existing, selected, config):
+                winner_record = existing
+                break
+
+            winner_article = _reextract(config, selected)
+            if winner_article.article_id != article_id:
+                raise ValueError(
+                    "stored candidate identity changed during re-extraction"
+                )
+            catalog.replace_candidate(run_id, winner_article)
+            current_by_path[selected.source_html_path] = winner_article
 
         catalog.replace_duplicates(
             run_id,
