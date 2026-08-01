@@ -50,20 +50,20 @@ class PipelineConfig:
         )
 
     @property
-    def state_db(self) -> Path:
-        return self.output_root / "state" / "pipeline.duckdb"
+    def catalog_db(self) -> Path:
+        return self.output_root / "catalog.duckdb"
 
     @property
-    def parquet_root(self) -> Path:
-        return self.output_root / "parquet"
-
-    @property
-    def index_db(self) -> Path:
-        return self.output_root / "index" / "wsj.duckdb"
+    def text_root(self) -> Path:
+        return self.output_root / "text"
 
     @property
     def staging_root(self) -> Path:
         return self.output_root / "staging"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.output_root / "pipeline.lock"
 
 
 def _resolve_path(root: Path, configured: str) -> Path:

@@ -13,9 +13,9 @@ class SourceCandidate:
     relative_html_path: str
     html_size: int
     html_mtime_ns: int
-    relative_image_path: str | None
-    image_size: int | None
-    image_mtime_ns: int | None
+    relative_header_image_path: str | None
+    header_image_size: int | None
+    header_image_mtime_ns: int | None
     warnings: tuple[str, ...] = ()
 
 
@@ -35,42 +35,18 @@ class PublicationDates:
 class ExtractedArticle:
     """Normalized representation of one raw source snapshot."""
 
+    article_id: str
     relative_html_path: str
     source_html_sha256: str
     extractor_version: str
-    wsj_article_id: str | None
     canonical_url: str | None
-    headline: str | None
-    original_headline: str | None
-    summary: str | None
-    authors: tuple[str, ...]
-    keywords: tuple[str, ...]
-    section: str | None
-    page: str | None
-    article_type: str | None
-    access: str | None
     published_at_utc: datetime
-    publication_date_utc: date
-    published_at_new_york: datetime
     publication_date_new_york: date
-    publication_year_ny: int
-    publication_month_ny: int
     updated_at_utc: datetime | None
-    created_at_utc: datetime | None
-    last_published_at_utc: datetime | None
-    body_paragraphs: tuple[str, ...]
-    body_text: str
-    body_word_count: int
-    relative_image_path: str | None
-    image_present: bool
-    image_media_type: str | None
-    image_size_bytes: int | None
-    image_caption: str | None
-    image_credit: str | None
-    image_creator: str | None
-    image_alt: str | None
-    image_width: int | None
-    image_height: int | None
+    markdown_text: str
+    editorial_character_count: int
+    editorial_block_count: int
     metadata_completeness: int
+    relative_header_image_path: str | None
+    inline_image_urls: tuple[str, ...]
     warnings: tuple[str, ...]
-    raw_metadata_json: str

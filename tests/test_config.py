@@ -36,11 +36,20 @@ def test_config_resolves_relative_paths_from_project_root(tmp_path: Path) -> Non
 
     assert config.source_root == (tmp_path / "data/wsj_archive").resolve()
     assert config.output_root == (tmp_path / "data/processed/wsj").resolve()
-    assert config.state_db == config.output_root / "state" / "pipeline.duckdb"
-    assert config.parquet_root == config.output_root / "parquet"
-    assert config.index_db == config.output_root / "index" / "wsj.duckdb"
+    assert config.catalog_db == config.output_root / "catalog.duckdb"
+    assert config.text_root == config.output_root / "text"
     assert config.staging_root == config.output_root / "staging"
+    assert config.lock_path == config.output_root / "pipeline.lock"
     assert config.batch_size == 250
+
+
+def test_config_exposes_single_catalog_and_text_paths(tmp_path: Path) -> None:
+    config = PipelineConfig(tmp_path / "archive", tmp_path / "processed")
+
+    assert config.catalog_db == tmp_path / "processed" / "catalog.duckdb"
+    assert config.text_root == tmp_path / "processed" / "text"
+    assert config.staging_root == tmp_path / "processed" / "staging"
+    assert config.lock_path == tmp_path / "processed" / "pipeline.lock"
 
 
 @pytest.mark.parametrize("batch_size", [0, -1])
