@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from datetime import date
@@ -279,14 +280,19 @@ def test_post_commit_cleanup_failure_retains_harmless_orphan(
         published="2024-02-03T15:30:00Z",
         paragraphs=("Changed date and content.",),
     )
-    real_unlink = Path.unlink
+    real_unlink = os.unlink
 
-    def fail_old_cleanup(path: Path, *args, **kwargs) -> None:
-        if path == old_path:
+    def fail_old_cleanup(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *args,
+        dir_fd: int | None = None,
+        **kwargs,
+    ) -> None:
+        if Path(path).name == old_path.name and dir_fd is not None:
             raise OSError("simulated orphan cleanup failure")
-        real_unlink(path, *args, **kwargs)
+        real_unlink(path, *args, dir_fd=dir_fd, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", fail_old_cleanup)
+    monkeypatch.setattr(os, "unlink", fail_old_cleanup)
 
     summary = run_pipeline(config, limit=10, full=False)
 
@@ -302,3 +308,43 @@ def test_post_commit_cleanup_failure_retains_harmless_orphan(
             "SELECT cleaned_markdown_path FROM articles"
         ).fetchone()[0]
     assert catalog_path == new_path.relative_to(config.output_root).as_posix()
+
+
+def test_orphan_cleanup_does_not_follow_symlinked_date_directory(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    source_path = "2024/one.html"
+    write_article_fixture(
+        archive,
+        source_path,
+        article_id="WP-CLEANUP-SYMLINK",
+        published="2024-01-02T15:30:00Z",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    old_path = config.output_root / article_markdown_path(
+        "wsj:WP-CLEANUP-SYMLINK",
+        date(2024, 1, 2),
+    )
+    external_day = tmp_path / "external-day"
+    external_day.mkdir()
+    external_victim = external_day / old_path.name
+    external_victim.write_text("external file must survive", encoding="utf-8")
+    old_path.unlink()
+    old_path.parent.rmdir()
+    old_path.parent.symlink_to(external_day, target_is_directory=True)
+    write_article_fixture(
+        archive,
+        source_path,
+        article_id="WP-CLEANUP-SYMLINK",
+        published="2024-02-03T15:30:00Z",
+        paragraphs=("Changed date and content.",),
+    )
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.changed == 1
+    assert external_victim.read_text(encoding="utf-8") == (
+        "external file must survive"
+    )

@@ -90,6 +90,47 @@ def ensure_no_legacy_output(config: PipelineConfig) -> None:
         )
 
 
+def _is_single_path_component(value: str) -> bool:
+    return bool(value) and value not in {".", ".."} and Path(value).name == value
+
+
+def _open_directory(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags)
+
+
+def _open_directory_components(
+    root_descriptor: int,
+    components: Iterable[str],
+    *,
+    create: bool,
+    mode: int,
+) -> int:
+    """Open a relative directory chain without following any component."""
+
+    descriptor = os.dup(root_descriptor)
+    try:
+        for component in components:
+            if not _is_single_path_component(component):
+                raise ValueError("directory path contains an unsafe component")
+            if create:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=mode, dir_fd=descriptor)
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def write_markdown_atomic(
     markdown: str,
     target: Path,
@@ -98,31 +139,58 @@ def write_markdown_atomic(
 ) -> str:
     """Publish verified UTF-8 Markdown with one atomic replacement."""
 
-    output_root = staging_root.resolve().parent
-    resolved_target = target.resolve()
-    if (
-        resolved_target == output_root
-        or not resolved_target.is_relative_to(output_root)
-    ):
+    output_root = staging_root.parent.resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    target_parent = target.parent.resolve()
+    if not target.name or not target_parent.is_relative_to(output_root):
         raise ValueError("target must be inside output root")
-
-    resolved_staging = staging_root.resolve()
-    run_staging = (resolved_staging / run_id).resolve()
-    if not run_staging.is_relative_to(resolved_staging):
+    if not _is_single_path_component(run_id):
         raise ValueError("run staging path must be inside staging root")
 
-    relative_target = resolved_target.relative_to(output_root).as_posix()
+    relative_target = (
+        target_parent.relative_to(output_root) / target.name
+    ).as_posix()
     staged_name = f"{hashlib.sha256(relative_target.encode()).hexdigest()}.md"
-    staged = run_staging / staged_name
     markdown_bytes = markdown.encode("utf-8")
     expected_hash = hashlib.sha256(markdown_bytes).hexdigest()
 
-    run_staging.mkdir(parents=True, exist_ok=True)
-    resolved_target.parent.mkdir(parents=True, exist_ok=True)
+    root_descriptor = _open_directory(output_root)
+    staging_descriptor: int | None = None
+    run_descriptor: int | None = None
+    target_descriptor: int | None = None
     try:
+        try:
+            staging_descriptor = _open_directory_components(
+                root_descriptor,
+                (staging_root.name,),
+                create=True,
+                mode=0o700,
+            )
+        except OSError as error:
+            raise ValueError(
+                "staging root must be inside output root and not a symlink"
+            ) from error
+        run_descriptor = _open_directory_components(
+            staging_descriptor,
+            (run_id,),
+            create=True,
+            mode=0o700,
+        )
+        target_descriptor = _open_directory_components(
+            root_descriptor,
+            target_parent.relative_to(output_root).parts,
+            create=True,
+            mode=0o755,
+        )
+
         create_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
         create_flags |= getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(staged, create_flags, 0o600)
+        descriptor = os.open(
+            staged_name,
+            create_flags,
+            0o600,
+            dir_fd=run_descriptor,
+        )
         try:
             with os.fdopen(descriptor, "wb", closefd=False) as stream:
                 stream.write(markdown_bytes)
@@ -130,7 +198,11 @@ def write_markdown_atomic(
             os.close(descriptor)
 
         read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(staged, read_flags)
+        descriptor = os.open(
+            staged_name,
+            read_flags,
+            dir_fd=run_descriptor,
+        )
         try:
             staged_stat = os.fstat(descriptor)
             if not stat.S_ISREG(staged_stat.st_mode) or staged_stat.st_nlink != 1:
@@ -142,13 +214,25 @@ def write_markdown_atomic(
         staged_hash = hashlib.sha256(staged_bytes).hexdigest()
         if staged_hash != expected_hash:
             raise ValueError("staged Markdown verification failed")
-        os.replace(staged, resolved_target)
+        os.replace(
+            staged_name,
+            target.name,
+            src_dir_fd=run_descriptor,
+            dst_dir_fd=target_descriptor,
+        )
         return staged_hash
     finally:
-        with suppress(FileNotFoundError):
-            staged.unlink()
-        with suppress(OSError):
-            run_staging.rmdir()
+        if run_descriptor is not None:
+            with suppress(FileNotFoundError):
+                os.unlink(staged_name, dir_fd=run_descriptor)
+            os.close(run_descriptor)
+        if staging_descriptor is not None:
+            with suppress(OSError):
+                os.rmdir(run_id, dir_fd=staging_descriptor)
+            os.close(staging_descriptor)
+        if target_descriptor is not None:
+            os.close(target_descriptor)
+        os.close(root_descriptor)
 
 
 def run_pipeline(
@@ -653,6 +737,46 @@ def _cleanup_orphans(
         current = catalog.article_for_id(article_id)
         if current is not None and current.cleaned_markdown_path == relative_path:
             continue
-        orphan = config.output_root / relative_path
         with suppress(OSError):
-            orphan.unlink()
+            _unlink_generated_file(config.output_root, relative_path)
+
+
+def _unlink_generated_file(output_root: Path, relative_path: str) -> None:
+    relative = Path(relative_path)
+    if (
+        relative.is_absolute()
+        or not relative.name
+        or any(not _is_single_path_component(part) for part in relative.parts)
+    ):
+        return
+
+    resolved_root = output_root.resolve()
+    resolved_parent = (resolved_root / relative.parent).resolve()
+    if not resolved_parent.is_relative_to(resolved_root):
+        return
+
+    root_descriptor = _open_directory(resolved_root)
+    parent_descriptor: int | None = None
+    file_descriptor: int | None = None
+    try:
+        parent_descriptor = _open_directory_components(
+            root_descriptor,
+            relative.parent.parts,
+            create=False,
+            mode=0o755,
+        )
+        file_descriptor = os.open(
+            relative.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        file_stat = os.fstat(file_descriptor)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
+            return
+        os.unlink(relative.name, dir_fd=parent_descriptor)
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        os.close(root_descriptor)

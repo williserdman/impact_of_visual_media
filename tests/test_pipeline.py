@@ -119,10 +119,12 @@ def test_atomic_markdown_reopens_and_verifies_staged_bytes(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
         flags: int,
         mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
     ) -> int:
-        if Path(path) == staged and not flags & os.O_CREAT:
+        if Path(path).name == staged.name and not flags & os.O_CREAT:
             staged.write_bytes(b"corrupt staged bytes")
-        return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", corrupt_before_reopen)
 
@@ -143,8 +145,16 @@ def test_failed_atomic_markdown_replace_preserves_target_and_cleans_staging(
     target.parent.mkdir(parents=True)
     target.write_text("original", encoding="utf-8")
 
-    def fail_replace(_source: Path, destination: Path) -> None:
-        assert Path(destination) == target
+    def fail_replace(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int,
+        dst_dir_fd: int,
+    ) -> None:
+        assert source.endswith(".md")
+        assert destination == target.name
+        assert src_dir_fd != dst_dir_fd
         raise OSError("simulated replacement interruption")
 
     monkeypatch.setattr(os, "replace", fail_replace)
@@ -201,6 +211,53 @@ def test_atomic_markdown_refuses_preexisting_staged_symlink(
     assert not target.is_symlink()
     assert outside.read_text(encoding="utf-8") == "outside original"
     assert list(staging_root.rglob("*")) == []
+
+
+def test_atomic_markdown_replaces_target_symlink_not_its_referent(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "processed"
+    staging_root = output_root / "staging"
+    target = output_root / "text" / "article.md"
+    victim = output_root / "text" / "existing.md"
+    victim.parent.mkdir(parents=True)
+    victim.write_text("referent must survive", encoding="utf-8")
+    target.symlink_to(victim)
+
+    published_hash = write_markdown_atomic(
+        "safe replacement",
+        target,
+        staging_root,
+        "run-target-symlink",
+    )
+
+    assert not target.is_symlink()
+    assert target.read_text(encoding="utf-8") == "safe replacement"
+    assert published_hash == sha256(b"safe replacement").hexdigest()
+    assert victim.read_text(encoding="utf-8") == "referent must survive"
+
+
+def test_atomic_markdown_refuses_staging_root_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "processed"
+    output_root.mkdir()
+    external_staging = tmp_path / "external-staging"
+    external_staging.mkdir()
+    staging_root = output_root / "staging"
+    staging_root.symlink_to(external_staging, target_is_directory=True)
+    target = output_root / "text" / "article.md"
+
+    with pytest.raises(ValueError, match="staging root must be inside output root"):
+        write_markdown_atomic(
+            "must not stage externally",
+            target,
+            staging_root,
+            "run-staging-symlink",
+        )
+
+    assert not target.exists()
+    assert list(external_staging.iterdir()) == []
 
 
 def test_pipeline_extracts_new_sources_then_skips_unchanged_rerun(
