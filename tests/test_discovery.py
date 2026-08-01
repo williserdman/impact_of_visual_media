@@ -20,7 +20,9 @@ def test_discovers_mixed_year_layouts_in_stable_order(tmp_path: Path) -> None:
         "2016/z-story.html",
         "2024/2024/a-story.HTML",
     ]
-    assert candidates[1].relative_image_path == ("2024/2024/a-story_main_image.WEBP")
+    assert candidates[1].relative_header_image_path == (
+        "2024/2024/a-story_main_image.WEBP"
+    )
 
 
 def test_excludes_hidden_macos_and_backup_directories(tmp_path: Path) -> None:
@@ -41,9 +43,9 @@ def test_missing_image_is_valid_and_warned(tmp_path: Path) -> None:
 
     [candidate] = list(discover_sources(archive))
 
-    assert candidate.relative_image_path is None
-    assert candidate.image_size is None
-    assert candidate.image_mtime_ns is None
+    assert candidate.relative_header_image_path is None
+    assert candidate.header_image_size is None
+    assert candidate.header_image_mtime_ns is None
     assert candidate.warnings == ("missing_image",)
 
 
@@ -55,8 +57,8 @@ def test_ambiguous_images_use_extension_priority_and_warn(tmp_path: Path) -> Non
 
     [candidate] = list(discover_sources(archive))
 
-    assert candidate.relative_image_path == "2016/story_main_image.jpg"
-    assert candidate.image_size == 4
+    assert candidate.relative_header_image_path == "2016/story_main_image.jpg"
+    assert candidate.header_image_size == 4
     assert candidate.warnings == ("multiple_images",)
 
 

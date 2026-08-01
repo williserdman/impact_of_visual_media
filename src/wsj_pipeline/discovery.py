@@ -68,11 +68,11 @@ def _candidate_for(
         relative_html_path=html_path.relative_to(source_root).as_posix(),
         html_size=html_stat.st_size,
         html_mtime_ns=html_stat.st_mtime_ns,
-        relative_image_path=(
+        relative_header_image_path=(
             image_path.relative_to(source_root).as_posix() if image_path else None
         ),
-        image_size=image_stat.st_size if image_stat else None,
-        image_mtime_ns=image_stat.st_mtime_ns if image_stat else None,
+        header_image_size=image_stat.st_size if image_stat else None,
+        header_image_mtime_ns=image_stat.st_mtime_ns if image_stat else None,
         warnings=tuple(warnings),
     )
 
