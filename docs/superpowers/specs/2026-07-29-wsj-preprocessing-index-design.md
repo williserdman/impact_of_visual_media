@@ -1,346 +1,450 @@
-# WSJ Preprocessing and Publication-Date Index Design
+# Simplified WSJ Cleaning and Catalog Design
+
+**Date:** 2026-08-01
+
+**Status:** Approved for implementation planning
+
+**Scope:** Clean the licensed WSJ HTML/image archive into canonical Markdown
+files and a minimal, safe DuckDB research catalog.
 
 ## Purpose
 
-Build a reproducible, incremental pipeline that converts the licensed raw WSJ
-archive into a clean, research-ready article dataset. The first version stops
-at shared preprocessing and date indexing. Embeddings, temporal knowledge
-graphs, market data, and trading strategies are downstream projects.
+The archive contains roughly one hundred WSJ articles per day across many
+years. Each raw article is an HTML file with an optional local companion header
+image. The shared preprocessing layer should do only what future research
+projects need in common:
 
-The pipeline must support the current 2016–2023 archive and later additions for
-2024–2026 without rescanning or rewriting unaffected data. Development and
-verification use generated fixtures and explicitly limited smoke samples; no
-command run as part of development may process the full archive.
+1. preserve all editorial article text in a clean, deterministic format;
+2. retain references to the local header image and linked editorial images;
+3. retain exact publication time and an indexed New York publication date;
+4. provide stable identity, provenance, duplicate handling, and incremental
+   updates; and
+5. expose those artifacts through one small DuckDB catalog.
 
-## Chosen Approach
+Text/image embedding, temporal knowledge graphs, market data, labels,
+backtests, and trading strategies remain downstream. The preprocessing layer
+does not embed, summarize, classify, fetch market data, or download remote
+images.
 
-Use a staged Python CLI:
+## Safety and Scale Constraints
 
-1. inventory source HTML and companion images;
-2. extract and normalize new or changed records;
-3. select one canonical record per WSJ article and audit duplicates;
-4. publish affected Parquet partitions atomically;
-5. rebuild a small DuckDB query index over the published dataset.
+- `data/wsj_archive/` is immutable input. The pipeline never renames, rewrites,
+  moves, or deletes raw HTML or images.
+- All generated state is written below the configured output root, which must
+  not overlap the source root.
+- Raw and derived data remain ignored by Git.
+- Automated verification uses generated temporary fixtures only.
+- `run` requires exactly one of a positive `--limit` or explicit `--full`.
+- No agent may launch a corpus-wide run unless the user authorizes it in the
+  current task.
+- Work is committed in bounded batches so a full run does not require loading
+  the archive into memory.
+- Logs, failures, fixtures, documentation, and commits never contain licensed
+  article excerpts.
 
-This is preferable to a single streaming job because every stage is
-restartable and inspectable. It is preferable to making DuckDB the only
-published representation because Parquet remains portable to embedding,
-graph, and distributed-compute tools.
+## Architecture
 
-## Repository and Runtime Layout
-
-Tracked source:
-
-```text
-AGENTS.md
-README.md
-pyproject.toml
-config/wsj_pipeline.toml
-src/wsj_pipeline/
-tests/
-docs/superpowers/specs/
+```mermaid
+flowchart LR
+    A[Read-only WSJ HTML] --> B[Discovery]
+    H[Local header image] --> B
+    B --> C[Editorial extraction]
+    C --> D[Identity and duplicate ranking]
+    D --> E[Atomic Markdown file]
+    D --> F[(DuckDB catalog)]
+    E --> G[Research workflows]
+    F --> G
+    H --> G
+    I[Remote editorial image URLs] --> F
 ```
 
-Ignored licensed and generated data:
+The pipeline has two research-facing outputs:
 
-```text
-data/wsj_archive/                 # immutable source
-data/processed/wsj/
-  state/pipeline.duckdb           # operational manifest and extracted rows
-  parquet/articles/
-    publication_year_ny=YYYY/
-      publication_month_ny=MM/
-        articles.parquet
-  parquet/audit/
-    duplicates.parquet
-    failures.parquet
-    missing_images.parquet
-    runs.parquet
-  index/wsj.duckdb                # user-facing tables/views and date index
-  staging/                        # atomic publication workspace
+1. one canonical UTF-8 Markdown file per unique publishable article; and
+2. one `articles` row in a single DuckDB database pointing to that Markdown,
+   the local header image, linked editorial-image URLs, and publication dates.
+
+DuckDB also holds the minimal operational tables required for incremental
+processing and auditing. There is no Parquet layer, separate operational
+database, or separately rebuilt publication index.
+
+## Source Discovery
+
+Discovery recursively enumerates `.html` files in stable lexical order. It
+supports both observed layouts, such as `2016/*.html` and
+`2023/2023/*.html`, and future year directories without code changes.
+
+Hidden directories, `__MACOSX`, and a top-level `backup` directory are excluded.
+A local header image is a sibling with the same HTML stem plus
+`_main_image` and one of these extensions, in priority order:
+
+1. `.jpg`
+2. `.jpeg`
+3. `.png`
+4. `.webp`
+
+No header image is a valid condition. If several candidates exist, discovery
+uses the extension priority deterministically and records a warning.
+
+Each discovered source records relative paths, byte sizes, and nanosecond
+modification times for the HTML and selected header image. These inexpensive
+fingerprints drive incremental classification; content hashing resolves stat
+changes when needed.
+
+## Cleaned Markdown Contract
+
+Each canonical article is written as deterministic UTF-8 Markdown. Editorial
+content is preserved in reading order.
+
+Included content:
+
+- headline;
+- subtitle, dek, and summary, without repeating identical text;
+- byline;
+- body paragraphs;
+- section headings;
+- editorial lists and tables;
+- pull quotes;
+- editorial hyperlinks;
+- inline figures and editorial image URLs;
+- image alt text, captions, credits, and creator text; and
+- relevant visible text belonging to article interactives.
+
+Excluded content:
+
+- global navigation and page chrome;
+- advertisements and tracking elements;
+- subscription, registration, and login prompts;
+- recommended and related-story cards;
+- social-sharing controls;
+- author biographies;
+- scripts, styles, and hidden accessibility duplicates; and
+- repeated metadata already represented once in the article.
+
+Markdown uses conventional constructs rather than a custom container format:
+
+```markdown
+# Headline
+
+Subtitle or dek.
+
+By Alice Reporter and Bob Editor
+
+Opening paragraph with an [editorial link](https://example.com).
+
+## Section heading
+
+![Image alt text](https://images.wsj.net/example.jpg)
+
+Image caption. Image credit.
 ```
 
-All roots are configurable. Stored paths are relative to the configured source
-or output root where possible, so moving the project does not invalidate the
-dataset.
+Normalization is conservative: Unicode normalization, whitespace cleanup,
+deterministic blank lines, and stable Markdown escaping. The pipeline does not
+lowercase, stem, summarize, translate, paraphrase, or alter editorial meaning.
 
-## Components
+Remote editorial images are not downloaded. Their resolved HTTP(S) URLs appear
+at their approximate reading positions in the Markdown and, without duplicates,
+in the ordered `inline_image_urls` catalog list. The local companion header
+image remains a separate nullable relative path.
 
-### Source discovery and pairing
+## Identity and Duplicate Selection
 
-The inventory stage recursively finds `.html` files under the source root in
-stable lexical order. It excludes hidden directories, `__MACOSX`, and the
-top-level `backup` directory. A companion image is a file beside the HTML whose
-stem is `<html-stem>_main_image` and whose extension is one of JPEG, PNG, or
-WebP. No image is a valid condition recorded in the missing-image audit.
-Multiple matching image files are an extraction warning resolved by stable
-extension/path ordering.
+The stable `article_id` is derived in this order:
 
-Discovery records relative path, byte size, and nanosecond modification time.
-That inexpensive stat tuple detects candidates for reprocessing. For each
-candidate already being read, the processor records a SHA-256 of the HTML
-bytes. Unchanged stat tuples are skipped; matching content hashes prevent a
-metadata-only filesystem change from creating a new logical record.
+1. `wsj:<trimmed WSJ article ID>`;
+2. `url:<SHA-256 of normalized canonical URL>`; or
+3. `html:<source HTML SHA-256>`.
 
-The source archive is read-only. The pipeline never renames, moves, or modifies
-raw HTML or images.
+Canonical URL normalization lowercases the scheme and host, removes fragments
+and default ports, normalizes the trailing slash, and sorts query parameters.
 
-### HTML extraction
+Several raw sources may resolve to one article ID. All publishable candidates
+have a valid publication timestamp. The winner is selected deterministically
+by this ascending preference order:
 
-Extraction has a versioned interface and produces one normalized source record
-or a structured failure. It uses, in order:
-
-- WSJ `<meta>` fields for article ID, canonical URL, headline, summary,
-  timestamps, author, section, type, access, keywords, and declared counts;
-- JSON-LD as a structured fallback and for image caption, credit, dimensions,
-  and creator;
-- the article DOM for ordered body paragraphs, excluding ads, related-content
-  cards, author biographies, captions, and dynamic insets;
-- filename and filesystem metadata only as explicitly flagged fallbacks.
-
-Body output includes both an ordered list of cleaned paragraphs and a
-double-newline-joined `body_text`. Whitespace and Unicode are normalized without
-lowercasing, stemming, sentence splitting, summarizing, or otherwise changing
-editorial meaning. If no editorial paragraphs are found, the record is retained
-with an empty body and an `empty_body` warning; a later extractor version can
-reprocess it. Raw metadata selected during parsing is retained as compact JSON
-for forward compatibility. Raw full HTML is not copied into Parquet.
-
-Every extracted row records the extractor version, source content hash,
-extraction timestamp, extraction warnings, and source-relative paths.
-
-### Identity and deterministic duplicates
-
-`article_key` is derived from the WSJ article ID when present. Otherwise it is
-a SHA-256 of the normalized canonical URL; if both are missing, it is a
-SHA-256 of the source HTML.
-
-When several source rows have the same article key, the canonical winner is
-selected deterministically by:
-
-1. valid publication timestamp;
-2. nonempty body;
-3. larger body word count;
+1. nonempty editorial content;
+2. greater cleaned editorial character count;
+3. greater count of extracted editorial blocks;
 4. greater metadata completeness;
-5. later WSJ `updated_at`;
-6. lexical source path as the final tie-breaker.
+5. later WSJ update timestamp; and
+6. lexical source path.
 
-Nonwinners are written to the duplicate audit with their winner, rank, and
-reason. They remain in operational state and can be re-evaluated after parser
-changes. Because archived pages may contain post-publication edits, the
-pipeline preserves `updated_at` and does not claim that body text represents
-the first published revision.
+Only the winner has a canonical Markdown file and an `articles` row.
+Nonwinners retain identity, quality metrics, source hashes, and their winner
+reference in operational tables, but their cleaned article text is not stored.
+If the winner disappears or becomes invalid during a completed full run,
+remaining raw candidates are re-extracted as needed and the next ranked source
+is promoted.
 
-### Dates
+## Publication Dates and Output Paths
 
-The authoritative event time is the parsed WSJ publication timestamp. It is
-stored timezone-aware in UTC as `published_at_utc`. The pipeline derives:
+The authoritative event time is WSJ `datePublished`/publication metadata. A
+missing, malformed, or timezone-naive publication timestamp is a structured
+failure and produces no research record.
 
-- `publication_date_utc`;
-- `published_at_new_york`;
-- `publication_date_new_york`;
-- `publication_year_ny`;
-- `publication_month_ny`.
+The exact timestamp is normalized to timezone-aware UTC as
+`published_at_utc`. The pipeline derives
+`publication_date_new_york` using the IANA `America/New_York` timezone,
+including daylight-saving transitions. Created, updated, and last-published
+timestamps are never silently substituted for publication time.
 
-New York conversion uses the IANA `America/New_York` zone and therefore
-observes daylight-saving transitions. Parquet partitions use New York year and
-month. `updated_at_utc`, `created_at_utc`, and `last_published_at_utc` are
-preserved separately and never substituted silently for publication time.
+The canonical Markdown path is:
 
-Rows without a valid publication timestamp are retained in failure/audit state
-but are not published as canonical dated articles.
+```text
+text/YYYY/MM/DD/<stable-article-hash>.md
+```
 
-### Canonical article schema
+`YYYY/MM/DD` comes from `publication_date_new_york`. The filename is the
+hexadecimal SHA-256 of the full namespaced `article_id`, which avoids unsafe
+title characters and collisions while keeping identity readable in DuckDB.
 
-The published article table contains:
+## Generated Layout
 
-- identity/provenance: `article_key`, WSJ ID, canonical URL, source path,
-  source hash, extractor version;
-- editorial fields: headline, original headline, summary, body paragraphs,
-  body text, authors, keywords, section, page, article type, access;
-- timestamps and derived dates described above;
-- image fields: relative path, presence flag, media type, byte size, caption,
-  credit, creator, alt text, declared width and height;
-- quality fields: body word count, metadata completeness, warnings;
-- compact selected raw metadata JSON.
+```text
+data/processed/wsj/
+├── catalog.duckdb
+├── text/
+│   └── YYYY/
+│       └── MM/
+│           └── DD/
+│               └── <stable-article-hash>.md
+├── staging/
+└── pipeline.lock
+```
 
-Lists use native Parquet list types. Timestamps use Arrow timezone-aware
-timestamps. Schema versioning is explicit and checked before publication.
+All paths stored in DuckDB are relative to the configured source or output
+root, as appropriate. This makes the catalog portable with its corresponding
+directories.
 
-### Operational state and incremental publication
+## DuckDB Catalog
 
-`pipeline.duckdb` stores runs, the source manifest, extracted source records,
-failures, duplicate decisions, pending article keys, and dirty publication
-partitions. A run:
+The catalog schema is explicitly versioned. Opening a database with an
+unsupported schema fails with a concise instruction; the pipeline does not
+silently migrate or delete generated data.
 
-1. acquires an exclusive pipeline lock;
-2. inventories sources and identifies new, changed, and optionally missing
-   paths;
-3. processes candidates in bounded batches and commits progress after each
-   batch;
-4. recomputes canonical winners for affected article keys;
-5. determines affected old and new year/month partitions;
-6. writes each affected partition to staging, validates it, then atomically
-   replaces the published partition file;
-7. publishes audit Parquet files and the query index;
-8. records a run summary and releases the lock.
+### Research-facing `articles`
 
-An interrupted extraction can resume from committed batches. An interrupted
-publication leaves the previous partition intact. Each committed extraction
-change durably enqueues its article key. Canonical recomputation atomically
-replaces the decision, records its old and new month partitions as dirty, and
-then clears the pending key. A dirty partition is cleared only after its staged
-Parquet replacement succeeds. Therefore a retry drains committed work even
-when all discovered source fingerprints are unchanged.
+| Column | DuckDB type | Constraint and meaning |
+|---|---|---|
+| `article_id` | `VARCHAR` | Primary key; stable namespaced identity |
+| `source_html_path` | `VARCHAR` | Unique winning source path relative to the archive |
+| `cleaned_markdown_path` | `VARCHAR` | Unique path relative to the output root |
+| `header_image_path` | `VARCHAR` | Nullable path relative to the archive |
+| `inline_image_urls` | `VARCHAR[]` | Ordered, deduplicated remote editorial image URLs |
+| `published_at_utc` | `TIMESTAMPTZ` | Exact authoritative publication instant |
+| `publication_date_new_york` | `DATE` | Indexed New York research date |
+| `cleaned_markdown_sha256` | `VARCHAR` | Integrity hash of the published Markdown bytes |
 
-A successful `--full` inventory records every seen manifest path and marks
-previously known, unseen sources missing before canonicalization. This removal
-reconciliation is never performed for `--limit` runs or interrupted
-inventories. Re-running with no source, extractor-version, or pending-state
-changes is a no-op apart from a run record.
+An index on `(publication_date_new_york, published_at_utc, article_id)` supports
+exact-day and bounded-range research queries.
 
-A changed extractor/schema version does not trigger an accidental archive-wide
-run. The CLI reports those records as stale and requires an explicit
-`--reprocess` switch in addition to the normal `--limit` or `--full` scope.
+### Operational tables
 
-### DuckDB publication-date index
+- `metadata`: schema and extractor versions;
+- `runs`: command, scope, timestamps, status, and content-free counts;
+- `source_manifest`: source/image fingerprints, hashes, status, article ID,
+  extractor version, and last-seen run;
+- `candidates`: source-to-identity mapping and deterministic ranking metrics;
+- `duplicates`: nonwinner source, winner source, rank, and reason; and
+- `failures`: run, source, stage, stable error code, and content-free message.
 
-The published `wsj.duckdb` is rebuilt transactionally from canonical Parquet
-and contains:
+The operational tables are implementation state, not the primary research
+interface. They do not retain cleaned article bodies.
 
-- an `articles` view over all article partitions;
-- a materialized `publication_index` table ordered by
-  `(publication_date_new_york, published_at_utc, article_key)`;
-- a `daily_publication_counts` view;
-- views over duplicate, failure, missing-image, and run audits.
+## Incremental Processing
 
-The index stores article keys and dates rather than duplicating article bodies.
-Its Parquet-backed views use the resolved output location so they work
-regardless of the caller's current directory. Moving the output directory
-requires rerunning the inexpensive `index` command. Typical queries by exact
-date or bounded date range are documented in the README.
+One mutating process owns an exclusive `pipeline.lock`. A normal run:
+
+1. creates a `running` run record;
+2. discovers sources in deterministic order;
+3. classifies candidates against `source_manifest`;
+4. processes new or changed candidates in bounded transactions;
+5. recomputes winners for affected identities;
+6. stages and atomically replaces changed canonical Markdown files;
+7. commits article, candidate, duplicate, and manifest changes;
+8. validates changed outputs and catalog invariants;
+9. records a succeeded or failed summary; and
+10. removes the lock.
+
+Classification distinguishes:
+
+- `new`: no manifest row;
+- `unchanged`: HTML and header-image fingerprints match;
+- `metadata_only`: stats changed but content and selected image identity did not;
+- `changed`: HTML content or selected header image changed;
+- `stale_extractor`: stored extractor version differs; and
+- `missing`: a prior source was absent from a completed full inventory.
+
+Extractor-version changes never trigger automatic corpus-wide work. Stale
+sources are reported and require `--reprocess` together with `--limit` or
+`--full`.
+
+A completed `--full` inventory marks previously known unseen sources missing.
+A limited or interrupted run never infers deletion from unseen paths. Adding
+2024–2026 folders and rerunning `run --full` therefore processes only new or
+changed sources while safely reconciling genuine removals.
+
+## Atomicity and Crash Recovery
+
+For a winning candidate, publication proceeds as follows:
+
+1. render Markdown bytes deterministically;
+2. write them under a run-specific staging directory;
+3. reopen the staged file and verify its SHA-256;
+4. atomically replace the deterministic final path; and
+5. commit the related catalog and manifest updates in one DuckDB transaction.
+
+The source manifest is committed only after final-file replacement. If a
+process stops after replacement but before the catalog commit, the source still
+appears unprocessed and the next run deterministically repairs the catalog and
+file. The stored Markdown hash lets validation detect the temporary mismatch.
+
+If a corrected date changes the output path, the new file is published before
+the catalog switches paths. The obsolete generated file is removed only after
+the catalog commit. A crash can therefore leave a harmless orphan, but never a
+committed row pointing to a replacement that was not published. Validation
+reports orphaned Markdown files.
+
+Failures close the run lifecycle as `failed` without exposing article text.
+The lock file is removed in a `finally` path. If the process itself is killed
+before cleanup, an operator verifies no process is active, removes only the
+stale lock, and reruns the idempotent command.
+
+## CLI
+
+The installed command is `wsj-pipeline` with four subcommands:
+
+- `inventory [--limit N]`: read-only discovery and image counts;
+- `run (--limit N | --full) [--reprocess]`: incremental cleaning and catalog
+  update;
+- `validate`: complete catalog/file/date/orphan validation; and
+- `smoke`: complete generated-fixture workflow in a temporary directory.
+
+All commands emit deterministic JSON summaries. `validate` and `run` return a
+nonzero exit status when validation fails. `smoke` ignores the configured real
+archive and cannot process licensed corpus data.
+
+## Validation
+
+Validation reports stable, content-free issue codes and checks:
+
+- supported catalog and extractor versions;
+- unique article IDs, source paths, and cleaned Markdown paths;
+- existence of every catalogued Markdown file;
+- Markdown SHA-256 agreement;
+- existence of catalogued local header images;
+- exact UTC-to-New-York date derivation;
+- agreement between New York date and `YYYY/MM/DD` path;
+- valid HTTP(S) inline image URLs and stable list ordering;
+- candidate, duplicate-winner, manifest, and article consistency;
+- no `running` run left by a completed command;
+- no catalog row for a failed or missing winner; and
+- generated Markdown files not referenced by the catalog.
+
+Validation scans paths and files incrementally rather than retaining the corpus
+in Python memory. A full validation can still be I/O-intensive because it hashes
+every cleaned file, so automated tests exercise it only on temporary fixtures.
+
+## Testing
+
+All tests create small synthetic HTML and image fixtures under temporary
+directories. Required coverage includes:
+
+- mixed archive layouts and excluded directories;
+- missing and ambiguous header images;
+- complete editorial reading order;
+- removal of ads, related cards, prompts, biographies, scripts, and chrome;
+- Markdown escaping, Unicode, headings, lists, tables, quotes, and links;
+- inline editorial image URLs, captions, credits, ordering, and deduplication;
+- publication parsing, distinct UTC/New York dates, and daylight saving;
+- stable identity fallbacks and duplicate ranking;
+- unchanged reruns, HTML changes, image-only changes, and extractor staleness;
+- bounded committed batches and interruption recovery;
+- winner removal and duplicate promotion during full runs;
+- the rule that limited runs never reconcile unseen sources;
+- future-year additions;
+- catalog constraints, file hashes, path dates, missing files, and orphans;
+- lock contention and failed run lifecycle; and
+- a fixture-only end-to-end smoke command.
+
+Implementation verification runs only the fixture test suite, lint, package
+build, and generated `smoke` command. It does not launch real-corpus extraction.
+
+## Package Boundaries
+
+The implementation is organized into focused modules:
+
+- `config.py`: safe resolved paths and bounded settings;
+- `models.py`: discovery and extraction value objects;
+- `discovery.py`: stable HTML enumeration and header-image pairing;
+- `extract.py`: editorial Markdown, structured metadata, dates, and image URLs;
+- `catalog.py`: DuckDB schema and transactional state access;
+- `pipeline.py`: locking, incremental orchestration, duplicate decisions, and
+  atomic Markdown publication;
+- `validate.py`: catalog, filesystem, date, hash, and orphan invariants; and
+- `cli.py`: argument safety and deterministic JSON output.
+
+The old Parquet publisher, separate state/index services, and their commands are
+removed. Dependencies used only by that architecture, including PyArrow, are
+removed.
+
+## Research Interface
+
+Typical date-range discovery is a direct catalog query:
+
+```sql
+SELECT
+    article_id,
+    cleaned_markdown_path,
+    header_image_path,
+    inline_image_urls,
+    published_at_utc,
+    publication_date_new_york
+FROM articles
+WHERE publication_date_new_york
+      BETWEEN DATE '2024-01-01' AND DATE '2024-01-31'
+ORDER BY published_at_utc, article_id;
+```
+
+Text embedding jobs open `cleaned_markdown_path`. Multimodal jobs combine that
+file with `header_image_path` and may independently decide whether and how to
+retrieve `inline_image_urls`. Temporal graph jobs use the exact timestamp and
+New York date as event-time anchors. These downstream jobs write outside the
+preprocessing output contract.
 
 ## Documentation Architecture
 
-The user-facing documentation has exactly two entry points:
+There are exactly two user-facing documentation entry points:
 
-1. `README.md` is the concise operator landing page. It owns installation,
-   safety gates, the smoke-to-full workflow, common commands, output locations,
-   short query examples, and links to deeper material.
-2. `docs/architecture-crash-course.md` is the single deep guide. It teaches the
-   research motivation, end-to-end data flow, module boundaries, data
-   contracts, incremental state transitions, recovery properties, validation,
-   testing, extension procedures, and downstream research attachment points.
+1. `README.md`: concise installation, safety, smoke-to-full operation, common
+   queries, output layout, and navigation; and
+2. `docs/architecture-crash-course.md`: the single deep guide for researchers,
+   maintainers, and coding agents.
 
-The crash course is layered: a Python/SQL-literate researcher can stop after
-the conceptual walkthrough, while maintainers and coding agents can continue
-into tables, schemas, queues, atomicity, and change recipes. A Mermaid overview
-and compact tables are used only where relationships are clearer visually than
-in prose.
+The crash course moves from the research mental model through an article's
+end-to-end journey, module boundaries, schema and state transitions, recovery,
+validation, testing, safe extension recipes, downstream attachment points, a
+code-reading order, and a glossary.
 
-`AGENTS.md` remains a control file for coding agents rather than a third
-user-facing guide. This design specification remains the authoritative record
-of architectural decisions, and the implementation plan remains a historical
-execution record. Both link readers to the current README and crash course but
-do not duplicate operational instructions.
+`AGENTS.md` remains a coding-agent control file rather than a third user guide.
+This design specification is the architectural decision record, and the
+implementation plan is execution history. They link to current user-facing
+documentation without duplicating it.
 
-Documentation claims must be traceable to current code or smoke-scale tests.
-Verification checks every documented CLI command against `--help`, checks
-module/table/schema inventories against source, runs generated-fixture tests
-and the smoke command, validates internal Markdown links, and confirms Git
-tracks no raw or derived data. No documentation verification reads or processes
-the licensed corpus.
+Documentation verification checks CLI help, module/table inventories, internal
+Markdown links, fixture tests, lint, package build, the generated smoke command,
+and Git's tracked-file list. It never reads or processes the licensed archive.
 
-## CLI and Safety
+## Migration and Compatibility
 
-The package exposes `wsj-pipeline` with:
+The simplified catalog is intentionally incompatible with the earlier
+Parquet-oriented prototype. Because all generated output is ignored and
+reproducible, no automatic migration is provided. If an existing output root
+contains the legacy schema, the new pipeline stops with a concise instruction
+to move that derived directory aside or choose a fresh output root. It never
+deletes either legacy derived output or raw source data automatically.
 
-- `inventory`: inspect candidate counts and source layout;
-- `process`: extract a bounded set of new/changed records;
-- `publish`: deduplicate and publish affected partitions;
-- `index`: rebuild the DuckDB query index;
-- `validate`: check state, Parquet, and index invariants;
-- `run`: run the incremental stages in order;
-- `smoke`: run the entire workflow on generated test fixtures.
-
-Potentially large commands print source/output roots and an estimated candidate
-count before processing. Development documentation uses `smoke` and
-`--limit`. A full unbounded run requires an explicit `--full` flag; `run`
-without `--full` or `--limit` exits before processing. This prevents an agent
-or developer from accidentally launching a 100+ GB job.
-
-## Errors and Audits
-
-One malformed article does not stop a batch. Failures include stage, source
-path, stable error code, concise message, extractor version, and run ID.
-Warnings cover missing images, ambiguous image matches, metadata fallbacks,
-empty bodies, declared/observed word-count discrepancies, and suspicious date
-relationships.
-
-Fatal conditions stop publication: incompatible schema, corrupt operational
-state, lock contention, duplicate published article keys, partition/date
-mismatch, invalid timezone handling, unpublished state queues, or an index
-whose article provenance/date values differ from canonical Parquet.
-
-Corpus validation iterates projected Parquet batches containing only schema,
-identity, provenance, and publication-date columns. It never loads article body
-columns into Python or retains projected rows across batches. Global uniqueness,
-duplicate-reference, and Parquet/index equality checks execute inside DuckDB.
-
-Logs must not include article bodies, secrets, or licensed content excerpts.
-
-## Validation and Testing
-
-Unit tests use small synthetic HTML documents representing:
-
-- complete metadata and body;
-- missing image;
-- missing ID with canonical-URL fallback;
-- missing/invalid publication timestamp;
-- duplicate candidates and deterministic tie-breaking;
-- New York dates around UTC midnight and daylight-saving changes;
-- extraction failures and recovery;
-- changed and unchanged source fingerprints.
-
-Integration tests run the complete pipeline in a temporary directory and
-verify:
-
-- a second unchanged run performs no article extraction;
-- adding a new year processes only new files;
-- changing a source replaces the correct affected partition;
-- canonical article keys are unique;
-- audit rows point to valid source/winner keys;
-- Parquet and DuckDB contain identical canonical keys and date values;
-- an interrupted staged publication cannot damage an existing partition;
-- an unbounded `run` without `--full` is rejected.
-
-Repository verification runs formatting/linting, static checks where
-configured, unit tests, and the fixture-only smoke command. It may run a
-real-archive sample only with an explicit small `--limit`; it must never start
-the full archive job.
-
-## Documentation for Future Work
-
-`README.md` documents setup, commands, data layout, date semantics, sample
-queries, incremental additions, recovery, and the boundary between this
-pipeline and downstream research.
-
-The repository `AGENTS.md` tells future agents:
-
-- treat `data/wsj_archive` as immutable licensed input;
-- never run an unbounded archive job without explicit user authorization;
-- use generated fixtures or a very small explicit smoke limit;
-- keep raw and derived data out of Git;
-- preserve provenance, UTC/New York dates, deterministic ordering, and
-  idempotence;
-- update this design and schema documentation when changing extraction or
-  canonicalization behavior.
-
-## Out of Scope
-
-- text, image, or multimodal embeddings;
-- OCR, image caption generation, or image transformations;
-- entity/event extraction and temporal knowledge graphs;
-- market calendars, market data, labels, backtests, or trading strategies;
-- distributed execution and cloud orchestration;
-- recovering historical article revisions not present in the archive.
+The source archive layout and default source path remain compatible. The
+research interface changes from Parquet plus a separate date index to Markdown
+paths plus the single `articles` catalog table.
