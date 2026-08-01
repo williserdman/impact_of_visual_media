@@ -348,3 +348,49 @@ def test_orphan_cleanup_does_not_follow_symlinked_date_directory(
     assert external_victim.read_text(encoding="utf-8") == (
         "external file must survive"
     )
+
+
+def test_orphan_cleanup_symlink_loop_does_not_fail_committed_run(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    source_path = "2024/one.html"
+    write_article_fixture(
+        archive,
+        source_path,
+        article_id="WP-CLEANUP-LOOP",
+        published="2024-01-02T15:30:00Z",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    old_path = config.output_root / article_markdown_path(
+        "wsj:WP-CLEANUP-LOOP",
+        date(2024, 1, 2),
+    )
+    loop_directory = old_path.parent
+    old_path.unlink()
+    loop_directory.rmdir()
+    loop_directory.symlink_to(loop_directory, target_is_directory=True)
+    write_article_fixture(
+        archive,
+        source_path,
+        article_id="WP-CLEANUP-LOOP",
+        published="2024-02-03T15:30:00Z",
+        paragraphs=("Changed date and content.",),
+    )
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    new_path = config.output_root / article_markdown_path(
+        "wsj:WP-CLEANUP-LOOP",
+        date(2024, 2, 3),
+    )
+    assert summary.changed == 1
+    assert new_path.is_file()
+    assert loop_directory.is_symlink()
+    assert loop_directory.readlink() == loop_directory
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        run_status = connection.execute(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()[0]
+    assert run_status == "succeeded"

@@ -751,10 +751,6 @@ def _unlink_generated_file(output_root: Path, relative_path: str) -> None:
         return
 
     resolved_root = output_root.resolve()
-    resolved_parent = (resolved_root / relative.parent).resolve()
-    if not resolved_parent.is_relative_to(resolved_root):
-        return
-
     root_descriptor = _open_directory(resolved_root)
     parent_descriptor: int | None = None
     file_descriptor: int | None = None
