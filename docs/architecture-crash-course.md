@@ -265,12 +265,25 @@ traversal does not perform reconciliation.
 Changing `EXTRACTOR_VERSION` makes prior manifest rows stale. Without
 `--reprocess`, they are counted and marked seen but left untouched. This is a
 safety gate: a version bump never implies automatic corpus-wide work.
+Malformed or timezone-naive optional update timestamps are retained as a
+content-free warning and ranked as missing update metadata; the authoritative
+publication timestamp remains strict and timezone-aware.
 
 ## 9. Atomicity and recovery
 
-One `pipeline.lock` covers mutation and final validation. Publication uses a
-run-specific staging directory, verifies staged bytes, and atomically replaces
-the deterministic target before catalog changes commit.
+One `pipeline.lock` covers mutation and final validation. A validated run stays
+`running`, with no finish time or summary, until validation and final-summary
+persistence complete; only then does it make one terminal `succeeded` or
+`failed` transition. Publication uses a run-specific staging directory,
+verifies staged bytes, and atomically replaces the deterministic target before
+catalog changes commit.
+
+Catalog access rejects a symlink, non-regular file, or multiply linked catalog
+leaf before DuckDB can mutate it. Source discovery accepts only regular
+non-symlink HTML and local header-image leaves. Hashing, extraction, duplicate
+promotion, and validation reopen source-relative paths through no-follow
+directory descriptors so a post-discovery leaf swap cannot escape the source
+root.
 
 | Failure point | Durable result | Recovery |
 |---|---|---|
@@ -317,11 +330,12 @@ the corpus in Python. It reports stable, sorted, content-free issue codes for:
 
 - unsupported catalog or extractor versions and malformed relations;
 - duplicate article IDs, source paths, or Markdown paths;
-- unfinished runs and manifest/candidate/article inconsistencies;
+- unfinished runs, invalid persisted lifecycle domains, terminal
+  status/summary disagreement, and manifest/candidate/article inconsistencies;
 - incorrect winner selection, duplicate ranks, reasons, or references;
 - failed or missing sources still selected as winners;
 - missing, unsafe, or hash-mismatched Markdown files;
-- missing or unsafe local header-image paths;
+- missing or unsafe winning source-HTML and local header-image paths;
 - UTC-to-New-York date and dated-path disagreement;
 - invalid or duplicated inline HTTP(S) URLs; and
 - generated Markdown not referenced by the catalog.

@@ -6,6 +6,7 @@ import os
 from collections.abc import Iterator
 from pathlib import Path
 
+from wsj_pipeline.file_safety import stat_relative_regular
 from wsj_pipeline.models import SourceCandidate
 
 EXCLUDED_DIRECTORIES = frozenset({"__MACOSX"})
@@ -37,10 +38,11 @@ def discover_sources(
 
 
 def _walk_html(directory: Path, *, top_level: bool) -> Iterator[Path]:
-    entries: list[tuple[str, Path, bool]] = []
+    entries: list[tuple[str, Path, bool, bool]] = []
     with os.scandir(directory) as directory_entries:
         for entry in directory_entries:
-            is_directory = entry.is_dir(follow_symlinks=False)
+            is_symlink = entry.is_symlink()
+            is_directory = not is_symlink and entry.is_dir(follow_symlinks=False)
             if is_directory and (
                 entry.name.startswith(".")
                 or entry.name in EXCLUDED_DIRECTORIES
@@ -52,13 +54,17 @@ def _walk_html(directory: Path, *, top_level: bool) -> Iterator[Path]:
                     f"{entry.name}/" if is_directory else entry.name,
                     Path(entry.path),
                     is_directory,
+                    not is_symlink and entry.is_file(follow_symlinks=False),
                 )
             )
 
-    for _, path, is_directory in sorted(entries, key=lambda item: item[0]):
+    for _, path, is_directory, is_regular in sorted(
+        entries,
+        key=lambda item: item[0],
+    ):
         if is_directory:
             yield from _walk_html(path, top_level=False)
-        elif path.name.lower().endswith(".html"):
+        elif path.name.lower().endswith(".html") and is_regular:
             yield path
 
 
@@ -67,7 +73,8 @@ def _candidate_for(
     html_path: Path,
     image_index: dict[str, list[Path]],
 ) -> SourceCandidate:
-    html_stat = html_path.stat()
+    relative_html_path = html_path.relative_to(source_root).as_posix()
+    html_stat = stat_relative_regular(source_root, relative_html_path)
     image_paths = _matching_images(html_path, image_index)
     warnings: list[str] = []
 
@@ -79,10 +86,11 @@ def _candidate_for(
         if len(image_paths) > 1:
             warnings.append("multiple_images")
         image_path = image_paths[0]
-        image_stat = image_path.stat()
+        relative_image_path = image_path.relative_to(source_root).as_posix()
+        image_stat = stat_relative_regular(source_root, relative_image_path)
 
     return SourceCandidate(
-        relative_html_path=html_path.relative_to(source_root).as_posix(),
+        relative_html_path=relative_html_path,
         html_size=html_stat.st_size,
         html_mtime_ns=html_stat.st_mtime_ns,
         relative_header_image_path=(
@@ -112,7 +120,15 @@ def _matching_images(
 
 def _index_images(directory: Path) -> dict[str, list[Path]]:
     image_index: dict[str, list[Path]] = {}
-    for candidate in directory.iterdir():
-        if candidate.is_file() and candidate.suffix.casefold() in _IMAGE_PRIORITY:
-            image_index.setdefault(candidate.stem.casefold(), []).append(candidate)
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            candidate = Path(entry.path)
+            if (
+                not entry.is_symlink()
+                and entry.is_file(follow_symlinks=False)
+                and candidate.suffix.casefold() in _IMAGE_PRIORITY
+            ):
+                image_index.setdefault(candidate.stem.casefold(), []).append(
+                    candidate
+                )
     return image_index

@@ -70,6 +70,30 @@ def test_missing_image_is_valid_and_warned(tmp_path: Path) -> None:
     assert candidate.warnings == ("missing_image",)
 
 
+def test_discovery_excludes_html_and_header_image_leaf_symlinks(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    external_html = tmp_path / "external.html"
+    external_html.write_bytes(b"external synthetic article")
+    linked_html = archive / "2016" / "linked.html"
+    linked_html.parent.mkdir(parents=True)
+    linked_html.symlink_to(external_html)
+    real_html = archive / "2016" / "real.html"
+    create_file(real_html, b"real synthetic article")
+    external_image = tmp_path / "external.jpg"
+    external_image.write_bytes(b"external synthetic image")
+    (archive / "2016" / "real_main_image.jpg").symlink_to(external_image)
+
+    candidates = list(discover_sources(archive))
+
+    assert [candidate.relative_html_path for candidate in candidates] == [
+        "2016/real.html"
+    ]
+    assert candidates[0].relative_header_image_path is None
+    assert candidates[0].warnings == ("missing_image",)
+
+
 def test_ambiguous_images_use_extension_priority_and_warn(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     create_file(archive / "2016" / "story.html")
@@ -159,14 +183,14 @@ def test_image_pairing_scans_each_source_directory_once(
     for index in range(4):
         create_file(folder / f"story-{index}.html")
         create_file(folder / f"story-{index}_main_image.jpg")
-    real_iterdir = Path.iterdir
+    real_index_images = discovery_module._index_images
     scanned_directories: list[Path] = []
 
-    def counted_iterdir(path: Path):
+    def counted_index_images(path: Path):
         scanned_directories.append(path)
-        return real_iterdir(path)
+        return real_index_images(path)
 
-    monkeypatch.setattr(Path, "iterdir", counted_iterdir)
+    monkeypatch.setattr(discovery_module, "_index_images", counted_index_images)
 
     assert len(list(discover_sources(archive))) == 4
     assert scanned_directories.count(folder) == 1

@@ -14,9 +14,10 @@ from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
+from wsj_pipeline.file_safety import read_relative_regular, stat_relative_regular
 from wsj_pipeline.models import ExtractedArticle, SourceCandidate
 
-EXTRACTOR_VERSION = "3"
+EXTRACTOR_VERSION = "4"
 NEW_YORK = ZoneInfo("America/New_York")
 
 _EXCLUDED_TAGS = frozenset(
@@ -156,8 +157,12 @@ def extract_article(
 ) -> ExtractedArticle:
     """Extract one source into structured metadata and editorial Markdown."""
 
-    html_path = source_root / candidate.relative_html_path
-    html_bytes = html_path.read_bytes()
+    html_bytes = read_relative_regular(
+        source_root,
+        candidate.relative_html_path,
+    ).data
+    if candidate.relative_header_image_path is not None:
+        stat_relative_regular(source_root, candidate.relative_header_image_path)
     html_sha256 = hashlib.sha256(html_bytes).hexdigest()
     soup = BeautifulSoup(html_bytes, "lxml")
     metadata = _extract_metadata(soup)
@@ -194,10 +199,15 @@ def extract_article(
             "missing_publication_timestamp",
             "article has no publication timestamp",
         )
-    updated_at_utc = parse_wsj_timestamp(
-        _first_value(metadata, "article.updated", "dateModified")
-        or _json_string(news_article, "dateModified")
-    )
+    warnings = list(candidate.warnings)
+    try:
+        updated_at_utc = parse_wsj_timestamp(
+            _first_value(metadata, "article.updated", "dateModified")
+            or _json_string(news_article, "dateModified")
+        )
+    except ExtractionError:
+        updated_at_utc = None
+        warnings.append("invalid_optional_update")
 
     metadata_blocks = _metadata_blocks(headline, descriptive_metadata, authors)
     editorial_blocks, inline_image_urls = _extract_editorial_blocks(
@@ -206,7 +216,6 @@ def extract_article(
     )
     blocks = (*metadata_blocks, *editorial_blocks)
     markdown_text = "\n\n".join(blocks)
-    warnings = list(candidate.warnings)
     if not markdown_text:
         warnings.append("empty_content")
 

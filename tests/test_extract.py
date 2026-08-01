@@ -498,7 +498,7 @@ def test_extracts_structured_identity_dates_and_provenance(tmp_path: Path) -> No
     assert article.source_html_sha256 == hashlib.sha256(
         html_path.read_bytes()
     ).hexdigest()
-    assert article.extractor_version == extract_module.EXTRACTOR_VERSION == "3"
+    assert article.extractor_version == extract_module.EXTRACTOR_VERSION == "4"
     assert article.published_at_utc == datetime(2024, 1, 2, 15, 30, tzinfo=UTC)
     assert article.publication_date_new_york == date(2024, 1, 2)
     assert article.updated_at_utc == datetime(2024, 1, 2, 16, 0, tzinfo=UTC)
@@ -547,6 +547,30 @@ def test_publication_timestamp_failures_are_content_free(
     assert caught.value.code == code
     if published:
         assert published not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "updated",
+    ("malformed-optional-update", "2024-01-02T16:00:00"),
+    ids=("malformed", "naive"),
+)
+def test_invalid_optional_update_is_dropped_with_content_free_warning(
+    tmp_path: Path,
+    updated: str,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/story.html",
+        published="2024-01-02T15:30:00Z",
+        updated=updated,
+    )
+
+    article = extract_only_article(archive)
+
+    assert article.updated_at_utc is None
+    assert article.warnings == ("invalid_optional_update",)
+    assert updated not in repr(article.warnings)
 
 
 def test_missing_header_image_is_retained_as_warning(tmp_path: Path) -> None:

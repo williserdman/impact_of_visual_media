@@ -24,7 +24,11 @@ def test_fixture_smoke_proves_the_complete_markdown_catalog(
 ) -> None:
     observed: dict[str, object] = {}
 
-    def inspect_then_validate(config: PipelineConfig):
+    def inspect_then_validate(
+        config: PipelineConfig,
+        *,
+        _active_run_id: str | None = None,
+    ):
         with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
             observed["article_count"] = connection.execute(
                 "SELECT count(*) FROM articles"
@@ -49,7 +53,7 @@ def test_fixture_smoke_proves_the_complete_markdown_catalog(
             path.relative_to(config.output_root).as_posix()
             for path in sorted(config.text_root.rglob("*.md"))
         ]
-        report = validate_outputs(config)
+        report = validate_outputs(config, _active_run_id=_active_run_id)
         observed["validation_issues"] = report.issues
         return report
 

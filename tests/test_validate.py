@@ -203,6 +203,70 @@ def test_validation_enforces_exact_read_only_catalog_contract(
     assert all("private sentinel" not in issue.message for issue in report.issues)
 
 
+@pytest.mark.parametrize("leaf_kind", ("symlink", "directory", "hardlink"))
+def test_validation_rejects_unsafe_catalog_leaf_without_reading_it(
+    tmp_path: Path,
+    leaf_kind: str,
+) -> None:
+    config = PipelineConfig(tmp_path / "archive", tmp_path / "processed")
+    config.source_root.mkdir()
+    config.output_root.mkdir()
+    external = tmp_path / "private-sentinel.duckdb"
+    external.write_bytes(b"private sentinel bytes")
+    if leaf_kind == "symlink":
+        config.catalog_db.symlink_to(external)
+    elif leaf_kind == "directory":
+        config.catalog_db.mkdir()
+    else:
+        config.catalog_db.hardlink_to(external)
+    before = external.read_bytes()
+
+    report = validation.validate_outputs(config)
+
+    assert report.issues == (
+        validation.ValidationIssue(
+            "unsafe_catalog_path",
+            "catalog path is unsafe",
+        ),
+    )
+    assert external.read_bytes() == before
+    assert "private sentinel" not in report.issues[0].message
+
+
+def test_validation_rechecks_catalog_leaf_before_read_only_duckdb_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = PipelineConfig(tmp_path / "archive", tmp_path / "processed")
+    config.source_root.mkdir()
+    with Catalog.open(config.catalog_db):
+        pass
+    external = tmp_path / "external.duckdb"
+    with Catalog.open(external):
+        pass
+    external_before = external.read_bytes()
+    original_catalog = config.catalog_db.with_name("original.duckdb")
+    real_status = validation._catalog_file_status
+
+    def swap_after_initial_check(path: Path) -> str:
+        result = real_status(path)
+        path.rename(original_catalog)
+        path.symlink_to(external)
+        return result
+
+    monkeypatch.setattr(validation, "_catalog_file_status", swap_after_initial_check)
+
+    report = validation.validate_outputs(config)
+
+    assert report.issues == (
+        validation.ValidationIssue(
+            "unsafe_catalog_path",
+            "catalog path is unsafe",
+        ),
+    )
+    assert external.read_bytes() == external_before
+
+
 def test_validation_detects_unsupported_catalog_version(tmp_path: Path) -> None:
     config = _build_outputs(tmp_path)
     with duckdb.connect(str(config.catalog_db)) as connection:
@@ -656,6 +720,57 @@ def test_validation_detects_running_run(tmp_path: Path) -> None:
     assert "running_run" in _codes(config)
 
 
+@pytest.mark.parametrize(
+    ("status", "summary_json"),
+    (
+        ("succeeded", '{"validation_ok":false}'),
+        ("failed", '{"validation_ok":true}'),
+        ("succeeded", "not-json"),
+    ),
+)
+def test_validation_detects_terminal_status_summary_inconsistency(
+    tmp_path: Path,
+    status: str,
+    summary_json: str,
+) -> None:
+    config = _build_outputs(tmp_path)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(
+            "UPDATE runs SET status = ?, summary_json = ?",
+            [status, summary_json],
+        )
+
+    assert "inconsistent_run_summary" in _codes(config)
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_code"),
+    (
+        (
+            "UPDATE source_manifest SET status = 'processed'",
+            "invalid_manifest_status",
+        ),
+        ("UPDATE runs SET command = 'process'", "invalid_run_command"),
+        ("UPDATE runs SET scope = 'all'", "invalid_run_scope"),
+        ("UPDATE runs SET status = 'processed'", "invalid_run_status"),
+    ),
+    ids=("manifest-status", "run-command", "run-scope", "run-status"),
+)
+def test_validation_enforces_persisted_lifecycle_domains(
+    tmp_path: Path,
+    damage: str,
+    expected_code: str,
+) -> None:
+    config = _build_outputs(tmp_path)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(damage)
+
+    report = validation.validate_outputs(config)
+
+    assert expected_code in [issue.code for issue in report.issues]
+    assert all("processed" not in issue.message for issue in report.issues)
+
+
 @pytest.mark.parametrize("status", ["failed", "missing"])
 def test_validation_rejects_failed_or_missing_winner(
     tmp_path: Path,
@@ -763,6 +878,21 @@ def test_validation_does_not_follow_header_directory_symlink(
     real_directory.symlink_to(relocated, target_is_directory=True)
 
     assert "unsafe_header_image_path" in _codes(config)
+
+
+def test_validation_does_not_follow_winning_html_leaf_symlink(
+    tmp_path: Path,
+) -> None:
+    config = _build_outputs(tmp_path)
+    source_path = config.source_root / "2024/january.html"
+    external = tmp_path / "external.html"
+    external.write_bytes(source_path.read_bytes())
+    source_path.unlink()
+    source_path.symlink_to(external)
+
+    report = validation.validate_outputs(config)
+
+    assert "unsafe_source_html_path" in [issue.code for issue in report.issues]
 
 
 def test_validation_streams_each_catalog_file_before_requesting_the_next(

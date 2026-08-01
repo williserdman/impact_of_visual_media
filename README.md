@@ -153,6 +153,11 @@ the pipeline hashes HTML before deciding whether extraction is necessary.
 New content, changed HTML, and changed selected header images are processed in
 bounded transactions; unchanged content is not republished.
 
+Discovery and later source reads reject symlinked HTML or local header-image
+leaves and reopen accepted paths through no-follow source-relative descriptors.
+Malformed optional update timestamps become a stable warning and rank as
+missing update metadata; publication timestamps remain strict.
+
 An extractor-version change marks existing sources stale but does not silently
 start corpus-wide work. Reprocess an explicit scope:
 
@@ -185,6 +190,11 @@ stale lock, then rerun. Never delete the source archive to recover. If legacy
 or unsupported derived output is detected, move that generated directory
 aside or choose a fresh output root; the pipeline will not migrate or delete
 it automatically.
+
+The catalog leaf must be a single-link regular file; symlinks, directories, and
+hard links are refused before DuckDB mutation. A validated run remains
+nonterminal until validation completes and its final content-free summary is
+stored in the terminal transition.
 
 ## Development checks
 

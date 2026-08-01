@@ -360,9 +360,23 @@ def test_validated_pipeline_holds_lock_and_persists_returned_summary(
     write_article_fixture(archive, "2024/one.html", article_id="WP-ONE")
     config = PipelineConfig(archive, tmp_path / "processed")
 
-    def inspect_lock_then_validate(candidate_config: PipelineConfig):
+    def inspect_lock_then_validate(
+        candidate_config: PipelineConfig,
+        *,
+        _active_run_id: str | None = None,
+    ):
         assert candidate_config.lock_path.is_file()
-        return validate_outputs(candidate_config)
+        assert _active_run_id is not None
+        with Catalog.read_only(candidate_config.catalog_db) as connection:
+            assert connection.execute(
+                "SELECT status, finished_at, summary_json FROM runs "
+                "WHERE run_id = ?",
+                [_active_run_id],
+            ).fetchone() == ("running", None, None)
+        return validate_outputs(
+            candidate_config,
+            _active_run_id=_active_run_id,
+        )
 
     monkeypatch.setattr(
         pipeline_module,
@@ -384,6 +398,36 @@ def test_validated_pipeline_holds_lock_and_persists_returned_summary(
     assert status == "succeeded"
     assert json.loads(summary_json) == asdict(summary)
     assert summary.validation_ok is True
+
+
+def test_validated_pipeline_persists_failed_terminal_state_on_validator_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2024/one.html", article_id="WP-VALIDATE-ERROR")
+    config = PipelineConfig(archive, tmp_path / "processed")
+
+    def fail_validation(
+        _config: PipelineConfig,
+        *,
+        _active_run_id: str | None = None,
+    ):
+        assert _active_run_id is not None
+        raise RuntimeError("simulated validator failure")
+
+    monkeypatch.setattr(pipeline_module, "validate_outputs", fail_validation)
+
+    with pytest.raises(RuntimeError, match="simulated validator failure"):
+        run_validated_pipeline(config, limit=1, full=False)
+
+    with Catalog.read_only(config.catalog_db) as connection:
+        status, finished_at, summary_json = connection.execute(
+            "SELECT status, finished_at, summary_json FROM runs"
+        ).fetchone()
+    assert status == "failed"
+    assert finished_at is not None
+    assert json.loads(summary_json)["validation_ok"] is False
 
 
 def test_completed_full_run_removes_unseen_unique_article_and_markdown(
@@ -1106,6 +1150,50 @@ def test_rank_uses_lexical_source_path_as_final_tiebreaker() -> None:
     second = replace(first, relative_html_path="2024/b.html")
 
     assert min((second, first), key=candidate_rank) is first
+
+
+def test_invalid_optional_update_remains_a_ranked_duplicate_candidate(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/a-invalid.html",
+        article_id="WP-OPTIONAL-UPDATE-DUPLICATE",
+        updated="malformed-optional-update",
+    )
+    write_article_fixture(
+        archive,
+        "2024/z-valid.html",
+        article_id="WP-OPTIONAL-UPDATE-DUPLICATE",
+        updated="2024-01-03T16:00:00Z",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+
+    summary = run_validated_pipeline(config, limit=None, full=True)
+
+    assert summary.succeeded == 2
+    assert summary.failed == 0
+    assert summary.articles == 1
+    assert summary.duplicate_count == 1
+    assert summary.validation_ok is True
+    with Catalog.read_only(config.catalog_db) as connection:
+        assert connection.execute(
+            "SELECT source_html_path FROM articles"
+        ).fetchone() == ("2024/z-valid.html",)
+        assert connection.execute(
+            """
+            SELECT updated_at_utc, warnings
+            FROM candidates
+            WHERE source_html_path = '2024/a-invalid.html'
+            """
+        ).fetchone() == (None, ["invalid_optional_update"])
+        assert connection.execute(
+            "SELECT source_html_path, reason FROM duplicates"
+        ).fetchone() == (
+            "2024/a-invalid.html",
+            "lower_metadata_completeness",
+        )
 
 
 def test_recompute_writes_one_winner_and_content_free_audit_rows(

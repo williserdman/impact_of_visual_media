@@ -181,6 +181,15 @@ def test_run_lifecycle_records_deterministic_content_free_json(
     assert row[4] is not None
 
 
+def test_run_can_transition_from_running_only_once(tmp_path: Path) -> None:
+    with Catalog.open(tmp_path / "catalog.duckdb") as catalog:
+        run_id = catalog.begin_run("run", "limit:1")
+        catalog.finish_run(run_id, "failed", {"validation_ok": False})
+
+        with pytest.raises(CatalogError, match="run is not active"):
+            catalog.finish_run(run_id, "succeeded", {"validation_ok": True})
+
+
 def test_run_and_failure_records_reject_free_form_text(tmp_path: Path) -> None:
     with Catalog.open(tmp_path / "catalog.duckdb") as catalog:
         run_id = catalog.begin_run("run", "limit:1")
@@ -245,6 +254,31 @@ def test_open_rejects_malformed_version_one_schema_without_altering_it(
             ("metadata",),
             ("rogue",),
         ]
+
+
+@pytest.mark.parametrize("leaf_kind", ("symlink", "directory", "hardlink"))
+def test_open_rejects_unsafe_catalog_leaf_before_duckdb_access(
+    tmp_path: Path,
+    leaf_kind: str,
+) -> None:
+    database_path = tmp_path / "output" / "catalog.duckdb"
+    database_path.parent.mkdir()
+    external = tmp_path / "external.duckdb"
+    external.write_bytes(b"synthetic external bytes")
+    if leaf_kind == "symlink":
+        database_path.symlink_to(external)
+    elif leaf_kind == "directory":
+        database_path.mkdir()
+    else:
+        database_path.hardlink_to(external)
+    before = external.read_bytes()
+
+    with pytest.raises(CatalogError) as raised:
+        Catalog.open(database_path)
+
+    assert raised.value.code == "unsafe_catalog_path"
+    assert str(raised.value) == "catalog path is unsafe"
+    assert external.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -420,7 +454,7 @@ def test_classify_compares_manifest_fingerprints_and_extractor_version(
             "run-1",
             candidate,
             extractor_version="3",
-            status="processed",
+            status="succeeded",
             source_html_sha256="a" * 64,
             article_id="wsj:synthetic",
         )
@@ -435,6 +469,23 @@ def test_classify_compares_manifest_fingerprints_and_extractor_version(
     assert stale.kind == "stale_extractor"
     assert changed.kind == "stat_changed"
     assert changed.image_changed is True
+
+
+def test_replace_manifest_rejects_status_outside_persisted_domain(
+    tmp_path: Path,
+) -> None:
+    with (
+        Catalog.open(tmp_path / "catalog.duckdb") as catalog,
+        pytest.raises(CatalogError, match="invalid manifest status"),
+    ):
+        catalog.replace_manifest(
+            "run-1",
+            _candidate(),
+            extractor_version="4",
+            status="processed",
+            source_html_sha256="a" * 64,
+            article_id="wsj:synthetic",
+        )
 
 
 def test_failed_transaction_rolls_back_all_catalog_replacements(
@@ -454,7 +505,7 @@ def test_failed_transaction_rolls_back_all_catalog_replacements(
                 run_id,
                 candidate,
                 extractor_version=article.extractor_version,
-                status="processed",
+                status="succeeded",
                 source_html_sha256=article.source_html_sha256,
                 article_id=article.article_id,
             )

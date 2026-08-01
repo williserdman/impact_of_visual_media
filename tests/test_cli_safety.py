@@ -170,10 +170,14 @@ def test_failed_run_validation_persists_cli_summary_and_failed_status(
     config_path = tmp_path / "pipeline.toml"
     _write_config(config_path, archive, output)
 
-    def remove_markdown_then_validate(config: PipelineConfig):
+    def remove_markdown_then_validate(
+        config: PipelineConfig,
+        *,
+        _active_run_id: str | None = None,
+    ):
         [markdown_path] = config.text_root.rglob("*.md")
         markdown_path.unlink()
-        return validate_outputs(config)
+        return validate_outputs(config, _active_run_id=_active_run_id)
 
     monkeypatch.setattr(
         pipeline_module,

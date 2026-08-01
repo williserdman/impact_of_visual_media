@@ -224,7 +224,7 @@ git commit -m "refactor: name local header image explicitly"
 - Retain/adapt: `tests/test_dates.py`
 
 **Interfaces:**
-- `EXTRACTOR_VERSION = "3"`
+- `EXTRACTOR_VERSION = "4"`
 - `parse_wsj_timestamp(value: str | None) -> datetime | None`
 - `derive_publication_date_new_york(value: datetime) -> date`
 - `derive_article_id(wsj_id: str | None, canonical_url: str | None,

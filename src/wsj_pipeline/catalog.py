@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
@@ -144,6 +146,8 @@ _RUN_SCOPE_PATTERN = re.compile(
     r"(?:limit:[1-9][0-9]*(?:,reprocess)?|full(?:,reprocess)?|fixture)"
 )
 _RUN_STATUSES = {"succeeded", "failed"}
+_PERSISTED_RUN_STATUSES = _RUN_STATUSES | {"running"}
+_MANIFEST_STATUSES = {"succeeded", "failed", "missing"}
 _SUMMARY_COUNTERS = {
     "articles",
     "changed",
@@ -168,6 +172,9 @@ _FAILURE_MESSAGES = {
     "naive_timestamp": "timestamp has no timezone",
 }
 _EXTRACTOR_VERSION_PATTERN = re.compile(r"[1-9][0-9]*")
+_CATALOG_DIRECTORY_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 class CatalogError(RuntimeError):
@@ -176,6 +183,147 @@ class CatalogError(RuntimeError):
     def __init__(self, message: str, *, code: str = "invalid_catalog") -> None:
         super().__init__(message)
         self.code = code
+
+
+def _prepare_catalog_path(
+    path: Path,
+    *,
+    create: bool,
+) -> tuple[int, str, tuple[int, int] | None]:
+    """Anchor one safe DuckDB leaf below a no-follow parent descriptor."""
+
+    absolute_path = Path(os.path.abspath(path))
+    if (
+        not absolute_path.name
+        or absolute_path.name in {".", ".."}
+        or Path(absolute_path.name).name != absolute_path.name
+    ):
+        raise CatalogError("catalog path is unsafe", code="unsafe_catalog_path")
+    if create:
+        absolute_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        parent_descriptor = os.open(
+            absolute_path.parent,
+            _CATALOG_DIRECTORY_FLAGS,
+        )
+    except FileNotFoundError as error:
+        raise CatalogError(
+            "catalog path is missing",
+            code="missing_catalog",
+        ) from error
+    except OSError as error:
+        raise CatalogError(
+            "catalog path is unsafe",
+            code="unsafe_catalog_path",
+        ) from error
+
+    try:
+        try:
+            leaf_stat = os.stat(
+                absolute_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if not create:
+                raise CatalogError(
+                    "catalog path is missing",
+                    code="missing_catalog",
+                ) from None
+            return (
+                parent_descriptor,
+                f"/proc/self/fd/{parent_descriptor}/{absolute_path.name}",
+                None,
+            )
+        if not stat.S_ISREG(leaf_stat.st_mode) or leaf_stat.st_nlink != 1:
+            raise CatalogError(
+                "catalog path is unsafe",
+                code="unsafe_catalog_path",
+            )
+        anchored_path = f"/proc/self/fd/{parent_descriptor}/{absolute_path.name}"
+        return (
+            parent_descriptor,
+            anchored_path,
+            (leaf_stat.st_dev, leaf_stat.st_ino),
+        )
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+
+
+def _verify_catalog_leaf(
+    parent_descriptor: int,
+    leaf_name: str,
+    identity: tuple[int, int],
+) -> None:
+    """Reject a catalog leaf replaced while DuckDB was opening its pathname."""
+
+    try:
+        leaf_stat = os.stat(
+            leaf_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise CatalogError(
+            "catalog path is unsafe",
+            code="unsafe_catalog_path",
+        ) from error
+    if (
+        not stat.S_ISREG(leaf_stat.st_mode)
+        or leaf_stat.st_nlink != 1
+        or (leaf_stat.st_dev, leaf_stat.st_ino) != identity
+    ):
+        raise CatalogError("catalog path is unsafe", code="unsafe_catalog_path")
+
+
+def _create_fresh_catalog_leaf(
+    parent_descriptor: int,
+    leaf_name: str,
+) -> tuple[int, int]:
+    """Install a new empty DuckDB without overwriting a raced-in leaf."""
+
+    temporary_name = f".{leaf_name}.{uuid4().hex}.tmp"
+    temporary_path = f"/proc/self/fd/{parent_descriptor}/{temporary_name}"
+    try:
+        duckdb.connect(temporary_path).close()
+        temporary_stat = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(temporary_stat.st_mode)
+            or temporary_stat.st_nlink != 1
+        ):
+            raise CatalogError(
+                "catalog path is unsafe",
+                code="unsafe_catalog_path",
+            )
+        try:
+            os.link(
+                temporary_name,
+                leaf_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            raise CatalogError(
+                "catalog path is unsafe",
+                code="unsafe_catalog_path",
+            ) from error
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+    leaf_stat = os.stat(
+        leaf_name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISREG(leaf_stat.st_mode) or leaf_stat.st_nlink != 1:
+        raise CatalogError("catalog path is unsafe", code="unsafe_catalog_path")
+    return leaf_stat.st_dev, leaf_stat.st_ino
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,27 +383,78 @@ class ArticleRecord:
 class Catalog:
     """Own one compatible DuckDB connection and its SQL operations."""
 
-    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+    def __init__(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        parent_descriptor: int | None = None,
+    ) -> None:
         self.connection = connection
+        self._parent_descriptor = parent_descriptor
 
     @classmethod
     def open(cls, path: Path) -> Catalog:
         """Open ``path``, creating schema version 1 only for a fresh database."""
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        catalog = cls(duckdb.connect(str(path)))
+        parent_descriptor, anchored_path, identity = _prepare_catalog_path(
+            path,
+            create=True,
+        )
+        connection: duckdb.DuckDBPyConnection | None = None
+        try:
+            if identity is None:
+                identity = _create_fresh_catalog_leaf(
+                    parent_descriptor,
+                    path.name,
+                )
+            connection = duckdb.connect(anchored_path)
+            _verify_catalog_leaf(parent_descriptor, path.name, identity)
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            os.close(parent_descriptor)
+            raise
+        assert connection is not None
+        catalog = cls(connection, parent_descriptor)
         try:
             catalog._ensure_schema()
         except BaseException:
-            catalog.connection.close()
+            catalog.close()
             raise
         return catalog
+
+    @classmethod
+    @contextmanager
+    def read_only(
+        cls,
+        path: Path,
+    ) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Open a safe existing catalog through an anchored parent descriptor."""
+
+        parent_descriptor, anchored_path, identity = _prepare_catalog_path(
+            path,
+            create=False,
+        )
+        connection: duckdb.DuckDBPyConnection | None = None
+        try:
+            connection = duckdb.connect(anchored_path, read_only=True)
+            _verify_catalog_leaf(parent_descriptor, path.name, identity)
+            yield connection
+        finally:
+            if connection is not None:
+                connection.close()
+            os.close(parent_descriptor)
 
     def __enter__(self) -> Catalog:
         return self
 
     def __exit__(self, *_args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
         self.connection.close()
+        if self._parent_descriptor is not None:
+            os.close(self._parent_descriptor)
+            self._parent_descriptor = None
 
     def _ensure_schema(self) -> None:
         table_types = self._table_types(self.connection)
@@ -536,14 +735,17 @@ class Catalog:
             sort_keys=True,
             separators=(",", ":"),
         )
-        self.connection.execute(
+        transitioned = self.connection.execute(
             """
             UPDATE runs
             SET status = ?, summary_json = ?, finished_at = current_timestamp
-            WHERE run_id = ?
+            WHERE run_id = ? AND status = 'running'
+            RETURNING run_id
             """,
             [status, summary_json, run_id],
-        )
+        ).fetchone()
+        if transitioned is None:
+            raise CatalogError("run is not active")
 
     def classify(
         self,
@@ -719,6 +921,8 @@ class Catalog:
         source_html_sha256: str | None,
         article_id: str | None,
     ) -> None:
+        if status not in _MANIFEST_STATUSES:
+            raise CatalogError("invalid manifest status")
         self.connection.execute(
             """
             INSERT INTO source_manifest (

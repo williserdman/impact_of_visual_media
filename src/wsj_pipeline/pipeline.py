@@ -24,6 +24,7 @@ from wsj_pipeline.catalog import (
 from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.discovery import discover_sources
 from wsj_pipeline.extract import EXTRACTOR_VERSION, ExtractionError, extract_article
+from wsj_pipeline.file_safety import read_relative_regular, stat_relative_regular
 from wsj_pipeline.models import ExtractedArticle, SourceCandidate
 from wsj_pipeline.validate import ValidationReport, validate_outputs
 
@@ -301,6 +302,7 @@ def _execute_pipeline_run(
     limit: int | None,
     full: bool,
     reprocess: bool,
+    defer_success: bool,
 ) -> tuple[str, PipelineSummary]:
     """Process one run while the caller owns the pipeline lock."""
 
@@ -376,7 +378,10 @@ def _execute_pipeline_run(
                 catalog.article_count(),
                 catalog.duplicate_count(),
             )
-            catalog.finish_run(run_id, "succeeded", asdict(summary))
+            if not defer_success:
+                stored_summary = asdict(summary)
+                stored_summary.pop("validation_ok")
+                catalog.finish_run(run_id, "succeeded", stored_summary)
             return run_id, summary
         except Exception:
             with suppress(Exception):
@@ -410,12 +415,13 @@ def _run_pipeline_lifecycle(
             limit=limit,
             full=full,
             reprocess=reprocess,
+            defer_success=validator is not None,
         )
         if validator is None:
             return summary
 
         try:
-            validation = validator(config)
+            validation = validator(config, _active_run_id=run_id)
             summary = replace(summary, validation_ok=validation.ok)
             with Catalog.open(config.catalog_db) as catalog:
                 catalog.finish_run(
@@ -585,6 +591,12 @@ def _process_candidate(
     *,
     reprocess: bool,
 ) -> tuple[tuple[str, str], ...]:
+    stat_relative_regular(config.source_root, candidate.relative_html_path)
+    if candidate.relative_header_image_path is not None:
+        stat_relative_regular(
+            config.source_root,
+            candidate.relative_header_image_path,
+        )
     classification = catalog.classify(candidate, EXTRACTOR_VERSION)
     if classification.kind == "unchanged":
         counters["unchanged"] += 1
@@ -609,8 +621,12 @@ def _process_candidate(
             counters=counters,
         )
 
-    html_path = config.source_root / candidate.relative_html_path
-    source_html_sha256 = hashlib.sha256(html_path.read_bytes()).hexdigest()
+    source_html_sha256 = hashlib.sha256(
+        read_relative_regular(
+            config.source_root,
+            candidate.relative_html_path,
+        ).data
+    ).hexdigest()
     if (
         classification.kind == "stat_changed"
         and not classification.was_failed
@@ -860,9 +876,10 @@ def _recompute_article_in_transaction(
                 extractor_version=EXTRACTOR_VERSION,
                 status="failed",
                 source_html_sha256=hashlib.sha256(
-                    (
-                        config.source_root / selected.source_html_path
-                    ).read_bytes()
+                    read_relative_regular(
+                        config.source_root,
+                        selected.source_html_path,
+                    ).data
                 ).hexdigest(),
                 article_id=article_id,
             )
@@ -992,16 +1009,13 @@ def _source_for_stored_candidate(
     config: PipelineConfig,
     candidate: CandidateRecord,
 ) -> SourceCandidate:
-    html_path = config.source_root / candidate.source_html_path
-    html_stat = html_path.stat()
-    header_path = (
-        config.source_root / candidate.header_image_path
-        if candidate.header_image_path is not None
-        else None
+    html_stat = stat_relative_regular(
+        config.source_root,
+        candidate.source_html_path,
     )
     header_stat = (
-        header_path.stat()
-        if header_path is not None and header_path.is_file()
+        stat_relative_regular(config.source_root, candidate.header_image_path)
+        if candidate.header_image_path is not None
         else None
     )
     return SourceCandidate(

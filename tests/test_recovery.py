@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from datetime import date
@@ -12,8 +14,9 @@ import duckdb
 import pytest
 
 import wsj_pipeline.discovery as discovery_module
+import wsj_pipeline.pipeline as pipeline_module
 from tests.fixtures import write_article_fixture
-from wsj_pipeline.catalog import Catalog
+from wsj_pipeline.catalog import Catalog, CatalogError
 from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.pipeline import (
     PipelineLockedError,
@@ -390,6 +393,48 @@ def test_file_before_catalog_interruption_is_repaired_on_retry(
     assert stored_hash == sha256(published.read_bytes()).hexdigest()
 
 
+def test_abrupt_exit_at_validation_boundary_leaves_run_nonterminal(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/one.html",
+        article_id="WP-ABRUPT-VALIDATION",
+    )
+    output_root = tmp_path / "processed"
+    script = """
+import os
+import sys
+from pathlib import Path
+import wsj_pipeline.pipeline as pipeline
+from wsj_pipeline.config import PipelineConfig
+
+def abrupt_validator(_config, *, _active_run_id=None):
+    assert _active_run_id is not None
+    os._exit(73)
+
+pipeline.validate_outputs = abrupt_validator
+pipeline.run_validated_pipeline(
+    PipelineConfig(Path(sys.argv[1]), Path(sys.argv[2])),
+    limit=1,
+    full=False,
+)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(archive), str(output_root)],
+        check=False,
+    )
+
+    assert completed.returncode == 73
+    config = PipelineConfig(archive, output_root)
+    with Catalog.read_only(config.catalog_db) as connection:
+        assert connection.execute(
+            "SELECT status, finished_at, summary_json FROM runs"
+        ).fetchone() == ("running", None, None)
+
+
 def test_interrupted_full_inventory_does_not_reconcile_unseen_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -563,6 +608,154 @@ def test_legacy_output_is_refused_without_deletion(
         )
     else:
         assert marker.read_bytes() == b"legacy-derived-data"
+
+
+def test_catalog_symlink_cannot_mutate_source_owned_target(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/one.html",
+        article_id="WP-CATALOG-SYMLINK",
+    )
+    source_owned_catalog = archive / "raw-owned.duckdb"
+    with duckdb.connect(str(source_owned_catalog)) as connection:
+        connection.execute("CREATE TABLE source_marker (value INTEGER)")
+        connection.execute("INSERT INTO source_marker VALUES (7)")
+    config = PipelineConfig(archive, tmp_path / "processed")
+    config.output_root.mkdir()
+    config.catalog_db.symlink_to(source_owned_catalog)
+    source_before = {
+        path.relative_to(archive).as_posix(): path.read_bytes()
+        for path in sorted(archive.rglob("*"))
+        if path.is_file()
+    }
+
+    with pytest.raises(CatalogError) as raised:
+        run_validated_pipeline(config, limit=1, full=False)
+
+    source_after = {
+        path.relative_to(archive).as_posix(): path.read_bytes()
+        for path in sorted(archive.rglob("*"))
+        if path.is_file()
+    }
+    assert raised.value.code == "unsafe_catalog_path"
+    assert source_after == source_before
+    assert config.catalog_db.is_symlink()
+
+
+@pytest.mark.parametrize("swapped_leaf", ("html", "header"))
+def test_post_discovery_source_leaf_swap_cannot_publish_external_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swapped_leaf: str,
+) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2024/one.html",
+        article_id="WP-SOURCE-SWAP",
+    )
+    header_path = html_path.with_name("one_main_image.jpg")
+    external_root = tmp_path / "external"
+    external_html = write_article_fixture(
+        external_root,
+        "outside.html",
+        article_id="WP-SOURCE-SWAP",
+        paragraphs=("External sentinel must never be published.",),
+    )
+    external_leaf = (
+        external_html
+        if swapped_leaf == "html"
+        else external_html.with_name("outside_main_image.jpg")
+    )
+    swapped_path = html_path if swapped_leaf == "html" else header_path
+    original_path = swapped_path.with_name(f"{swapped_path.name}.original")
+    config = PipelineConfig(archive, tmp_path / "processed")
+    real_discover = pipeline_module.discover_sources
+    external_before = external_leaf.read_bytes()
+
+    def discover_then_swap(source_root: Path, limit: int | None = None):
+        candidates = list(real_discover(source_root, limit=limit))
+        swapped_path.rename(original_path)
+        swapped_path.symlink_to(external_leaf)
+        yield from candidates
+
+    monkeypatch.setattr(pipeline_module, "discover_sources", discover_then_swap)
+
+    with pytest.raises(RuntimeError, match="source path is unsafe"):
+        run_validated_pipeline(config, limit=1, full=False)
+
+    assert external_leaf.read_bytes() == external_before
+    assert not tuple(config.text_root.rglob("*.md"))
+    with Catalog.read_only(config.catalog_db) as connection:
+        assert connection.execute("SELECT count(*) FROM articles").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone() == ("failed",)
+
+
+def test_stored_candidate_promotion_does_not_follow_swapped_source_leaf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    winning_path = write_article_fixture(
+        archive,
+        "2024/a.html",
+        article_id="WP-PROMOTION-SWAP",
+        paragraphs=("Long synthetic winner.", "Second winning paragraph."),
+    )
+    losing_path = write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-PROMOTION-SWAP",
+        paragraphs=("Short loser.",),
+    )
+    config = PipelineConfig(archive, tmp_path / "processed", batch_size=1)
+    run_pipeline(config, limit=None, full=True)
+    winning_path.unlink()
+    winning_path.with_name("a_main_image.jpg").unlink()
+    external_root = tmp_path / "external"
+    external = write_article_fixture(
+        external_root,
+        "outside.html",
+        article_id="WP-PROMOTION-SWAP",
+        paragraphs=("External promotion sentinel must never be published.",),
+    )
+    external_before = external.read_bytes()
+    original_loser = losing_path.with_name("b.html.original")
+    real_reconcile = Catalog.reconcile_missing
+    swapped = False
+
+    def swap_before_reconciliation(
+        catalog: Catalog,
+        run_id: str,
+        *,
+        batch_size: int,
+    ) -> int:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            losing_path.rename(original_loser)
+            losing_path.symlink_to(external)
+        return real_reconcile(catalog, run_id, batch_size=batch_size)
+
+    monkeypatch.setattr(Catalog, "reconcile_missing", swap_before_reconciliation)
+
+    with pytest.raises(RuntimeError, match="source path is unsafe"):
+        run_pipeline(config, limit=None, full=True)
+
+    assert external.read_bytes() == external_before
+    assert all(
+        "External promotion sentinel" not in path.read_text(encoding="utf-8")
+        for path in config.text_root.rglob("*.md")
+    )
+    with Catalog.read_only(config.catalog_db) as connection:
+        assert connection.execute(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone() == ("failed",)
 
 
 def test_changed_date_moves_markdown_and_deletes_only_old_generated_file(

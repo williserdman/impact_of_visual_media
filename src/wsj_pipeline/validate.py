@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import errno
 import hashlib
+import json
 import os
 import stat
 from collections.abc import Iterator
@@ -14,13 +14,24 @@ from urllib.parse import urlsplit
 
 import duckdb
 
-from wsj_pipeline.catalog import CATALOG_SCHEMA_VERSION, Catalog, CatalogError
+from wsj_pipeline.catalog import (
+    _MANIFEST_STATUSES,
+    _PERSISTED_RUN_STATUSES,
+    _RUN_COMMANDS,
+    _RUN_SCOPE_PATTERN,
+    CATALOG_SCHEMA_VERSION,
+    Catalog,
+    CatalogError,
+)
 from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.extract import EXTRACTOR_VERSION, derive_publication_date_new_york
+from wsj_pipeline.file_safety import (
+    DIRECTORY_FLAGS,
+    open_relative_regular,
+    sha256_descriptor,
+)
 
-_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-_DIRECTORY_FLAGS = _READ_FLAGS | os.O_DIRECTORY
-_HASH_CHUNK_SIZE = 1024 * 1024
+_DIRECTORY_FLAGS = DIRECTORY_FLAGS
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +56,7 @@ class ValidationReport:
 @dataclass(frozen=True, slots=True)
 class _CatalogFile:
     article_id: str
+    source_html_path: str
     cleaned_markdown_path: str
     header_image_path: str | None
     inline_image_urls: tuple[str, ...]
@@ -53,7 +65,11 @@ class _CatalogFile:
     cleaned_markdown_sha256: str
 
 
-def validate_outputs(config: PipelineConfig) -> ValidationReport:
+def validate_outputs(
+    config: PipelineConfig,
+    *,
+    _active_run_id: str | None = None,
+) -> ValidationReport:
     """Return all catalog and filesystem violations in deterministic order."""
 
     catalog_status = _catalog_file_status(config.catalog_db)
@@ -67,7 +83,7 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
 
     issues: list[ValidationIssue] = []
     try:
-        with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        with Catalog.read_only(config.catalog_db) as connection:
             try:
                 Catalog.validate_schema(connection)
             except CatalogError as error:
@@ -91,10 +107,25 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
                         ),
                     )
                 )
-            _validate_relations(connection, issues)
+            _validate_relations(
+                connection,
+                issues,
+                active_run_id=_active_run_id,
+            )
             for item in _iter_catalog_files(connection):
                 _validate_catalog_file(config, item, issues)
             _validate_orphans(config, connection, issues)
+    except CatalogError as error:
+        messages = {
+            "missing_catalog": "catalog path is missing",
+            "unsafe_catalog_path": "catalog path is unsafe",
+        }
+        issues.append(
+            ValidationIssue(
+                error.code,
+                messages.get(error.code, "catalog path is unsafe"),
+            )
+        )
     except duckdb.Error:
         issues.append(
             ValidationIssue(
@@ -121,6 +152,8 @@ def _catalog_file_status(path: Path) -> str:
 def _validate_relations(
     connection: duckdb.DuckDBPyConnection,
     issues: list[ValidationIssue],
+    *,
+    active_run_id: str | None = None,
 ) -> None:
     schema_version = connection.execute(
         "SELECT value FROM metadata WHERE key = 'schema_version'"
@@ -155,6 +188,43 @@ def _validate_relations(
         "catalog rows use an unsupported extractor version",
     )
 
+    domain_checks = (
+        (
+            "invalid_manifest_status",
+            "SELECT count(*) FROM source_manifest WHERE status NOT IN "
+            f"({', '.join('?' for _ in _MANIFEST_STATUSES)})",
+            list(sorted(_MANIFEST_STATUSES)),
+            "source manifests use an invalid status",
+        ),
+        (
+            "invalid_run_command",
+            "SELECT count(*) FROM runs WHERE command NOT IN "
+            f"({', '.join('?' for _ in _RUN_COMMANDS)})",
+            list(sorted(_RUN_COMMANDS)),
+            "runs use an invalid command",
+        ),
+        (
+            "invalid_run_scope",
+            "SELECT count(*) FROM runs WHERE NOT regexp_full_match(scope, ?)",
+            [_RUN_SCOPE_PATTERN.pattern],
+            "runs use an invalid scope",
+        ),
+        (
+            "invalid_run_status",
+            "SELECT count(*) FROM runs WHERE status NOT IN "
+            f"({', '.join('?' for _ in _PERSISTED_RUN_STATUSES)})",
+            list(sorted(_PERSISTED_RUN_STATUSES)),
+            "runs use an invalid status",
+        ),
+    )
+    for code, query, parameters, message in domain_checks:
+        _append_count_issue(
+            issues,
+            code,
+            _count(connection, query, parameters),
+            message,
+        )
+
     duplicate_checks = (
         ("article_id", "duplicate_article_id"),
         ("source_html_path", "duplicate_source_html_path"),
@@ -182,13 +252,52 @@ def _validate_relations(
 
     running_runs = _count(
         connection,
-        "SELECT count(*) FROM runs WHERE status = 'running'",
+        """
+        SELECT count(*)
+        FROM runs
+        WHERE status = 'running'
+          AND (? IS NULL OR run_id <> ?)
+        """,
+        [active_run_id, active_run_id],
     )
     _append_count_issue(
         issues,
         "running_run",
         running_runs,
         "catalog contains unfinished running runs",
+    )
+    inconsistent_run_summaries = 0
+    for status, finished_at, summary_json in connection.execute(
+        "SELECT status, finished_at, summary_json FROM runs"
+    ).fetchall():
+        if status == "running":
+            if finished_at is not None or summary_json is not None:
+                inconsistent_run_summaries += 1
+            continue
+        if status not in {"succeeded", "failed"}:
+            continue
+        if finished_at is None or summary_json is None:
+            inconsistent_run_summaries += 1
+            continue
+        try:
+            summary = json.loads(summary_json)
+        except (TypeError, ValueError):
+            inconsistent_run_summaries += 1
+            continue
+        if not isinstance(summary, dict):
+            inconsistent_run_summaries += 1
+            continue
+        validation_ok = summary.get("validation_ok")
+        if "validation_ok" in summary and (
+            not isinstance(validation_ok, bool)
+            or validation_ok != (status == "succeeded")
+        ):
+            inconsistent_run_summaries += 1
+    _append_count_issue(
+        issues,
+        "inconsistent_run_summary",
+        inconsistent_run_summaries,
+        "run terminal status and summary are inconsistent",
     )
 
     inconsistent_manifest_winners = _count(
@@ -458,7 +567,7 @@ def _validate_relations(
 def _count(
     connection: duckdb.DuckDBPyConnection,
     query: str,
-    parameters: list[str] | None = None,
+    parameters: list[object] | None = None,
 ) -> int:
     return int(connection.execute(query, parameters or []).fetchone()[0])
 
@@ -480,7 +589,8 @@ def _iter_catalog_files(
 
     result = connection.execute(
         """
-        SELECT article_id, cleaned_markdown_path, header_image_path,
+        SELECT article_id, source_html_path, cleaned_markdown_path,
+               header_image_path,
                inline_image_urls, published_at_utc,
                publication_date_new_york, cleaned_markdown_sha256
         FROM articles
@@ -490,12 +600,13 @@ def _iter_catalog_files(
     while row := result.fetchone():
         yield _CatalogFile(
             article_id=row[0],
-            cleaned_markdown_path=row[1],
-            header_image_path=row[2],
-            inline_image_urls=tuple(row[3]),
-            published_at_utc=row[4],
-            publication_date_new_york=row[5],
-            cleaned_markdown_sha256=row[6],
+            source_html_path=row[1],
+            cleaned_markdown_path=row[2],
+            header_image_path=row[3],
+            inline_image_urls=tuple(row[4]),
+            published_at_utc=row[5],
+            publication_date_new_york=row[6],
+            cleaned_markdown_sha256=row[7],
         )
 
 
@@ -528,7 +639,28 @@ def _validate_catalog_file(
             )
         )
 
-    markdown_status, descriptor = _open_relative_regular(
+    source_status, descriptor = open_relative_regular(
+        config.source_root,
+        item.source_html_path,
+    )
+    if descriptor is not None:
+        os.close(descriptor)
+    if source_status == "missing":
+        issues.append(
+            ValidationIssue(
+                "missing_source_html",
+                f"source HTML is missing: {item.source_html_path}",
+            )
+        )
+    elif source_status == "unsafe":
+        issues.append(
+            ValidationIssue(
+                "unsafe_source_html_path",
+                f"source HTML path is unsafe: {item.source_html_path}",
+            )
+        )
+
+    markdown_status, descriptor = open_relative_regular(
         config.output_root,
         item.cleaned_markdown_path,
     )
@@ -548,7 +680,7 @@ def _validate_catalog_file(
         )
     else:
         assert descriptor is not None
-        actual_hash = _sha256_descriptor(descriptor)
+        actual_hash = sha256_descriptor(descriptor)
         if actual_hash != item.cleaned_markdown_sha256:
             issues.append(
                 ValidationIssue(
@@ -558,7 +690,7 @@ def _validate_catalog_file(
             )
 
     if item.header_image_path is not None:
-        header_status, descriptor = _open_relative_regular(
+        header_status, descriptor = open_relative_regular(
             config.source_root,
             item.header_image_path,
         )
@@ -618,81 +750,6 @@ def _valid_http_url(value: object) -> bool:
     except ValueError:
         return False
     return parsed.scheme.lower() in {"http", "https"} and bool(parsed.hostname)
-
-
-def _open_relative_regular(root: Path, relative_value: str) -> tuple[str, int | None]:
-    relative = Path(relative_value)
-    if (
-        relative.is_absolute()
-        or not relative.parts
-        or any(not _safe_component(part) for part in relative.parts)
-    ):
-        return "unsafe", None
-
-    try:
-        root_descriptor = os.open(root, _DIRECTORY_FLAGS)
-    except FileNotFoundError:
-        return "missing", None
-    except OSError:
-        return "unsafe", None
-
-    parent_descriptor = os.dup(root_descriptor)
-    file_descriptor: int | None = None
-    try:
-        for component in relative.parts[:-1]:
-            try:
-                next_descriptor = os.open(
-                    component,
-                    _DIRECTORY_FLAGS,
-                    dir_fd=parent_descriptor,
-                )
-            except FileNotFoundError:
-                return "missing", None
-            except OSError:
-                return "unsafe", None
-            os.close(parent_descriptor)
-            parent_descriptor = next_descriptor
-
-        try:
-            file_descriptor = os.open(
-                relative.parts[-1],
-                _READ_FLAGS,
-                dir_fd=parent_descriptor,
-            )
-        except FileNotFoundError:
-            return "missing", None
-        except OSError as error:
-            if error.errno == errno.ENOENT:
-                return "missing", None
-            return "unsafe", None
-        file_stat = os.fstat(file_descriptor)
-        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1:
-            os.close(file_descriptor)
-            file_descriptor = None
-            return "unsafe", None
-        return "ok", file_descriptor
-    finally:
-        os.close(parent_descriptor)
-        os.close(root_descriptor)
-
-
-def _safe_component(component: str) -> bool:
-    return (
-        bool(component)
-        and component not in {".", ".."}
-        and Path(component).name == component
-    )
-
-
-def _sha256_descriptor(descriptor: int) -> str:
-    digest = hashlib.sha256()
-    try:
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            while chunk := stream.read(_HASH_CHUNK_SIZE):
-                digest.update(chunk)
-    finally:
-        os.close(descriptor)
-    return digest.hexdigest()
 
 
 def _validate_orphans(
