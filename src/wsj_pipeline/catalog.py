@@ -156,6 +156,7 @@ class CandidateStatus:
     old_html_sha256: str | None = None
     old_article_id: str | None = None
     image_changed: bool = False
+    was_failed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -502,11 +503,13 @@ class Catalog:
 
         old_html_sha256 = row[5]
         old_article_id = row[7]
+        was_failed = row[8] == "failed"
         if row[6] != extractor_version:
             return CandidateStatus(
                 "stale_extractor",
                 old_html_sha256,
                 old_article_id,
+                was_failed=was_failed,
             )
 
         current_fingerprint = (
@@ -521,6 +524,7 @@ class Catalog:
                 "unchanged",
                 old_html_sha256,
                 old_article_id,
+                was_failed=was_failed,
             )
 
         image_changed = tuple(row[2:5]) != current_fingerprint[2:5]
@@ -529,7 +533,22 @@ class Catalog:
             old_html_sha256,
             old_article_id,
             image_changed,
+            was_failed,
         )
+
+    def mark_seen(self, run_id: str, source_html_path: str) -> None:
+        """Mark a discovered row seen without changing its stored fingerprint."""
+
+        result = self.connection.execute(
+            """
+            UPDATE source_manifest
+            SET last_seen_run_id = ?
+            WHERE source_html_path = ?
+            """,
+            [run_id, source_html_path],
+        )
+        if result.fetchone()[0] != 1:
+            raise CatalogError("cannot mark an unknown source manifest row as seen")
 
     def replace_manifest(
         self,
@@ -789,6 +808,24 @@ class Catalog:
             publication_date_new_york=row[6],
             cleaned_markdown_sha256=row[7],
         )
+
+    def article_count(self) -> int:
+        """Return the number of current research article rows."""
+
+        return int(
+            self.connection.execute("SELECT count(*) FROM articles").fetchone()[0]
+        )
+
+    def remove_article(self, article_id: str) -> ArticleRecord | None:
+        """Remove and return one research row inside the caller's transaction."""
+
+        existing = self.article_for_id(article_id)
+        if existing is not None:
+            self.connection.execute(
+                "DELETE FROM articles WHERE article_id = ?",
+                [article_id],
+            )
+        return existing
 
 
 def _validate_summary(summary: Mapping[str, object]) -> None:

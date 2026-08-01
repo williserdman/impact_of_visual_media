@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from tests.fixtures import write_article_fixture
 from wsj_pipeline.catalog import Catalog
@@ -18,6 +20,8 @@ from wsj_pipeline.pipeline import (
     article_markdown_path,
     candidate_rank,
     recompute_article,
+    run_pipeline,
+    write_markdown_atomic,
 )
 
 
@@ -96,6 +100,454 @@ def test_pipeline_summary_exposes_only_approved_counts_and_validation() -> None:
         "articles": 0,
         "validation_ok": False,
     }
+
+
+def test_atomic_markdown_reopens_and_verifies_staged_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "processed"
+    staging_root = output_root / "staging"
+    target = output_root / "text" / "article.md"
+    relative_target = target.relative_to(output_root).as_posix()
+    staged = staging_root / "run-1" / (
+        f"{sha256(relative_target.encode()).hexdigest()}.md"
+    )
+    real_open = os.open
+
+    def corrupt_before_reopen(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        if Path(path) == staged and not flags & os.O_CREAT:
+            staged.write_bytes(b"corrupt staged bytes")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", corrupt_before_reopen)
+
+    with pytest.raises(ValueError, match="staged Markdown verification failed"):
+        write_markdown_atomic("expected", target, staging_root, "run-1")
+
+    assert not target.exists()
+    assert list(staging_root.rglob("*")) == []
+
+
+def test_failed_atomic_markdown_replace_preserves_target_and_cleans_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "processed"
+    staging_root = output_root / "staging"
+    target = output_root / "text" / "article.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("original", encoding="utf-8")
+
+    def fail_replace(_source: Path, destination: Path) -> None:
+        assert Path(destination) == target
+        raise OSError("simulated replacement interruption")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated replacement interruption"):
+        write_markdown_atomic("replacement", target, staging_root, "run-2")
+
+    assert target.read_text(encoding="utf-8") == "original"
+    assert list(staging_root.rglob("*")) == []
+
+
+def test_atomic_markdown_refuses_targets_outside_output_root(
+    tmp_path: Path,
+) -> None:
+    staging_root = tmp_path / "processed" / "staging"
+    outside_target = tmp_path / "outside.md"
+
+    with pytest.raises(ValueError, match="target must be inside output root"):
+        write_markdown_atomic(
+            "must not escape",
+            outside_target,
+            staging_root,
+            "run-3",
+        )
+
+    assert not outside_target.exists()
+
+
+def test_atomic_markdown_refuses_preexisting_staged_symlink(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "processed"
+    staging_root = output_root / "staging"
+    run_staging = staging_root / "run-symlink"
+    target = output_root / "text" / "article.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("original target", encoding="utf-8")
+    outside = tmp_path / "outside-victim.md"
+    outside.write_text("outside original", encoding="utf-8")
+    relative_target = target.relative_to(output_root).as_posix()
+    staged = run_staging / f"{sha256(relative_target.encode()).hexdigest()}.md"
+    run_staging.mkdir(parents=True)
+    staged.symlink_to(outside)
+
+    with pytest.raises(FileExistsError):
+        write_markdown_atomic(
+            "maliciously redirected replacement",
+            target,
+            staging_root,
+            "run-symlink",
+        )
+
+    assert target.read_text(encoding="utf-8") == "original target"
+    assert not target.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "outside original"
+    assert list(staging_root.rglob("*")) == []
+
+
+def test_pipeline_extracts_new_sources_then_skips_unchanged_rerun(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2024/one.html", article_id="WP-ONE")
+    write_article_fixture(archive, "2024/two.html", article_id="WP-TWO")
+    config = PipelineConfig(archive, tmp_path / "processed", batch_size=1)
+
+    first = run_pipeline(config, limit=10, full=False)
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.extract_article",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged source was extracted")
+        ),
+    )
+    second = run_pipeline(config, limit=10, full=False)
+
+    assert first == PipelineSummary(
+        discovered=2,
+        new=2,
+        succeeded=2,
+        articles=2,
+    )
+    assert second == PipelineSummary(
+        discovered=2,
+        unchanged=2,
+        articles=2,
+    )
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        seen_run_ids = connection.execute(
+            "SELECT DISTINCT last_seen_run_id FROM source_manifest"
+        ).fetchall()
+        latest_run_id = connection.execute(
+            "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()[0]
+    assert seen_run_ids == [(latest_run_id,)]
+
+
+def test_mtime_only_change_updates_manifest_without_extraction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2024/one.html",
+        article_id="WP-MTIME",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    markdown_path = next(config.text_root.rglob("*.md"))
+    original_markdown_hash = sha256(markdown_path.read_bytes()).hexdigest()
+    original = html_path.stat()
+    os.utime(
+        html_path,
+        ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000),
+    )
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.extract_article",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("mtime-only source was extracted")
+        ),
+    )
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.metadata_only == 1
+    assert summary.succeeded == 0
+    assert sha256(markdown_path.read_bytes()).hexdigest() == original_markdown_hash
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        stored_mtime = connection.execute(
+            "SELECT html_mtime_ns FROM source_manifest"
+        ).fetchone()[0]
+    assert stored_mtime == html_path.stat().st_mtime_ns
+
+
+def test_html_change_reextracts_and_republishes_markdown(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2024/one.html",
+        article_id="WP-CHANGED",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    html_path.write_text(
+        html_path.read_text(encoding="utf-8").replace(
+            "First paragraph.",
+            "A materially changed first paragraph.",
+        ),
+        encoding="utf-8",
+    )
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.changed == 1
+    assert summary.succeeded == 1
+    assert "materially changed" in next(config.text_root.rglob("*.md")).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_header_image_only_change_reextracts_candidate(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2024/one.html",
+        article_id="WP-IMAGE",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    image_path = html_path.with_name("one_main_image.jpg")
+    image_path.write_bytes(b"materially-different-synthetic-image")
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.changed == 1
+    assert summary.succeeded == 1
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        stored_size = connection.execute(
+            "SELECT header_image_size FROM source_manifest"
+        ).fetchone()[0]
+    assert stored_size == image_path.stat().st_size
+
+
+def test_missing_header_image_is_a_successful_candidate_warning(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/one.html",
+        article_id="WP-NO-IMAGE",
+        with_image=False,
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.succeeded == 1
+    assert summary.failed == 0
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        header_image_path, warnings = connection.execute(
+            "SELECT header_image_path, warnings FROM candidates"
+        ).fetchone()
+    assert header_image_path is None
+    assert warnings == ["missing_image"]
+
+
+def test_extraction_failure_is_isolated_and_run_finishes(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/a-malformed.html",
+        article_id="WP-BAD",
+        published=None,
+    )
+    write_article_fixture(
+        archive,
+        "2024/b-valid.html",
+        article_id="WP-GOOD",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed", batch_size=2)
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.failed == 1
+    assert summary.succeeded == 1
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        failure = connection.execute(
+            "SELECT source_html_path, error_code, message FROM failures"
+        ).fetchone()
+        manifests = connection.execute(
+            "SELECT source_html_path, status FROM source_manifest "
+            "ORDER BY source_html_path"
+        ).fetchall()
+        run_status = connection.execute(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()[0]
+    assert failure == (
+        "2024/a-malformed.html",
+        "missing_publication_timestamp",
+        "article has no publication timestamp",
+    )
+    assert manifests == [
+        ("2024/a-malformed.html", "failed"),
+        ("2024/b-valid.html", "succeeded"),
+    ]
+    assert run_status == "succeeded"
+
+
+def test_unchanged_failed_source_is_marked_seen_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/malformed.html",
+        article_id="WP-PERMANENT-FAILURE",
+        published=None,
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    first = run_pipeline(config, limit=10, full=False)
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.extract_article",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unchanged failed source was retried")
+        ),
+    )
+
+    second = run_pipeline(config, limit=10, full=False)
+
+    assert first.new == 1
+    assert first.failed == 1
+    assert second.unchanged == 1
+    assert second.failed == 0
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        status, seen_run_id = connection.execute(
+            "SELECT status, last_seen_run_id FROM source_manifest"
+        ).fetchone()
+        second_run_id = connection.execute(
+            "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()[0]
+    assert status == "failed"
+    assert seen_run_id == second_run_id
+
+
+def test_failed_source_stat_change_retries_without_metadata_only_success(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2024/malformed.html",
+        article_id="WP-RETRY-FAILURE",
+        published=None,
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    original = html_path.stat()
+    os.utime(
+        html_path,
+        ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000),
+    )
+
+    retried = run_pipeline(config, limit=10, full=False)
+
+    assert retried.changed == 1
+    assert retried.metadata_only == 0
+    assert retried.failed == 1
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        status = connection.execute(
+            "SELECT status FROM source_manifest"
+        ).fetchone()[0]
+    assert status == "failed"
+
+
+def test_stale_failed_source_requires_reprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/malformed.html",
+        article_id="WP-STALE-FAILURE",
+        published=None,
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(
+            "UPDATE source_manifest SET extractor_version = '1'"
+        )
+    real_extract = extract_article
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.extract_article",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale failed source retried without --reprocess")
+        ),
+    )
+
+    skipped = run_pipeline(config, limit=10, full=False)
+
+    assert skipped.stale == 1
+    assert skipped.failed == 0
+    monkeypatch.setattr("wsj_pipeline.pipeline.extract_article", real_extract)
+    reprocessed = run_pipeline(
+        config,
+        limit=10,
+        full=False,
+        reprocess=True,
+    )
+    assert reprocessed.reprocessed == 1
+    assert reprocessed.failed == 1
+
+
+def test_stale_extractor_is_marked_seen_and_requires_reprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2024/one.html", article_id="WP-STALE")
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(
+            "UPDATE source_manifest SET extractor_version = '1'"
+        )
+    real_extract = extract_article
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.extract_article",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale source was extracted without --reprocess")
+        ),
+    )
+
+    skipped = run_pipeline(config, limit=10, full=False)
+
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        stored_version, seen_run_id = connection.execute(
+            "SELECT extractor_version, last_seen_run_id FROM source_manifest"
+        ).fetchone()
+        skipped_run_id = connection.execute(
+            "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()[0]
+    assert skipped.stale == 1
+    assert skipped.succeeded == 0
+    assert stored_version == "1"
+    assert seen_run_id == skipped_run_id
+
+    monkeypatch.setattr("wsj_pipeline.pipeline.extract_article", real_extract)
+    reprocessed = run_pipeline(
+        config,
+        limit=10,
+        full=False,
+        reprocess=True,
+    )
+
+    assert reprocessed.reprocessed == 1
+    assert reprocessed.succeeded == 1
 
 
 def test_rank_prefers_nonempty_content_before_all_other_metrics() -> None:
