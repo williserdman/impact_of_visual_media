@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -484,6 +485,65 @@ def test_failed_current_winner_promotes_valid_duplicate(
     assert winner == ("2024/a.html",)
     assert failed == ("failed",)
     assert candidates == [("2024/a.html",)]
+
+
+def test_failed_winner_and_malformed_stored_fallback_do_not_fail_run(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    for relative_path in ("2024/a.html", "2024/b.html"):
+        write_article_fixture(
+            archive,
+            relative_path,
+            article_id="WP-FAILED-FALLBACK",
+            paragraphs=("Identically ranked synthetic content.",),
+        )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    markdown_path = config.output_root / article_markdown_path(
+        "wsj:WP-FAILED-FALLBACK",
+        date(2024, 1, 2),
+    )
+    for relative_path in ("2024/a.html", "2024/b.html"):
+        write_article_fixture(
+            archive,
+            relative_path,
+            article_id="WP-FAILED-FALLBACK",
+            published=None,
+        )
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.failed == 2
+    assert summary.removed == 0
+    assert summary.articles == 0
+    assert not markdown_path.exists()
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        run_status = connection.execute(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()[0]
+        manifests = connection.execute(
+            "SELECT source_html_path, status FROM source_manifest "
+            "ORDER BY source_html_path"
+        ).fetchall()
+        failures = connection.execute(
+            "SELECT source_html_path, error_code FROM failures "
+            "WHERE run_id = (SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1) "
+            "ORDER BY source_html_path"
+        ).fetchall()
+        candidate_count = connection.execute(
+            "SELECT count(*) FROM candidates"
+        ).fetchone()[0]
+    assert run_status == "succeeded"
+    assert manifests == [
+        ("2024/a.html", "failed"),
+        ("2024/b.html", "failed"),
+    ]
+    assert failures == [
+        ("2024/a.html", "missing_publication_timestamp"),
+        ("2024/b.html", "missing_publication_timestamp"),
+    ]
+    assert candidate_count == 0
 
 
 def test_failed_only_candidate_removes_article_and_markdown(
@@ -1069,6 +1129,52 @@ def test_recompute_reuses_valid_stored_winner_without_reextracting(
         )
 
     assert second == first
+
+
+def test_public_recompute_removes_article_and_generated_file_when_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, articles = _duplicate_articles(tmp_path)
+    only_candidate = articles[0]
+    real_transaction = Catalog.transaction
+    transaction_observed = False
+
+    with Catalog.open(config.catalog_db) as catalog:
+        run_id = catalog.begin_run("run", "fixture")
+        original = recompute_article(
+            catalog,
+            config,
+            only_candidate.article_id,
+            run_id,
+            current_articles=(only_candidate,),
+        )
+        assert original is not None
+        markdown_path = config.output_root / original.cleaned_markdown_path
+        catalog.remove_candidate(only_candidate.relative_html_path)
+
+        @contextmanager
+        def observing_transaction(current_catalog: Catalog):
+            nonlocal transaction_observed
+            with real_transaction(current_catalog):
+                yield
+                transaction_observed = True
+                assert current_catalog.article_for_id(only_candidate.article_id) is None
+                assert markdown_path.is_file()
+
+        monkeypatch.setattr(Catalog, "transaction", observing_transaction)
+        removed = recompute_article(
+            catalog,
+            config,
+            only_candidate.article_id,
+            run_id,
+            current_articles=(),
+        )
+
+        assert removed is None
+        assert catalog.article_for_id(only_candidate.article_id) is None
+    assert transaction_observed
+    assert not markdown_path.exists()
 
 
 def test_recompute_uses_current_alternative_when_stored_winner_is_invalid(

@@ -290,6 +290,7 @@ def run_pipeline(
                             run_id,
                             current_articles=(),
                             remove_if_empty=True,
+                            counters=counters,
                         )
                         orphan_candidates.extend(orphans)
                 _cleanup_orphans(catalog, config, orphan_candidates)
@@ -369,6 +370,7 @@ def _process_candidate(
             candidate.relative_html_path,
             run_id,
             was_failed=classification.was_failed,
+            counters=counters,
         )
     if classification.kind == "stale_extractor" and not reprocess:
         counters["stale"] += 1
@@ -379,6 +381,7 @@ def _process_candidate(
             candidate.relative_html_path,
             run_id,
             was_failed=classification.was_failed,
+            counters=counters,
         )
 
     html_path = config.source_root / candidate.relative_html_path
@@ -432,6 +435,7 @@ def _process_candidate(
             candidate.relative_html_path,
             run_id,
             was_failed=True,
+            counters=counters,
         )
 
     orphan_candidates: tuple[tuple[str, str], ...] = ()
@@ -447,6 +451,7 @@ def _process_candidate(
             run_id,
             current_articles=(),
             remove_if_empty=True,
+            counters=counters,
         )
         orphan_candidates += old_orphans
     winner, new_orphans = _recompute_article_in_transaction(
@@ -455,6 +460,7 @@ def _process_candidate(
         article.article_id,
         run_id,
         current_articles=(article,),
+        counters=counters,
     )
     orphan_candidates += new_orphans
     if winner is None:
@@ -478,6 +484,7 @@ def _reconcile_failed_candidate(
     run_id: str,
     *,
     was_failed: bool,
+    counters: dict[str, int],
 ) -> tuple[tuple[str, str], ...]:
     if not was_failed:
         return ()
@@ -491,6 +498,7 @@ def _reconcile_failed_candidate(
         run_id,
         current_articles=(),
         remove_if_empty=True,
+        counters=counters,
     )
     return orphan_candidates
 
@@ -556,6 +564,7 @@ def recompute_article(
             run_id,
             current_articles=current_articles,
             invalid_source_paths=invalid_source_paths,
+            remove_if_empty=True,
         )
     _cleanup_orphans(catalog, config, orphan_candidates)
     return winner
@@ -570,6 +579,7 @@ def _recompute_article_in_transaction(
     current_articles: Iterable[ExtractedArticle],
     invalid_source_paths: Collection[str] = (),
     remove_if_empty: bool = False,
+    counters: dict[str, int] | None = None,
 ) -> tuple[ArticleRecord | None, tuple[tuple[str, str], ...]]:
     invalid_paths = frozenset(invalid_source_paths)
     current_by_path = {
@@ -608,7 +618,33 @@ def _recompute_article_in_transaction(
             winner_record = existing
             break
 
-        winner_article = _reextract(config, selected)
+        source = _source_for_stored_candidate(config, selected)
+        try:
+            winner_article = extract_article(source, config.source_root)
+        except ExtractionError as error:
+            catalog.replace_failure(
+                run_id,
+                selected.source_html_path,
+                stage="extract",
+                error_code=error.code,
+                extractor_version=EXTRACTOR_VERSION,
+            )
+            catalog.replace_manifest(
+                run_id,
+                source,
+                extractor_version=EXTRACTOR_VERSION,
+                status="failed",
+                source_html_sha256=hashlib.sha256(
+                    (
+                        config.source_root / selected.source_html_path
+                    ).read_bytes()
+                ).hexdigest(),
+                article_id=article_id,
+            )
+            catalog.remove_candidate(selected.source_html_path)
+            if counters is not None:
+                counters["failed"] += 1
+            continue
         if winner_article.article_id != article_id:
             raise ValueError(
                 "stored candidate identity changed during re-extraction"
@@ -727,10 +763,10 @@ def _can_reuse_existing(
     )
 
 
-def _reextract(
+def _source_for_stored_candidate(
     config: PipelineConfig,
     candidate: CandidateRecord,
-) -> ExtractedArticle:
+) -> SourceCandidate:
     html_path = config.source_root / candidate.source_html_path
     html_stat = html_path.stat()
     header_path = (
@@ -743,7 +779,7 @@ def _reextract(
         if header_path is not None and header_path.is_file()
         else None
     )
-    source = SourceCandidate(
+    return SourceCandidate(
         relative_html_path=candidate.source_html_path,
         html_size=html_stat.st_size,
         html_mtime_ns=html_stat.st_mtime_ns,
@@ -756,7 +792,6 @@ def _reextract(
         ),
         warnings=candidate.warnings,
     )
-    return extract_article(source, config.source_root)
 
 
 def _publish_markdown(
