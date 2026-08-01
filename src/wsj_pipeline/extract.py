@@ -1,31 +1,55 @@
-"""Versioned extraction of normalized records from archived WSJ HTML."""
+"""Versioned extraction of deterministic editorial Markdown."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-import mimetypes
 import re
 import unicodedata
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
-from wsj_pipeline.models import ExtractedArticle, PublicationDates, SourceCandidate
+from wsj_pipeline.models import ExtractedArticle, SourceCandidate
 
-EXTRACTOR_VERSION = "2"
+EXTRACTOR_VERSION = "3"
 NEW_YORK = ZoneInfo("America/New_York")
-_WORD_PATTERN = re.compile(r"\b[\w\u2019'-]+\b", re.UNICODE)
-_EXCLUDED_ANCESTOR_TOKENS = (
-    "author",
-    "caption",
-    "related",
-    "recommend",
-    "advert",
+
+_EXCLUDED_TAGS = frozenset(
+    {"button", "iframe", "nav", "noscript", "script", "style"}
 )
+_EXCLUDED_MARKER_WORDS = frozenset(
+    {
+        "ad",
+        "advert",
+        "advertisement",
+        "author",
+        "biography",
+        "hidden",
+        "login",
+        "navigation",
+        "promo",
+        "prompt",
+        "recommendation",
+        "recommended",
+        "related",
+        "registration",
+        "share",
+        "sharing",
+        "social",
+        "subscription",
+        "tracking",
+    }
+)
+_METADATA_MARKER_WORDS = frozenset(
+    {"byline", "dek", "headline", "subtitle", "summary"}
+)
+_MARKER_WORD_PATTERN = re.compile(r"[a-z0-9]+")
+_MARKDOWN_ESCAPE_PATTERN = re.compile(r"([\\`*_[\]{}|])")
 
 
 class ExtractionError(ValueError):
@@ -37,10 +61,17 @@ class ExtractionError(ValueError):
         super().__init__(f"{code}: {message}")
 
 
-def parse_wsj_timestamp(value: str | None) -> datetime | None:
-    """Parse a WSJ timestamp into an aware UTC datetime."""
+@dataclass(slots=True)
+class _RenderState:
+    canonical_url: str | None
+    inline_image_urls: list[str] = field(default_factory=list)
+    seen_image_urls: set[str] = field(default_factory=set)
 
-    if not value:
+
+def parse_wsj_timestamp(value: str | None) -> datetime | None:
+    """Parse an optional ISO-8601 timestamp into aware UTC."""
+
+    if value is None or not value.strip():
         return None
     normalized = value.strip()
     if normalized.endswith(("Z", "z")):
@@ -56,171 +87,461 @@ def parse_wsj_timestamp(value: str | None) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def derive_publication_dates(published_at_utc: datetime) -> PublicationDates:
-    """Derive unambiguous UTC and America/New_York calendar fields."""
+def derive_publication_date_new_york(value: datetime) -> date:
+    """Derive the America/New_York calendar date for an aware timestamp."""
 
-    if published_at_utc.tzinfo is None:
+    if value.tzinfo is None:
         raise ExtractionError("naive_timestamp", "timestamp has no timezone")
-    utc_value = published_at_utc.astimezone(UTC)
-    new_york_value = utc_value.astimezone(NEW_YORK)
-    return PublicationDates(
-        published_at_utc=utc_value,
-        publication_date_utc=utc_value.date(),
-        published_at_new_york=new_york_value,
-        publication_date_new_york=new_york_value.date(),
-        publication_year_ny=new_york_value.year,
-        publication_month_ny=new_york_value.month,
-    )
+    return value.astimezone(NEW_YORK).date()
+
+
+def derive_article_id(
+    wsj_id: str | None,
+    canonical_url: str | None,
+    html_sha256: str,
+) -> str:
+    """Derive a stable namespaced identity using the approved fallback chain."""
+
+    if wsj_id and wsj_id.strip():
+        return f"wsj:{wsj_id.strip()}"
+    if canonical_url and canonical_url.strip():
+        normalized = _normalize_canonical_url(canonical_url)
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return f"url:{digest}"
+    return f"html:{html_sha256}"
 
 
 def extract_article(
     candidate: SourceCandidate,
     source_root: Path,
 ) -> ExtractedArticle:
-    """Extract one candidate without modifying its raw files."""
+    """Extract one source into structured metadata and editorial Markdown."""
 
     html_path = source_root / candidate.relative_html_path
     html_bytes = html_path.read_bytes()
-    source_hash = hashlib.sha256(html_bytes).hexdigest()
+    html_sha256 = hashlib.sha256(html_bytes).hexdigest()
     soup = BeautifulSoup(html_bytes, "lxml")
     metadata = _extract_metadata(soup)
-    json_ld = _json_ld_objects(soup)
-    news_article = _first_typed_object(json_ld, "NewsArticle")
-    image_object = _first_typed_object(json_ld, "ImageObject")
+    news_article = _first_typed_object(_json_ld_objects(soup), "NewsArticle")
 
-    paragraphs = _extract_body_paragraphs(soup)
+    canonical_url = _canonical_url(soup)
+    wsj_id = _first_value(metadata, "article.id")
+    headline = (
+        _first_value(metadata, "article.headline")
+        or _json_string(news_article, "headline")
+        or _first_dom_metadata_value(soup, "headline", tag_name="h1")
+    )
+    descriptive_metadata = _unique_texts(
+        _first_value(metadata, "article.subtitle"),
+        _first_value(metadata, "article.dek"),
+        _first_value(metadata, "article.summary", "description"),
+        _json_string(news_article, "description"),
+        *_dom_metadata_values(soup, "subtitle"),
+        *_dom_metadata_values(soup, "dek"),
+        *_dom_metadata_values(soup, "summary"),
+    )
+    authors = _split_values(_first_value(metadata, "author"), separator="|")
+    if not authors:
+        authors = _json_ld_authors(news_article)
+    if not authors:
+        authors = _dom_authors(soup)
 
-    published = parse_wsj_timestamp(
+    published_at_utc = parse_wsj_timestamp(
         _first_value(metadata, "article.published", "datePublished")
         or _json_string(news_article, "datePublished")
     )
-    if published is None:
+    if published_at_utc is None:
         raise ExtractionError(
             "missing_publication_timestamp",
             "article has no publication timestamp",
         )
-    dates = derive_publication_dates(published)
+    updated_at_utc = parse_wsj_timestamp(
+        _first_value(metadata, "article.updated", "dateModified")
+        or _json_string(news_article, "dateModified")
+    )
 
-    body_text = "\n\n".join(paragraphs)
-    body_word_count = len(_WORD_PATTERN.findall(body_text))
+    metadata_blocks = _metadata_blocks(headline, descriptive_metadata, authors)
+    editorial_blocks, inline_image_urls = _extract_editorial_blocks(
+        soup,
+        canonical_url,
+    )
+    blocks = (*metadata_blocks, *editorial_blocks)
+    markdown_text = "\n\n".join(blocks)
     warnings = list(candidate.warnings)
-    if not paragraphs:
-        warnings.append("empty_body")
-    declared_word_count = _parse_int(_first_value(metadata, "article:word_count"))
-    if declared_word_count is not None and abs(
-        declared_word_count - body_word_count
-    ) > max(10, declared_word_count // 10):
-        warnings.append("word_count_mismatch")
+    if not markdown_text:
+        warnings.append("empty_content")
 
-    authors = _split_values(_first_value(metadata, "author"), separator="|")
-    if not authors:
-        authors = _json_ld_authors(news_article)
-
-    image_creator = _image_creator(image_object)
-    image_media_type = (
-        mimetypes.guess_type(candidate.relative_image_path)[0]
-        if candidate.relative_image_path
-        else None
-    )
-    headline = _first_value(metadata, "article.headline") or _json_string(
-        news_article, "headline"
-    )
-    canonical_url = _canonical_url(soup)
-    core_values = (
-        _first_value(metadata, "article.id"),
+    metadata_values = (
+        wsj_id,
         canonical_url,
         headline,
-        _first_value(metadata, "article.summary"),
+        *descriptive_metadata,
         authors,
-        _first_value(metadata, "article.section"),
-        published,
-        paragraphs,
-        candidate.relative_image_path,
+        published_at_utc,
+        updated_at_utc,
+    )
+    return ExtractedArticle(
+        article_id=derive_article_id(wsj_id, canonical_url, html_sha256),
+        relative_html_path=candidate.relative_html_path,
+        source_html_sha256=html_sha256,
+        extractor_version=EXTRACTOR_VERSION,
+        canonical_url=canonical_url,
+        published_at_utc=published_at_utc,
+        publication_date_new_york=derive_publication_date_new_york(
+            published_at_utc
+        ),
+        updated_at_utc=updated_at_utc,
+        markdown_text=markdown_text,
+        editorial_character_count=len(markdown_text),
+        editorial_block_count=len(blocks),
+        metadata_completeness=sum(bool(value) for value in metadata_values),
+        relative_header_image_path=candidate.relative_header_image_path,
+        inline_image_urls=inline_image_urls,
+        warnings=tuple(dict.fromkeys(warnings)),
     )
 
-    return ExtractedArticle(
-        relative_html_path=candidate.relative_html_path,
-        source_html_sha256=source_hash,
-        extractor_version=EXTRACTOR_VERSION,
-        wsj_article_id=_first_value(metadata, "article.id"),
-        canonical_url=canonical_url,
-        headline=headline,
-        original_headline=_first_value(metadata, "article.origheadline"),
-        summary=_first_value(metadata, "article.summary", "description"),
-        authors=authors,
-        keywords=_split_values(_first_value(metadata, "keywords"), separator=","),
-        section=_first_value(metadata, "article.section"),
-        page=_first_value(metadata, "article.page"),
-        article_type=_first_value(metadata, "article.type"),
-        access=_first_value(metadata, "article.access"),
-        published_at_utc=dates.published_at_utc,
-        publication_date_utc=dates.publication_date_utc,
-        published_at_new_york=dates.published_at_new_york,
-        publication_date_new_york=dates.publication_date_new_york,
-        publication_year_ny=dates.publication_year_ny,
-        publication_month_ny=dates.publication_month_ny,
-        updated_at_utc=parse_wsj_timestamp(
-            _first_value(metadata, "article.updated", "dateModified")
-        ),
-        created_at_utc=parse_wsj_timestamp(
-            _first_value(metadata, "article.created", "dateCreated")
-        ),
-        last_published_at_utc=parse_wsj_timestamp(
-            _first_value(metadata, "dateLastPubbed")
-        ),
-        body_paragraphs=paragraphs,
-        body_text=body_text,
-        body_word_count=body_word_count,
-        relative_image_path=candidate.relative_image_path,
-        image_present=candidate.relative_image_path is not None,
-        image_media_type=image_media_type,
-        image_size_bytes=candidate.image_size,
-        image_caption=_json_string(image_object, "caption"),
-        image_credit=_json_string(image_object, "creditText"),
-        image_creator=image_creator,
-        image_alt=_first_value(metadata, "twitter:image:alt", "og:image:alt"),
-        image_width=_json_int(image_object, "width"),
-        image_height=_json_int(image_object, "height"),
-        metadata_completeness=sum(bool(value) for value in core_values),
-        warnings=tuple(dict.fromkeys(warnings)),
-        raw_metadata_json=json.dumps(
-            metadata,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
+
+def _metadata_blocks(
+    headline: str | None,
+    descriptive_metadata: tuple[str, ...],
+    authors: tuple[str, ...],
+) -> tuple[str, ...]:
+    candidates = (
+        f"# {_escape_markdown(headline)}" if headline else None,
+        *(_escape_markdown(value) for value in descriptive_metadata),
+        _escape_markdown(_format_byline(authors)) if authors else None,
     )
+    blocks: list[str] = []
+    normalized_text: set[str] = set()
+    for block in candidates:
+        if not block:
+            continue
+        comparison = block.removeprefix("# ")
+        if comparison in normalized_text:
+            continue
+        normalized_text.add(comparison)
+        blocks.append(block)
+    return tuple(blocks)
+
+
+def _extract_editorial_blocks(
+    soup: BeautifulSoup,
+    canonical_url: str | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    root = soup.find("article")
+    if not isinstance(root, Tag):
+        root = soup.body if isinstance(soup.body, Tag) else soup
+    state = _RenderState(canonical_url)
+    blocks = tuple(_walk_blocks(root, state))
+    return blocks, tuple(state.inline_image_urls)
+
+
+def _walk_blocks(node: Tag, state: _RenderState) -> list[str]:
+    blocks: list[str] = []
+    for child in node.children:
+        if not isinstance(child, Tag):
+            continue
+        if _is_excluded(child) or _is_metadata_element(child):
+            continue
+        if child.name in {"h2", "h3", "h4", "h5", "h6"}:
+            heading = _render_inline(child, state)
+            if heading:
+                blocks.append(f"{'#' * int(child.name[1])} {heading}")
+        elif child.name == "p":
+            paragraph = _render_inline(child, state)
+            if paragraph:
+                blocks.append(paragraph)
+        elif child.name in {"ol", "ul"}:
+            rendered = _render_list(child, state)
+            if rendered:
+                blocks.append(rendered)
+        elif child.name == "table":
+            rendered = _render_table(child, state)
+            if rendered:
+                blocks.append(rendered)
+        elif child.name == "blockquote":
+            rendered = _render_quote(child, state)
+            if rendered:
+                blocks.append(rendered)
+        elif child.name == "figure":
+            blocks.extend(_render_figure(child, state))
+        elif child.name == "img":
+            image = _render_image(child, state)
+            if image:
+                blocks.append(image)
+        elif _is_interactive(child):
+            rendered = _render_visible_text(child)
+            if rendered:
+                blocks.append(_escape_markdown(rendered))
+        else:
+            blocks.extend(_walk_blocks(child, state))
+    return blocks
+
+
+def _render_list(tag: Tag, state: _RenderState) -> str:
+    items: list[str] = []
+    for index, item in enumerate(tag.find_all("li", recursive=False), start=1):
+        text = _render_inline(item, state)
+        if text:
+            marker = f"{index}." if tag.name == "ol" else "-"
+            items.append(f"{marker} {text}")
+    return "\n".join(items)
+
+
+def _render_table(tag: Tag, state: _RenderState) -> str:
+    rows: list[list[str]] = []
+    for row in tag.find_all("tr"):
+        cells = [
+            _render_inline(cell, state)
+            for cell in row.find_all(["th", "td"], recursive=False)
+        ]
+        if cells:
+            rows.append(cells)
+    if not rows:
+        return ""
+    width = max(len(row) for row in rows)
+    padded_rows = [row + [""] * (width - len(row)) for row in rows]
+    rendered = [_markdown_table_row(padded_rows[0])]
+    rendered.append(_markdown_table_row(["---"] * width))
+    rendered.extend(_markdown_table_row(row) for row in padded_rows[1:])
+    return "\n".join(rendered)
+
+
+def _markdown_table_row(cells: list[str]) -> str:
+    return f"| {' | '.join(cells)} |"
+
+
+def _render_quote(tag: Tag, state: _RenderState) -> str:
+    text = _render_inline(tag, state)
+    return "\n".join(f"> {line}" for line in text.splitlines()) if text else ""
+
+
+def _render_figure(tag: Tag, state: _RenderState) -> list[str]:
+    image = tag.find("img")
+    image_markdown = _render_image(image, state) if isinstance(image, Tag) else ""
+
+    caption_tag = tag.find("figcaption")
+    caption = (
+        _render_visible_text(caption_tag) if isinstance(caption_tag, Tag) else ""
+    )
+    credit_tag = tag.find(
+        class_=lambda value: value and "credit" in _class_value(value).casefold()
+    )
+    credit = _render_visible_text(credit_tag) if isinstance(credit_tag, Tag) else ""
+    creator_tag = tag.find(
+        class_=lambda value: value and "creator" in _class_value(value).casefold()
+    )
+    creator = (
+        _render_visible_text(creator_tag) if isinstance(creator_tag, Tag) else ""
+    )
+    caption_parts = list(
+        dict.fromkeys(part for part in (caption, credit, creator) if part)
+    )
+    caption_block = " ".join(_escape_markdown(part) for part in caption_parts)
+    return [block for block in (image_markdown, caption_block) if block]
+
+
+def _render_image(tag: Tag, state: _RenderState) -> str:
+    resolved_url = next(
+        (
+            resolved
+            for attribute in ("src", "data-src", "data-original")
+            if (
+                resolved := _resolve_http_url(
+                    _attribute(tag, attribute), state.canonical_url
+                )
+            )
+        ),
+        None,
+    )
+    if resolved_url is None or resolved_url in state.seen_image_urls:
+        return ""
+    state.seen_image_urls.add(resolved_url)
+    state.inline_image_urls.append(resolved_url)
+    alt = _escape_markdown(_clean_text(_attribute(tag, "alt")))
+    return f"![{alt}]({resolved_url})"
+
+
+def _render_inline(tag: Tag, state: _RenderState) -> str:
+    return _clean_text(_render_inline_raw(tag, state))
+
+
+def _render_inline_raw(node: Tag, state: _RenderState) -> str:
+    parts: list[str] = []
+    for child in node.children:
+        if isinstance(child, NavigableString):
+            parts.append(_escape_markdown(str(child), clean=False))
+        elif isinstance(child, Tag):
+            if child.name in _EXCLUDED_TAGS or _is_excluded(child):
+                continue
+            label = _render_inline_raw(child, state)
+            if child.name == "img":
+                parts.append(_render_image(child, state))
+            elif child.name == "a":
+                url = _resolve_http_url(
+                    _attribute(child, "href"), state.canonical_url
+                )
+                parts.append(f"[{label}]({url})" if url and label else label)
+            elif child.name == "br":
+                parts.append("\n")
+            else:
+                parts.append(label)
+    return "".join(parts)
+
+
+def _render_visible_text(tag: Tag) -> str:
+    parts: list[str] = []
+    for child in tag.children:
+        if isinstance(child, NavigableString):
+            parts.append(str(child))
+        elif isinstance(child, Tag) and not _is_excluded(child):
+            parts.append(_render_visible_text(child))
+    return _clean_text(" ".join(parts))
+
+
+def _is_excluded(tag: Tag) -> bool:
+    if tag.name in _EXCLUDED_TAGS or tag.has_attr("hidden"):
+        return True
+    if _attribute(tag, "aria-hidden").casefold() == "true":
+        return True
+    style = _attribute(tag, "style").replace(" ", "").casefold()
+    if "display:none" in style or "visibility:hidden" in style:
+        return True
+    marker_words = _marker_words(tag)
+    return bool(marker_words & _EXCLUDED_MARKER_WORDS)
+
+
+def _is_metadata_element(tag: Tag) -> bool:
+    if tag.name == "h1":
+        return True
+    return bool(_marker_words(tag) & _METADATA_MARKER_WORDS)
+
+
+def _is_interactive(tag: Tag) -> bool:
+    marker_words = _marker_words(tag)
+    return (
+        "interactive" in marker_words
+        or _attribute(tag, "data-type") == "interactive"
+    )
+
+
+def _marker_words(tag: Tag) -> set[str]:
+    marker = " ".join(
+        (
+            _attribute(tag, "id"),
+            _class_value(tag.get("class")),
+            _attribute(tag, "data-testid"),
+            _attribute(tag, "data-inset_type"),
+            _attribute(tag, "role"),
+        )
+    ).casefold()
+    return set(_MARKER_WORD_PATTERN.findall(marker))
 
 
 def _extract_metadata(soup: BeautifulSoup) -> dict[str, str]:
     metadata: dict[str, str] = {}
     for tag in soup.find_all("meta"):
-        key = tag.get("name") or tag.get("property") or tag.get("itemprop")
-        content = tag.get("content")
-        if isinstance(key, str) and isinstance(content, str) and key not in metadata:
+        key = _first_attribute(tag, "name", "property", "itemprop")
+        content = _attribute(tag, "content")
+        if key and content and key not in metadata:
             metadata[key] = _clean_text(content)
     return metadata
 
 
-def _canonical_url(soup: BeautifulSoup) -> str | None:
-    tag = soup.find("link", rel=lambda value: value and "canonical" in value)
-    if not isinstance(tag, Tag):
-        return None
-    href = tag.get("href")
-    if not isinstance(href, str) or not href.strip():
-        return None
-    parts = urlsplit(href.strip())
-    if not parts.scheme or not parts.netloc:
-        return href.strip()
-    return urlunsplit(
-        (
-            parts.scheme.lower(),
-            parts.netloc.lower(),
-            parts.path,
-            parts.query,
-            "",
-        )
+def _first_dom_metadata_value(
+    soup: BeautifulSoup,
+    marker_word: str,
+    *,
+    tag_name: str | None = None,
+) -> str | None:
+    values = _dom_metadata_values(soup, marker_word)
+    if values:
+        return values[0]
+    if tag_name:
+        tag = soup.find(tag_name)
+        if isinstance(tag, Tag):
+            value = _render_visible_text(tag)
+            return value or None
+    return None
+
+
+def _dom_metadata_values(
+    soup: BeautifulSoup,
+    marker_word: str,
+) -> tuple[str, ...]:
+    values: list[str] = []
+    for tag in soup.find_all(True):
+        if marker_word not in _marker_words(tag):
+            continue
+        value = _render_visible_text(tag)
+        if value and value not in values:
+            values.append(value)
+    return tuple(values)
+
+
+def _dom_authors(soup: BeautifulSoup) -> tuple[str, ...]:
+    byline = _first_dom_metadata_value(soup, "byline")
+    if not byline:
+        return ()
+    without_prefix = re.sub(r"^by\s+", "", byline, flags=re.IGNORECASE)
+    return tuple(
+        value
+        for item in re.split(r"\s+and\s+|\s*,\s*", without_prefix)
+        if (value := _clean_text(item))
     )
+
+
+def _canonical_url(soup: BeautifulSoup) -> str | None:
+    for tag in soup.find_all("link"):
+        rel = tag.get("rel")
+        rel_values = rel if isinstance(rel, list) else str(rel or "").split()
+        if "canonical" not in {str(value).casefold() for value in rel_values}:
+            continue
+        href = _attribute(tag, "href").strip()
+        return _normalize_canonical_url(href) if href else None
+    return None
+
+
+def _normalize_canonical_url(value: str) -> str:
+    stripped = value.strip()
+    parts = urlsplit(stripped)
+    scheme = parts.scheme.casefold()
+    hostname = (parts.hostname or "").casefold()
+    try:
+        port = parts.port
+    except ValueError:
+        return stripped
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        hostname = f"{hostname}:{port}"
+    path = parts.path.rstrip("/")
+    query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
+    return urlunsplit((scheme, hostname, path, query, ""))
+
+
+def _resolve_http_url(value: str, base_url: str | None) -> str | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    resolved = urljoin(base_url or "", stripped)
+    parts = urlsplit(resolved)
+    if parts.scheme.casefold() not in {"http", "https"} or not parts.netloc:
+        return None
+    scheme = parts.scheme.casefold()
+    hostname = (parts.hostname or "").casefold()
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        hostname = f"{hostname}:{port}"
+    path = quote(parts.path, safe="/:@!$&'*+,;=-._~%")
+    query = quote(parts.query, safe="=&?/:;+,%@!$'*[]-._~")
+    fragment = quote(parts.fragment, safe="?/:;+,%@!$&'*[]=-._~")
+    return urlunsplit((scheme, hostname, path, query, fragment))
 
 
 def _json_ld_objects(soup: BeautifulSoup) -> list[dict[str, object]]:
@@ -252,53 +573,38 @@ def _flatten_json_ld(value: object) -> list[dict[str, object]]:
 
 
 def _first_typed_object(
-    objects: list[dict[str, object]], object_type: str
+    objects: list[dict[str, object]],
+    object_type: str,
 ) -> dict[str, object]:
     for item in objects:
         types = item.get("@type")
-        if types == object_type or (isinstance(types, list) and object_type in types):
+        if types == object_type or (
+            isinstance(types, list) and object_type in types
+        ):
             return item
     return {}
 
 
-def _extract_body_paragraphs(soup: BeautifulSoup) -> tuple[str, ...]:
-    root = soup.find("article")
-    if not isinstance(root, Tag):
-        root = soup
-    paragraphs: list[str] = []
-    for paragraph in root.select('p[data-type="paragraph"]'):
-        if _is_excluded_paragraph(paragraph, root):
+def _json_ld_authors(news_article: dict[str, object]) -> tuple[str, ...]:
+    raw_authors = news_article.get("author")
+    if isinstance(raw_authors, dict):
+        raw_authors = [raw_authors]
+    if not isinstance(raw_authors, list):
+        return ()
+    authors: list[str] = []
+    for raw_author in raw_authors:
+        if not isinstance(raw_author, dict):
             continue
-        text = _clean_text(paragraph.get_text(" ", strip=True))
-        if text:
-            paragraphs.append(text)
-    return tuple(paragraphs)
+        name = raw_author.get("name")
+        if isinstance(name, str) and name.strip():
+            authors.append(_clean_text(name))
+    return tuple(authors)
 
 
-def _is_excluded_paragraph(paragraph: Tag, root: Tag) -> bool:
-    for ancestor in paragraph.parents:
-        if ancestor is root:
-            break
-        if not isinstance(ancestor, Tag):
-            continue
-        if ancestor.name in {"aside", "figure", "figcaption"}:
-            return True
-        if ancestor.has_attr("data-inset_type"):
-            return True
-        marker = " ".join(
-            [
-                ancestor.get("id", ""),
-                " ".join(ancestor.get("class", [])),
-                ancestor.get("data-testid", ""),
-            ]
-        ).casefold()
-        if any(token in marker for token in _EXCLUDED_ANCESTOR_TOKENS):
-            return True
-    return False
-
-
-def _clean_text(value: str) -> str:
-    return unicodedata.normalize("NFC", " ".join(value.split()))
+def _format_byline(authors: tuple[str, ...]) -> str:
+    if len(authors) == 1:
+        return f"By {authors[0]}"
+    return f"By {', '.join(authors[:-1])} and {authors[-1]}"
 
 
 def _first_value(metadata: dict[str, str], *keys: str) -> str | None:
@@ -317,46 +623,42 @@ def _split_values(value: str | None, *, separator: str) -> tuple[str, ...]:
     )
 
 
+def _unique_texts(*values: str | None) -> tuple[str, ...]:
+    unique: list[str] = []
+    for value in values:
+        if value and (cleaned := _clean_text(value)) and cleaned not in unique:
+            unique.append(cleaned)
+    return tuple(unique)
+
+
 def _json_string(value: dict[str, object], key: str) -> str | None:
     item = value.get(key)
     return _clean_text(item) if isinstance(item, str) and item.strip() else None
 
 
-def _json_int(value: dict[str, object], key: str) -> int | None:
-    item = value.get(key)
-    return int(item) if isinstance(item, (int, float)) else None
+def _first_attribute(tag: Tag, *keys: str) -> str:
+    for key in keys:
+        value = _attribute(tag, key)
+        if value:
+            return value
+    return ""
 
 
-def _json_ld_authors(news_article: dict[str, object]) -> tuple[str, ...]:
-    raw_authors = news_article.get("author")
-    if isinstance(raw_authors, dict):
-        raw_authors = [raw_authors]
-    if not isinstance(raw_authors, list):
-        return ()
-    authors: list[str] = []
-    for raw_author in raw_authors:
-        if isinstance(raw_author, dict):
-            name = raw_author.get("name")
-            if isinstance(name, str) and name.strip():
-                authors.append(_clean_text(name))
-    return tuple(authors)
+def _attribute(tag: Tag, key: str) -> str:
+    value = tag.get(key)
+    return value if isinstance(value, str) else ""
 
 
-def _image_creator(image_object: dict[str, object]) -> str | None:
-    creator = image_object.get("creator")
-    if isinstance(creator, dict):
-        name = creator.get("name")
-        if isinstance(name, str) and name.strip():
-            return _clean_text(name)
-    if isinstance(creator, str) and creator.strip():
-        return _clean_text(creator)
-    return None
+def _class_value(value: object) -> str:
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value)
+    return value if isinstance(value, str) else ""
 
 
-def _parse_int(value: str | None) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
+def _clean_text(value: str) -> str:
+    return unicodedata.normalize("NFC", " ".join(value.split()))
+
+
+def _escape_markdown(value: str, *, clean: bool = True) -> str:
+    normalized = _clean_text(value) if clean else unicodedata.normalize("NFC", value)
+    return _MARKDOWN_ESCAPE_PATTERN.sub(r"\\\1", normalized)
