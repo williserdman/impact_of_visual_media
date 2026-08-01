@@ -127,9 +127,26 @@ def test_preserves_distinct_metadata_and_uses_dom_fallbacks(tmp_path: Path) -> N
         subtitle="DOM subtitle.",
         summary="DOM summary.",
         paragraphs=(),
-        excluded_page_elements=False,
+        excluded_page_elements=True,
         editorial_metadata_in_dom_only=True,
     )
+    dom_path = dom_archive / "2024/story.html"
+    dom_document = dom_path.read_text(encoding="utf-8")
+    dom_document = dom_document.replace(
+        "Synthetic advertisement.",
+        '<span class="article-summary">Advertisement summary leak.</span>',
+    ).replace(
+        "Synthetic subscription prompt.",
+        '<span class="article-summary">Prompt summary leak.</span>',
+    ).replace(
+        "Synthetic related story.",
+        '<span class="article-summary">Related summary leak.</span>',
+    ).replace(
+        '<aside class="advertisement">',
+        '<div class="story-content"><span class="article-summary">'
+        'Unmarked body summary leak.</span></div><aside class="advertisement">',
+    )
+    dom_path.write_text(dom_document, encoding="utf-8")
 
     dom = extract_only_article(dom_archive)
 
@@ -144,6 +161,44 @@ def test_preserves_distinct_metadata_and_uses_dom_fallbacks(tmp_path: Path) -> N
         "",
         "By Test Reporter",
     ]
+    assert dom.markdown_text.count("Unmarked body summary leak.") == 1
+    for excluded_leak in (
+        "Advertisement summary leak.",
+        "Prompt summary leak.",
+        "Related summary leak.",
+    ):
+        assert excluded_leak not in dom.markdown_text
+
+
+def test_escapes_literal_markdown_block_markers_in_prose(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/story.html",
+        paragraphs=(
+            "# Literal heading marker",
+            "> Literal quote marker",
+            "- Literal list marker",
+            "+ Literal plus-list marker",
+            "1. Literal ordered-list marker",
+            "---",
+            "~~~",
+        ),
+        excluded_page_elements=False,
+    )
+
+    article = extract_only_article(archive)
+
+    for literal in (
+        r"\# Literal heading marker",
+        r"\> Literal quote marker",
+        r"\- Literal list marker",
+        r"\+ Literal plus-list marker",
+        r"1\. Literal ordered-list marker",
+        r"\---",
+        r"\~~~",
+    ):
+        assert literal in article.markdown_text.splitlines()
 
 
 def test_retains_empty_editorial_content_with_warning(tmp_path: Path) -> None:
@@ -277,6 +332,92 @@ def test_extracts_nested_lazy_image_from_valid_fallback_source(tmp_path: Path) -
     assert article.inline_image_urls == ("https://www.wsj.com/nested.png",)
     assert (
         "Before ![Nested synthetic alt](https://www.wsj.com/nested.png) after."
+        in article.markdown_text
+    )
+
+
+def test_preserves_figure_and_interactive_dom_order_with_links_and_images(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2024/story.html",
+        paragraphs=(),
+        inline_figures=(
+            (
+                "https://images.wsj.net/replace-me.jpg",
+                "Replace me",
+                "Replace caption.",
+                "REPLACE CREDIT.",
+                "Replace Creator.",
+            ),
+        ),
+        interactive_text=("Replace interactive.",),
+        excluded_page_elements=False,
+    )
+    document = html_path.read_text(encoding="utf-8")
+    figure_start = document.index("<figure>")
+    figure_end = document.index("</figure>", figure_start) + len("</figure>")
+    document = (
+        document[:figure_start]
+        + """<figure><figcaption>Caption <a href="/caption-link">link</a>.
+        <span class="image-credit">TEST CREDIT.
+        <span class="image-creator">Test Creator.</span></span>
+        <img src="/caption-image.png" alt="Caption image"> End.</figcaption></figure>"""
+        + document[figure_end:]
+    )
+    document = document.replace(
+        "<p>Replace interactive.</p><script>ignoredSyntheticCode()</script>",
+        'Interactive <a href="/interactive-link">link</a> '
+        '<img src="/interactive-image.png" alt="Interactive image"> after.',
+    )
+    html_path.write_text(document, encoding="utf-8")
+
+    article = extract_only_article(archive)
+
+    assert (
+        "Caption [link](https://www.wsj.com/caption-link). TEST CREDIT. "
+        "Test Creator. ![Caption image](https://www.wsj.com/caption-image.png) End."
+        in article.markdown_text
+    )
+    assert article.markdown_text.count("Test Creator.") == 1
+    assert (
+        "Interactive [link](https://www.wsj.com/interactive-link) "
+        "![Interactive image](https://www.wsj.com/interactive-image.png) after."
+        in article.markdown_text
+    )
+    assert article.inline_image_urls == (
+        "https://www.wsj.com/caption-image.png",
+        "https://www.wsj.com/interactive-image.png",
+    )
+
+
+def test_preserves_nested_lists_and_multi_paragraph_quotes(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2024/story.html",
+        paragraphs=(),
+        excluded_page_elements=False,
+    )
+    document = html_path.read_text(encoding="utf-8").replace(
+        '            \n            \n          </div>',
+        """<ul><li>Parent item<ul><li>Nested item</li></ul></li></ul>
+        <ol><li>One</li><li>Two</li><li>Three</li><li>Four</li><li>Five</li>
+        <li>Six</li><li>Seven</li><li>Eight</li><li>Nine</li>
+        <li>Tenth<ul><li>Nested under tenth</li></ul></li></ol>
+        <blockquote><p>First quoted paragraph.</p>
+        <p>Second quoted paragraph.</p></blockquote></div>""",
+    )
+    html_path.write_text(document, encoding="utf-8")
+
+    article = extract_only_article(archive)
+
+    assert "- Parent item\n  - Nested item" in article.markdown_text
+    assert "10. Tenth\n    - Nested under tenth" in article.markdown_text
+    assert (
+        "> First quoted paragraph.\n>\n> Second quoted paragraph."
         in article.markdown_text
     )
 

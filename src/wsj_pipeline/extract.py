@@ -50,6 +50,9 @@ _METADATA_MARKER_WORDS = frozenset(
 )
 _MARKER_WORD_PATTERN = re.compile(r"[a-z0-9]+")
 _MARKDOWN_ESCAPE_PATTERN = re.compile(r"([\\`*_[\]{}|])")
+_INLINE_TAGS = frozenset(
+    {"a", "b", "br", "cite", "em", "i", "img", "small", "span", "strong", "sub", "sup"}
+)
 
 
 class ExtractionError(ValueError):
@@ -208,8 +211,15 @@ def _metadata_blocks(
 ) -> tuple[str, ...]:
     candidates = (
         f"# {_escape_markdown(headline)}" if headline else None,
-        *(_escape_markdown(value) for value in descriptive_metadata),
-        _escape_markdown(_format_byline(authors)) if authors else None,
+        *(
+            _escape_block_markers(_escape_markdown(value))
+            for value in descriptive_metadata
+        ),
+        (
+            _escape_block_markers(_escape_markdown(_format_byline(authors)))
+            if authors
+            else None
+        ),
     )
     blocks: list[str] = []
     normalized_text: set[str] = set()
@@ -239,52 +249,80 @@ def _extract_editorial_blocks(
 def _walk_blocks(node: Tag, state: _RenderState) -> list[str]:
     blocks: list[str] = []
     for child in node.children:
-        if not isinstance(child, Tag):
+        if isinstance(child, Tag):
+            blocks.extend(_render_tag_blocks(child, state))
+    return blocks
+
+
+def _render_tag_blocks(tag: Tag, state: _RenderState) -> list[str]:
+    if _is_excluded(tag) or _is_metadata_element(tag):
+        return []
+    if tag.name in {"h2", "h3", "h4", "h5", "h6"}:
+        heading = _render_inline(tag, state)
+        return [f"{'#' * int(tag.name[1])} {heading}"] if heading else []
+    if tag.name == "p":
+        paragraph = _render_inline(tag, state)
+        return [_escape_block_markers(paragraph)] if paragraph else []
+    if tag.name in {"ol", "ul"}:
+        rendered = _render_list(tag, state)
+        return [rendered] if rendered else []
+    if tag.name == "table":
+        rendered = _render_table(tag, state)
+        return [rendered] if rendered else []
+    if tag.name == "blockquote":
+        rendered = _render_quote(tag, state)
+        return [rendered] if rendered else []
+    if tag.name == "figure":
+        return _render_figure(tag, state)
+    if tag.name == "img":
+        image = _render_image(tag, state)
+        return [image] if image else []
+    return _render_mixed_blocks(tag, state)
+
+
+def _render_mixed_blocks(tag: Tag, state: _RenderState) -> list[str]:
+    blocks: list[str] = []
+    inline_parts: list[str] = []
+
+    def flush_inline() -> None:
+        text = _clean_text("".join(inline_parts))
+        inline_parts.clear()
+        if text:
+            blocks.append(_escape_block_markers(text))
+
+    for child in tag.children:
+        if isinstance(child, NavigableString):
+            inline_parts.append(_escape_markdown(str(child), clean=False))
             continue
-        if _is_excluded(child) or _is_metadata_element(child):
+        if not isinstance(child, Tag) or _is_excluded(child):
             continue
-        if child.name in {"h2", "h3", "h4", "h5", "h6"}:
-            heading = _render_inline(child, state)
-            if heading:
-                blocks.append(f"{'#' * int(child.name[1])} {heading}")
-        elif child.name == "p":
-            paragraph = _render_inline(child, state)
-            if paragraph:
-                blocks.append(paragraph)
-        elif child.name in {"ol", "ul"}:
-            rendered = _render_list(child, state)
-            if rendered:
-                blocks.append(rendered)
-        elif child.name == "table":
-            rendered = _render_table(child, state)
-            if rendered:
-                blocks.append(rendered)
-        elif child.name == "blockquote":
-            rendered = _render_quote(child, state)
-            if rendered:
-                blocks.append(rendered)
-        elif child.name == "figure":
-            blocks.extend(_render_figure(child, state))
-        elif child.name == "img":
-            image = _render_image(child, state)
-            if image:
-                blocks.append(image)
-        elif _is_interactive(child):
-            rendered = _render_visible_text(child)
-            if rendered:
-                blocks.append(_escape_markdown(rendered))
-        else:
-            blocks.extend(_walk_blocks(child, state))
+        if child.name in _INLINE_TAGS:
+            inline_parts.append(_render_inline_node(child, state))
+            continue
+        flush_inline()
+        blocks.extend(_render_tag_blocks(child, state))
+    flush_inline()
     return blocks
 
 
 def _render_list(tag: Tag, state: _RenderState) -> str:
     items: list[str] = []
     for index, item in enumerate(tag.find_all("li", recursive=False), start=1):
-        text = _render_inline(item, state)
-        if text:
-            marker = f"{index}." if tag.name == "ol" else "-"
-            items.append(f"{marker} {text}")
+        item_blocks = _render_mixed_blocks(item, state)
+        if not item_blocks:
+            continue
+        marker = f"{index}." if tag.name == "ol" else "-"
+        continuation = " " * (len(marker) + 1)
+        first_lines = item_blocks[0].splitlines()
+        rendered_lines = [f"{marker} {first_lines[0]}"]
+        rendered_lines.extend(
+            f"{continuation}{line}" for line in first_lines[1:]
+        )
+        for nested_block in item_blocks[1:]:
+            rendered_lines.extend(
+                f"{continuation}{line}" for line in nested_block.splitlines()
+            )
+        items.append("\n".join(rendered_lines))
     return "\n".join(items)
 
 
@@ -312,33 +350,39 @@ def _markdown_table_row(cells: list[str]) -> str:
 
 
 def _render_quote(tag: Tag, state: _RenderState) -> str:
-    text = _render_inline(tag, state)
-    return "\n".join(f"> {line}" for line in text.splitlines()) if text else ""
+    blocks = _render_mixed_blocks(tag, state)
+    if not blocks:
+        return ""
+    quoted = ["\n".join(f"> {line}" for line in block.splitlines()) for block in blocks]
+    return "\n>\n".join(quoted)
 
 
 def _render_figure(tag: Tag, state: _RenderState) -> list[str]:
-    image = tag.find("img")
-    image_markdown = _render_image(image, state) if isinstance(image, Tag) else ""
+    blocks: list[str] = []
+    inline_parts: list[str] = []
 
-    caption_tag = tag.find("figcaption")
-    caption = (
-        _render_visible_text(caption_tag) if isinstance(caption_tag, Tag) else ""
-    )
-    credit_tag = tag.find(
-        class_=lambda value: value and "credit" in _class_value(value).casefold()
-    )
-    credit = _render_visible_text(credit_tag) if isinstance(credit_tag, Tag) else ""
-    creator_tag = tag.find(
-        class_=lambda value: value and "creator" in _class_value(value).casefold()
-    )
-    creator = (
-        _render_visible_text(creator_tag) if isinstance(creator_tag, Tag) else ""
-    )
-    caption_parts = list(
-        dict.fromkeys(part for part in (caption, credit, creator) if part)
-    )
-    caption_block = " ".join(_escape_markdown(part) for part in caption_parts)
-    return [block for block in (image_markdown, caption_block) if block]
+    def flush_inline() -> None:
+        text = _clean_text(" ".join(part for part in inline_parts if part))
+        inline_parts.clear()
+        if text:
+            blocks.append(_escape_block_markers(text))
+
+    for child in tag.children:
+        if isinstance(child, NavigableString):
+            inline_parts.append(_escape_markdown(str(child), clean=False))
+        elif isinstance(child, Tag) and not _is_excluded(child):
+            if child.name == "img":
+                flush_inline()
+                image = _render_image(child, state)
+                if image:
+                    blocks.append(image)
+            elif child.name in {"ol", "ul", "table", "blockquote", "p"}:
+                flush_inline()
+                blocks.extend(_render_tag_blocks(child, state))
+            else:
+                inline_parts.append(_render_inline_node(child, state))
+    flush_inline()
+    return blocks
 
 
 def _render_image(tag: Tag, state: _RenderState) -> str:
@@ -363,30 +407,26 @@ def _render_image(tag: Tag, state: _RenderState) -> str:
 
 
 def _render_inline(tag: Tag, state: _RenderState) -> str:
-    return _clean_text(_render_inline_raw(tag, state))
+    rendered = "".join(
+        _render_inline_node(child, state) for child in tag.children
+    )
+    return _clean_text(rendered)
 
 
-def _render_inline_raw(node: Tag, state: _RenderState) -> str:
-    parts: list[str] = []
-    for child in node.children:
-        if isinstance(child, NavigableString):
-            parts.append(_escape_markdown(str(child), clean=False))
-        elif isinstance(child, Tag):
-            if child.name in _EXCLUDED_TAGS or _is_excluded(child):
-                continue
-            label = _render_inline_raw(child, state)
-            if child.name == "img":
-                parts.append(_render_image(child, state))
-            elif child.name == "a":
-                url = _resolve_http_url(
-                    _attribute(child, "href"), state.canonical_url
-                )
-                parts.append(f"[{label}]({url})" if url and label else label)
-            elif child.name == "br":
-                parts.append("\n")
-            else:
-                parts.append(label)
-    return "".join(parts)
+def _render_inline_node(node: object, state: _RenderState) -> str:
+    if isinstance(node, NavigableString):
+        return _escape_markdown(str(node), clean=False)
+    if not isinstance(node, Tag) or _is_excluded(node):
+        return ""
+    if node.name == "img":
+        return _render_image(node, state)
+    label = "".join(_render_inline_node(child, state) for child in node.children)
+    if node.name == "a":
+        url = _resolve_http_url(_attribute(node, "href"), state.canonical_url)
+        return f"[{label}]({url})" if url and label else label
+    if node.name == "br":
+        return "\n"
+    return label
 
 
 def _render_visible_text(tag: Tag) -> str:
@@ -459,7 +499,11 @@ def _first_dom_metadata_value(
         return values[0]
     if tag_name:
         tag = soup.find(tag_name)
-        if isinstance(tag, Tag):
+        article_root = soup.find("article")
+        if isinstance(tag, Tag) and _is_valid_dom_metadata_candidate(
+            tag,
+            article_root if isinstance(article_root, Tag) else None,
+        ):
             value = _render_visible_text(tag)
             return value or None
     return None
@@ -470,13 +514,35 @@ def _dom_metadata_values(
     marker_word: str,
 ) -> tuple[str, ...]:
     values: list[str] = []
+    article_root = soup.find("article")
+    if not isinstance(article_root, Tag):
+        return ()
     for tag in soup.find_all(True):
         if marker_word not in _marker_words(tag):
+            continue
+        if not _is_valid_dom_metadata_candidate(tag, article_root):
             continue
         value = _render_visible_text(tag)
         if value and value not in values:
             values.append(value)
     return tuple(values)
+
+
+def _is_valid_dom_metadata_candidate(tag: Tag, article_root: Tag | None) -> bool:
+    if article_root is None or article_root not in tag.parents or _is_excluded(tag):
+        return False
+    in_header_region = tag.parent is article_root
+    for ancestor in tag.parents:
+        if ancestor is article_root:
+            return in_header_region
+        if not isinstance(ancestor, Tag):
+            continue
+        marker_words = _marker_words(ancestor)
+        if _is_excluded(ancestor) or "body" in marker_words:
+            return False
+        if ancestor.name == "header" or "header" in marker_words:
+            in_header_region = True
+    return False
 
 
 def _dom_authors(soup: BeautifulSoup) -> tuple[str, ...]:
@@ -662,3 +728,14 @@ def _clean_text(value: str) -> str:
 def _escape_markdown(value: str, *, clean: bool = True) -> str:
     normalized = _clean_text(value) if clean else unicodedata.normalize("NFC", value)
     return _MARKDOWN_ESCAPE_PATTERN.sub(r"\\\1", normalized)
+
+
+def _escape_block_markers(value: str) -> str:
+    escaped_lines: list[str] = []
+    for line in value.splitlines():
+        escaped = re.sub(r"^(\s*)([#>+-])(?=\s)", r"\1\\\2", line)
+        escaped = re.sub(r"^(\s*\d+)([.)])(?=\s)", r"\1\\\2", escaped)
+        if re.fullmatch(r"\s*(?:-{3,}|~{3,})\s*", escaped):
+            escaped = re.sub(r"^(\s*)", r"\1\\", escaped, count=1)
+        escaped_lines.append(escaped)
+    return "\n".join(escaped_lines)
