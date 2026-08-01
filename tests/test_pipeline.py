@@ -99,6 +99,7 @@ def test_pipeline_summary_exposes_only_approved_counts_and_validation() -> None:
         "failed": 0,
         "removed": 0,
         "articles": 0,
+        "duplicate_count": 0,
         "validation_ok": False,
     }
 

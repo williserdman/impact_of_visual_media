@@ -1,21 +1,18 @@
-"""Command-line interface and corpus-scale safety gates."""
+"""Four-command interface for safe Markdown catalog operations."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from collections.abc import Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict
 from pathlib import Path
 
 from wsj_pipeline.config import PipelineConfig
-from wsj_pipeline.service import (
-    index_only,
+from wsj_pipeline.pipeline import (
     inventory_sources,
-    process_only,
-    publish_all,
-    run_incremental,
     run_smoke,
+    run_validated_pipeline,
 )
 from wsj_pipeline.validate import validate_outputs
 
@@ -42,25 +39,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("config/wsj_pipeline.toml"),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    inventory = subparsers.add_parser("inventory")
-    inventory.add_argument("--limit", type=positive_int)
-
-    for command in ("publish", "index", "validate", "smoke"):
-        subparsers.add_parser(command)
-
-    for command in ("process", "run"):
-        command_parser = subparsers.add_parser(command)
-        scope = command_parser.add_mutually_exclusive_group(required=True)
-        scope.add_argument("--limit", type=positive_int)
-        scope.add_argument("--full", action="store_true")
-        command_parser.add_argument("--reprocess", action="store_true")
-
+    subparsers.add_parser("inventory")
+    run_parser = subparsers.add_parser("run")
+    scope = run_parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--limit", type=positive_int)
+    scope.add_argument("--full", action="store_true")
+    run_parser.add_argument("--reprocess", action="store_true")
+    subparsers.add_parser("validate")
+    subparsers.add_parser("smoke")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Execute one command and emit a deterministic JSON summary."""
+    """Execute one safe command and emit one deterministic JSON object."""
 
     args = build_parser().parse_args(argv)
     if args.command == "smoke":
@@ -68,34 +59,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         config = PipelineConfig.from_toml(args.config)
         if args.command == "inventory":
-            result = inventory_sources(config, limit=args.limit)
-        elif args.command == "process":
-            result = process_only(
+            result = inventory_sources(config)
+        elif args.command == "run":
+            result = run_validated_pipeline(
                 config,
                 limit=args.limit,
                 full=args.full,
                 reprocess=args.reprocess,
             )
-        elif args.command == "publish":
-            result = publish_all(config)
-        elif args.command == "index":
-            result = index_only(config)
         elif args.command == "validate":
             result = validate_outputs(config)
-        elif args.command == "run":
-            result = run_incremental(
-                config,
-                limit=args.limit,
-                full=args.full,
-                reprocess=args.reprocess,
-            )
         else:
             raise AssertionError(f"unhandled command {args.command}")
 
-    payload = asdict(result) if is_dataclass(result) else result
-    print(json.dumps(payload, sort_keys=True, default=str))
+    print(json.dumps(asdict(result), sort_keys=True))
     if args.command == "validate":
         return 0 if result.ok else 1
-    if hasattr(result, "validation_ok"):
+    if args.command in {"run", "smoke"}:
         return 0 if result.validation_ok else 1
     return 0

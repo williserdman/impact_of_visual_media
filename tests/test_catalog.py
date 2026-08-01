@@ -157,7 +157,12 @@ def test_run_lifecycle_records_deterministic_content_free_json(
         catalog.finish_run(
             run_id,
             "succeeded",
-            {"succeeded": 2, "failed": 1, "discovered": 3},
+            {
+                "succeeded": 2,
+                "failed": 1,
+                "discovered": 3,
+                "duplicate_count": 1,
+            },
         )
         row = catalog.connection.execute(
             """
@@ -169,7 +174,9 @@ def test_run_lifecycle_records_deterministic_content_free_json(
         ).fetchone()
 
     assert row[0:3] == ("run", "limit:5", "succeeded")
-    assert row[3] == '{"discovered":3,"failed":1,"succeeded":2}'
+    assert row[3] == (
+        '{"discovered":3,"duplicate_count":1,"failed":1,"succeeded":2}'
+    )
     assert "Synthetic headline" not in row[3]
     assert row[4] is not None
 

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import json
 import os
 import stat
+import tempfile
 from collections.abc import Collection, Iterable, Iterator
 from contextlib import contextmanager, suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date
 from itertools import islice
 from pathlib import Path
@@ -22,10 +25,20 @@ from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.discovery import discover_sources
 from wsj_pipeline.extract import EXTRACTOR_VERSION, ExtractionError, extract_article
 from wsj_pipeline.models import ExtractedArticle, SourceCandidate
+from wsj_pipeline.validate import validate_outputs
 
 
 class PipelineLockedError(RuntimeError):
     """Raised when another mutating pipeline process owns the lock."""
+
+
+@dataclass(frozen=True, slots=True)
+class InventorySummary:
+    """Content-free counts from read-only source discovery."""
+
+    discovered: int
+    with_image: int
+    missing_image: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +56,7 @@ class PipelineSummary:
     failed: int = 0
     removed: int = 0
     articles: int = 0
+    duplicate_count: int = 0
     validation_ok: bool = False
 
 
@@ -88,6 +102,21 @@ def ensure_no_legacy_output(config: PipelineConfig) -> None:
             "legacy derived output detected; move derived output aside or "
             "choose a fresh output root"
         )
+
+
+def inventory_sources(config: PipelineConfig) -> InventorySummary:
+    """Count source and paired header-image files without changing outputs."""
+
+    discovered = 0
+    with_image = 0
+    for candidate in discover_sources(config.source_root):
+        discovered += 1
+        with_image += candidate.relative_header_image_path is not None
+    return InventorySummary(
+        discovered=discovered,
+        with_image=with_image,
+        missing_image=discovered - with_image,
+    )
 
 
 def _is_single_path_component(value: str) -> bool:
@@ -295,7 +324,11 @@ def run_pipeline(
                         orphan_candidates.extend(orphans)
                 _cleanup_orphans(catalog, config, orphan_candidates)
 
-            summary = _pipeline_summary(counters, catalog.article_count())
+            summary = _pipeline_summary(
+                counters,
+                catalog.article_count(),
+                catalog.duplicate_count(),
+            )
             catalog.finish_run(run_id, "succeeded", asdict(summary))
             return summary
         except Exception:
@@ -303,9 +336,112 @@ def run_pipeline(
                 failed_summary = _pipeline_summary(
                     counters,
                     catalog.article_count(),
+                    catalog.duplicate_count(),
                 )
                 catalog.finish_run(run_id, "failed", asdict(failed_summary))
             raise
+
+
+def run_validated_pipeline(
+    config: PipelineConfig,
+    *,
+    limit: int | None,
+    full: bool,
+    reprocess: bool = False,
+) -> PipelineSummary:
+    """Run the pipeline and report validation of the completed outputs."""
+
+    summary = run_pipeline(
+        config,
+        limit=limit,
+        full=full,
+        reprocess=reprocess,
+    )
+    validation = validate_outputs(config)
+    return replace(summary, validation_ok=validation.ok)
+
+
+def run_smoke() -> PipelineSummary:
+    """Run and validate the pipeline against a generated temporary archive."""
+
+    with tempfile.TemporaryDirectory(prefix="wsj-pipeline-smoke-") as directory:
+        root = Path(directory)
+        source_root = root / "archive"
+        _write_smoke_article(
+            source_root / "2024" / "a.html",
+            article_id="SMOKE-A",
+            body="A longer canonical smoke article body.",
+            inline_image_url="https://images.wsj.net/smoke-a.jpg",
+            with_header_image=True,
+        )
+        _write_smoke_article(
+            source_root / "2024" / "a-duplicate.html",
+            article_id="SMOKE-A",
+            body="Short.",
+            inline_image_url="https://images.wsj.net/losing-duplicate.jpg",
+            with_header_image=True,
+        )
+        _write_smoke_article(
+            source_root / "2025" / "2025" / "b.html",
+            article_id="SMOKE-B",
+            body="A second canonical smoke article.",
+            inline_image_url="https://images.wsj.net/smoke-b.jpg",
+            with_header_image=False,
+            published="2025-02-03T14:00:00Z",
+        )
+        config = PipelineConfig(
+            source_root=source_root,
+            output_root=root / "processed",
+            batch_size=2,
+        )
+        return run_validated_pipeline(
+            config,
+            limit=None,
+            full=True,
+        )
+
+
+def _write_smoke_article(
+    html_path: Path,
+    *,
+    article_id: str,
+    body: str,
+    inline_image_url: str,
+    with_header_image: bool,
+    published: str = "2024-01-02T15:30:00Z",
+) -> None:
+    """Write one entirely synthetic smoke source and optional header image."""
+
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    escaped_article_id = html.escape(article_id)
+    metadata = {
+        "@context": "https://schema.org",
+        "@type": "NewsArticle",
+        "headline": f"Headline {article_id}",
+        "datePublished": published,
+        "author": [{"@type": "Person", "name": "Smoke Reporter"}],
+    }
+    document = f"""<!doctype html>
+    <html><head>
+      <link rel="canonical" href="https://www.wsj.com/smoke/{escaped_article_id}">
+      <meta name="article.id" content="{escaped_article_id}">
+      <meta name="article.headline" content="Headline {escaped_article_id}">
+      <meta name="article.published" content="{published}">
+      <meta name="article.updated" content="{published}">
+      <meta name="author" content="Smoke Reporter">
+      <script type="application/ld+json">{json.dumps(metadata)}</script>
+    </head><body><article>
+      <p data-type="paragraph">{html.escape(body)}</p>
+      <figure>
+        <img src="{html.escape(inline_image_url)}" alt="Synthetic smoke image">
+        <figcaption>Synthetic smoke caption.</figcaption>
+      </figure>
+    </article></body></html>"""
+    html_path.write_text(document, encoding="utf-8")
+    if with_header_image:
+        html_path.with_name(f"{html_path.stem}_main_image.jpg").write_bytes(
+            b"\xff\xd8\xff\xe0synthetic-smoke"
+        )
 
 
 def _new_summary_counters() -> dict[str, int]:
@@ -326,6 +462,7 @@ def _new_summary_counters() -> dict[str, int]:
 def _pipeline_summary(
     counters: dict[str, int],
     article_count: int,
+    duplicate_count: int,
 ) -> PipelineSummary:
     return PipelineSummary(
         discovered=counters["discovered"],
@@ -339,6 +476,7 @@ def _pipeline_summary(
         failed=counters["failed"],
         removed=counters["removed"],
         articles=article_count,
+        duplicate_count=duplicate_count,
     )
 
 

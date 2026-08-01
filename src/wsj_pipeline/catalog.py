@@ -123,6 +123,7 @@ _SUMMARY_COUNTERS = {
     "articles",
     "changed",
     "discovered",
+    "duplicate_count",
     "duplicates",
     "failed",
     "failures",
@@ -888,6 +889,13 @@ class Catalog:
 
         return int(
             self.connection.execute("SELECT count(*) FROM articles").fetchone()[0]
+        )
+
+    def duplicate_count(self) -> int:
+        """Return the number of current non-winning source rows."""
+
+        return int(
+            self.connection.execute("SELECT count(*) FROM duplicates").fetchone()[0]
         )
 
     def remove_article(self, article_id: str) -> ArticleRecord | None:
