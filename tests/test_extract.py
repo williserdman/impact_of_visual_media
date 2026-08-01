@@ -177,12 +177,17 @@ def test_escapes_literal_markdown_block_markers_in_prose(tmp_path: Path) -> None
         "2024/story.html",
         paragraphs=(
             "# Literal heading marker",
+            "## Literal level-two heading marker",
+            "### Literal level-three heading marker",
             "> Literal quote marker",
+            ">> Literal nested quote marker",
             "- Literal list marker",
             "+ Literal plus-list marker",
             "1. Literal ordered-list marker",
             "---",
             "~~~",
+            "#",
+            ">",
         ),
         excluded_page_elements=False,
     )
@@ -191,14 +196,45 @@ def test_escapes_literal_markdown_block_markers_in_prose(tmp_path: Path) -> None
 
     for literal in (
         r"\# Literal heading marker",
+        r"\## Literal level-two heading marker",
+        r"\### Literal level-three heading marker",
         r"\> Literal quote marker",
+        r"\>> Literal nested quote marker",
         r"\- Literal list marker",
         r"\+ Literal plus-list marker",
         r"1\. Literal ordered-list marker",
         r"\---",
         r"\~~~",
+        r"\#",
+        r"\>",
     ):
         assert literal in article.markdown_text.splitlines()
+
+
+def test_keeps_unlisted_inline_elements_in_one_mixed_content_block(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2024/story.html",
+        paragraphs=(),
+        excluded_page_elements=False,
+    )
+    document = html_path.read_text(encoding="utf-8").replace(
+        '            \n            \n          </div>',
+        """<div class="article-interactive">Before <code>x</code>
+        <time>noon</time> <abbr>WSJ</abbr> <mark>marked</mark>
+        <label>label</label> after.</div></div>""",
+    )
+    html_path.write_text(document, encoding="utf-8")
+
+    article = extract_only_article(archive)
+
+    assert (
+        "Before x noon WSJ marked label after."
+        in article.markdown_text.splitlines()
+    )
 
 
 def test_retains_empty_editorial_content_with_warning(tmp_path: Path) -> None:

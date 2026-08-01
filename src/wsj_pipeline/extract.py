@@ -50,8 +50,44 @@ _METADATA_MARKER_WORDS = frozenset(
 )
 _MARKER_WORD_PATTERN = re.compile(r"[a-z0-9]+")
 _MARKDOWN_ESCAPE_PATTERN = re.compile(r"([\\`*_[\]{}|])")
-_INLINE_TAGS = frozenset(
-    {"a", "b", "br", "cite", "em", "i", "img", "small", "span", "strong", "sub", "sup"}
+_BLOCK_TAGS = frozenset(
+    {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "dd",
+        "details",
+        "dialog",
+        "div",
+        "dl",
+        "dt",
+        "fieldset",
+        "figcaption",
+        "figure",
+        "footer",
+        "form",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hgroup",
+        "hr",
+        "li",
+        "main",
+        "menu",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "summary",
+        "table",
+        "ul",
+    }
 )
 
 
@@ -296,7 +332,7 @@ def _render_mixed_blocks(tag: Tag, state: _RenderState) -> list[str]:
             continue
         if not isinstance(child, Tag) or _is_excluded(child):
             continue
-        if child.name in _INLINE_TAGS:
+        if child.name not in _BLOCK_TAGS:
             inline_parts.append(_render_inline_node(child, state))
             continue
         flush_inline()
@@ -733,7 +769,11 @@ def _escape_markdown(value: str, *, clean: bool = True) -> str:
 def _escape_block_markers(value: str) -> str:
     escaped_lines: list[str] = []
     for line in value.splitlines():
-        escaped = re.sub(r"^(\s*)([#>+-])(?=\s)", r"\1\\\2", line)
+        escaped = re.sub(
+            r"^(\s*)(#{1,6}|>+|[+-])(?=\s|$)",
+            r"\1\\\2",
+            line,
+        )
         escaped = re.sub(r"^(\s*\d+)([.)])(?=\s)", r"\1\\\2", escaped)
         if re.fullmatch(r"\s*(?:-{3,}|~{3,})\s*", escaped):
             escaped = re.sub(r"^(\s*)", r"\1\\", escaped, count=1)
