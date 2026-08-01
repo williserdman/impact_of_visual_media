@@ -91,6 +91,8 @@ def test_open_creates_the_single_versioned_catalog_schema(tmp_path: Path) -> Non
 
     with Catalog.open(database_path):
         pass
+    with Catalog.open(database_path):
+        pass
 
     with duckdb.connect(str(database_path), read_only=True) as connection:
         tables = {row[0] for row in connection.execute("SHOW TABLES").fetchall()}
@@ -236,6 +238,125 @@ def test_open_rejects_malformed_version_one_schema_without_altering_it(
             ("metadata",),
             ("rogue",),
         ]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    (
+        "ALTER TABLE runs DROP COLUMN summary_json",
+        "CREATE OR REPLACE TABLE articles AS SELECT * FROM articles",
+        "DROP INDEX articles_publication_date_idx",
+        "DROP TABLE runs; CREATE VIEW runs AS SELECT 'x'::VARCHAR AS run_id",
+    ),
+    ids=("operational-column", "article-constraints", "date-index", "view"),
+)
+def test_open_rejects_damaged_version_one_contract(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    database_path = tmp_path / "catalog.duckdb"
+    with Catalog.open(database_path):
+        pass
+    with duckdb.connect(str(database_path)) as connection:
+        for statement in damage.split("; "):
+            connection.execute(statement)
+
+    with pytest.raises(CatalogError, match="malformed catalog schema version 1"):
+        Catalog.open(database_path)
+
+
+@pytest.mark.parametrize(
+    ("command", "scope"),
+    (
+        ("Synthetic headline", "limit:1"),
+        ("run", "Synthetic headline and article paragraph"),
+    ),
+    ids=("command", "scope"),
+)
+def test_begin_run_rejects_free_form_text(
+    tmp_path: Path,
+    command: str,
+    scope: str,
+) -> None:
+    with (
+        Catalog.open(tmp_path / "catalog.duckdb") as catalog,
+        pytest.raises(CatalogError, match="invalid run"),
+    ):
+        catalog.begin_run(command, scope)
+
+
+@pytest.mark.parametrize(
+    ("status", "summary"),
+    (
+        ("Synthetic headline", {"succeeded": 1}),
+        ("failed", {"Synthetic headline": 1}),
+    ),
+    ids=("status", "summary-key"),
+)
+def test_finish_run_rejects_free_form_text_channels(
+    tmp_path: Path,
+    status: str,
+    summary: dict[str, object],
+) -> None:
+    with Catalog.open(tmp_path / "catalog.duckdb") as catalog:
+        run_id = catalog.begin_run("run", "limit:1")
+        with pytest.raises(CatalogError, match=r"invalid run|summary"):
+            catalog.finish_run(run_id, status, summary)
+
+
+@pytest.mark.parametrize(
+    ("stage", "error_code", "extractor_version"),
+    (
+        (
+            "Synthetic headline",
+            "missing_publication_timestamp",
+            "3",
+        ),
+        ("extract", "Synthetic_headline", "3"),
+        (
+            "extract",
+            "missing_publication_timestamp",
+            "Synthetic headline",
+        ),
+    ),
+    ids=("stage", "error-code", "extractor-version"),
+)
+def test_replace_failure_rejects_free_form_text_channels(
+    tmp_path: Path,
+    stage: str,
+    error_code: str,
+    extractor_version: str,
+) -> None:
+    with Catalog.open(tmp_path / "catalog.duckdb") as catalog:
+        run_id = catalog.begin_run("run", "limit:1")
+        with pytest.raises(CatalogError, match="invalid failure"):
+            catalog.replace_failure(
+                run_id,
+                "2024/broken.html",
+                stage=stage,
+                error_code=error_code,
+                extractor_version=extractor_version,
+            )
+
+
+def test_replace_failure_uses_catalog_owned_message(tmp_path: Path) -> None:
+    with Catalog.open(tmp_path / "catalog.duckdb") as catalog:
+        run_id = catalog.begin_run("run", "limit:1")
+        catalog.replace_failure(
+            run_id,
+            "2024/broken.html",
+            stage="extract",
+            error_code="missing_publication_timestamp",
+            extractor_version="3",
+        )
+        row = catalog.connection.execute(
+            "SELECT error_code, message FROM failures"
+        ).fetchone()
+
+    assert row == (
+        "missing_publication_timestamp",
+        "article has no publication timestamp",
+    )
 
 
 def test_context_manager_closes_connection(tmp_path: Path) -> None:

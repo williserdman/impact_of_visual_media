@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -35,6 +36,112 @@ _ARTICLE_COLUMN_TYPES = {
     "publication_date_new_york": "DATE",
     "cleaned_markdown_sha256": "VARCHAR",
 }
+_TABLE_COLUMNS = {
+    "metadata": (
+        ("key", "VARCHAR", True, None, True),
+        ("value", "VARCHAR", True, None, False),
+    ),
+    "runs": (
+        ("run_id", "VARCHAR", True, None, True),
+        ("command", "VARCHAR", True, None, False),
+        ("scope", "VARCHAR", True, None, False),
+        ("status", "VARCHAR", True, None, False),
+        ("started_at", "TIMESTAMP WITH TIME ZONE", True, "current_timestamp", False),
+        ("finished_at", "TIMESTAMP WITH TIME ZONE", False, None, False),
+        ("summary_json", "VARCHAR", False, None, False),
+    ),
+    "source_manifest": (
+        ("source_html_path", "VARCHAR", True, None, True),
+        ("html_size", "BIGINT", True, None, False),
+        ("html_mtime_ns", "BIGINT", True, None, False),
+        ("header_image_path", "VARCHAR", False, None, False),
+        ("header_image_size", "BIGINT", False, None, False),
+        ("header_image_mtime_ns", "BIGINT", False, None, False),
+        ("source_html_sha256", "VARCHAR", False, None, False),
+        ("extractor_version", "VARCHAR", True, None, False),
+        ("status", "VARCHAR", True, None, False),
+        ("article_id", "VARCHAR", False, None, False),
+        ("last_run_id", "VARCHAR", True, None, False),
+        ("last_seen_run_id", "VARCHAR", True, None, False),
+    ),
+    "candidates": (
+        ("source_html_path", "VARCHAR", True, None, True),
+        ("article_id", "VARCHAR", True, None, False),
+        ("source_html_sha256", "VARCHAR", True, None, False),
+        ("extractor_version", "VARCHAR", True, None, False),
+        ("canonical_url", "VARCHAR", False, None, False),
+        ("published_at_utc", "TIMESTAMP WITH TIME ZONE", True, None, False),
+        ("publication_date_new_york", "DATE", True, None, False),
+        ("updated_at_utc", "TIMESTAMP WITH TIME ZONE", False, None, False),
+        ("editorial_character_count", "BIGINT", True, None, False),
+        ("editorial_block_count", "INTEGER", True, None, False),
+        ("metadata_completeness", "INTEGER", True, None, False),
+        ("header_image_path", "VARCHAR", False, None, False),
+        ("inline_image_urls", "VARCHAR[]", True, None, False),
+        ("warnings", "VARCHAR[]", True, None, False),
+        ("last_run_id", "VARCHAR", True, None, False),
+    ),
+    "duplicates": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("source_html_path", "VARCHAR", True, None, True),
+        ("winner_source_html_path", "VARCHAR", True, None, False),
+        ("duplicate_rank", "INTEGER", True, None, False),
+        ("reason", "VARCHAR", True, None, False),
+        ("run_id", "VARCHAR", True, None, False),
+    ),
+    "failures": (
+        ("run_id", "VARCHAR", True, None, True),
+        ("source_html_path", "VARCHAR", True, None, True),
+        ("stage", "VARCHAR", True, None, True),
+        ("error_code", "VARCHAR", True, None, False),
+        ("message", "VARCHAR", True, None, False),
+        ("extractor_version", "VARCHAR", True, None, False),
+        ("created_at", "TIMESTAMP WITH TIME ZONE", True, "current_timestamp", False),
+    ),
+    "articles": tuple(
+        (name, data_type, name != "header_image_path", None, name == "article_id")
+        for name, data_type in _ARTICLE_COLUMN_TYPES.items()
+    ),
+}
+_KEY_CONSTRAINTS = {
+    ("metadata", "PRIMARY KEY", ("key",)),
+    ("runs", "PRIMARY KEY", ("run_id",)),
+    ("source_manifest", "PRIMARY KEY", ("source_html_path",)),
+    ("candidates", "PRIMARY KEY", ("source_html_path",)),
+    ("duplicates", "PRIMARY KEY", ("article_id", "source_html_path")),
+    ("failures", "PRIMARY KEY", ("run_id", "source_html_path", "stage")),
+    ("articles", "PRIMARY KEY", ("article_id",)),
+    ("articles", "UNIQUE", ("source_html_path",)),
+    ("articles", "UNIQUE", ("cleaned_markdown_path",)),
+}
+_RUN_COMMANDS = {"inventory", "run", "validate", "smoke"}
+_RUN_SCOPE_PATTERN = re.compile(
+    r"(?:limit:[1-9][0-9]*(?:,reprocess)?|full(?:,reprocess)?|fixture)"
+)
+_RUN_STATUSES = {"succeeded", "failed"}
+_SUMMARY_COUNTERS = {
+    "articles",
+    "changed",
+    "discovered",
+    "duplicates",
+    "failed",
+    "failures",
+    "metadata_only",
+    "missing_images",
+    "new",
+    "removed",
+    "reprocessed",
+    "stale",
+    "succeeded",
+    "unchanged",
+}
+_FAILURE_STAGES = {"catalog", "discovery", "extract", "publish", "validate"}
+_FAILURE_MESSAGES = {
+    "invalid_timestamp": "timestamp is not valid ISO-8601",
+    "missing_publication_timestamp": "article has no publication timestamp",
+    "naive_timestamp": "timestamp has no timezone",
+}
+_EXTRACTOR_VERSION_PATTERN = re.compile(r"[1-9][0-9]*")
 
 
 class CatalogError(RuntimeError):
@@ -100,18 +207,18 @@ class Catalog:
         self.connection.close()
 
     def _ensure_schema(self) -> None:
-        tables = {
-            row[0]
+        table_types = {
+            row[0]: row[1]
             for row in self.connection.execute(
                 """
-                SELECT table_name
+                SELECT table_name, table_type
                 FROM information_schema.tables
                 WHERE table_catalog = current_database()
                   AND table_schema = 'main'
                 """
             ).fetchall()
         }
-        if "metadata" in tables:
+        if "metadata" in table_types:
             try:
                 row = self.connection.execute(
                     "SELECT value FROM metadata WHERE key = 'schema_version'"
@@ -120,9 +227,9 @@ class Catalog:
                 row = None
             version = str(row[0]) if row is not None else "missing"
             self._refuse_unsupported_version(version)
-            self._validate_existing_schema(tables)
+            self._validate_existing_schema(table_types)
             return
-        elif tables:
+        elif table_types:
             self._refuse_unsupported_version("missing")
 
         self.connection.execute("BEGIN TRANSACTION")
@@ -151,16 +258,49 @@ class Catalog:
                 "aside or choose a fresh output root"
             )
 
-    def _validate_existing_schema(self, tables: set[str]) -> None:
-        if tables != _CATALOG_TABLES:
+    def _validate_existing_schema(self, table_types: dict[str, str]) -> None:
+        if set(table_types) != _CATALOG_TABLES or set(table_types.values()) != {
+            "BASE TABLE"
+        }:
             self._raise_malformed_schema()
-        article_types = {
-            row[1]: row[2]
+        table_columns = {
+            table: tuple(
+                (row[1], row[2], row[3], row[4], row[5])
+                for row in self.connection.execute(
+                    f"PRAGMA table_info('{table}')"
+                ).fetchall()
+            )
+            for table in _CATALOG_TABLES
+        }
+        key_constraints = {
+            (row[0], row[1], tuple(row[2]))
             for row in self.connection.execute(
-                "PRAGMA table_info('articles')"
+                """
+                SELECT table_name, constraint_type, constraint_column_names
+                FROM duckdb_constraints()
+                WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+                """
             ).fetchall()
         }
-        if article_types != _ARTICLE_COLUMN_TYPES:
+        indexes = self.connection.execute(
+            """
+            SELECT table_name, index_name, is_unique, expressions
+            FROM duckdb_indexes()
+            """
+        ).fetchall()
+        if (
+            table_columns != _TABLE_COLUMNS
+            or key_constraints != _KEY_CONSTRAINTS
+            or indexes
+            != [
+                (
+                    "articles",
+                    "articles_publication_date_idx",
+                    False,
+                    "[publication_date_new_york, published_at_utc, article_id]",
+                )
+            ]
+        ):
             self._raise_malformed_schema()
 
     @staticmethod
@@ -285,6 +425,8 @@ class Catalog:
             raise
 
     def begin_run(self, command: str, scope: str) -> str:
+        if command not in _RUN_COMMANDS or _RUN_SCOPE_PATTERN.fullmatch(scope) is None:
+            raise CatalogError("invalid run command or scope")
         run_id = str(uuid4())
         self.connection.execute(
             """
@@ -301,8 +443,9 @@ class Catalog:
         status: str,
         summary: Mapping[str, object],
     ) -> None:
-        if not _is_content_free_summary(summary):
-            raise CatalogError("run summary values must be content-free counts")
+        if status not in _RUN_STATUSES:
+            raise CatalogError("invalid run status")
+        _validate_summary(summary)
         summary_json = json.dumps(
             summary,
             allow_nan=False,
@@ -504,6 +647,12 @@ class Catalog:
             raise CatalogError(
                 "failure messages are catalog-owned; pass only a stable error code"
             )
+        if (
+            stage not in _FAILURE_STAGES
+            or error_code not in _FAILURE_MESSAGES
+            or _EXTRACTOR_VERSION_PATTERN.fullmatch(extractor_version) is None
+        ):
+            raise CatalogError("invalid failure stage, code, or extractor version")
         self.connection.execute(
             """
             INSERT INTO failures (
@@ -521,7 +670,7 @@ class Catalog:
                 source_html_path,
                 stage,
                 error_code,
-                error_code,
+                _FAILURE_MESSAGES[error_code],
                 extractor_version,
             ],
         )
@@ -556,16 +705,13 @@ class Catalog:
         )
 
 
-def _is_content_free_summary(value: object) -> bool:
-    if value is None or isinstance(value, bool | int):
-        return True
-    if isinstance(value, float):
-        return value == value and value not in (float("inf"), float("-inf"))
-    if isinstance(value, Mapping):
-        return all(
-            isinstance(key, str) and _is_content_free_summary(item)
-            for key, item in value.items()
-        )
-    if isinstance(value, tuple | list):
-        return all(_is_content_free_summary(item) for item in value)
-    return False
+def _validate_summary(summary: Mapping[str, object]) -> None:
+    for key, value in summary.items():
+        if key == "validation_ok" and isinstance(value, bool):
+            continue
+        if key not in _SUMMARY_COUNTERS or isinstance(value, bool) or not isinstance(
+            value, int
+        ) or value < 0:
+            raise CatalogError(
+                "run summary values must be content-free counts with allowlisted keys"
+            )
