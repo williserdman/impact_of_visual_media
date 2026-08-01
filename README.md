@@ -43,8 +43,8 @@ overlap. Put a custom configuration before the subcommand:
 
 ## Four-command CLI
 
-The installed CLI has exactly four subcommands and prints one deterministic
-JSON summary per invocation:
+The installed CLI has exactly four subcommands. On its normal result path, each
+command prints one deterministic JSON summary:
 
 ```text
 inventory                 read-only counts for all discovered HTML/header images
@@ -57,6 +57,8 @@ smoke                     run the complete workflow on generated temporary fixtu
 `run` requires exactly one of a positive `--limit` or `--full`. `validate`,
 `run`, and `smoke` return a nonzero status when their final validation fails.
 `smoke` ignores the configured archive and output paths.
+Argument parsing, configuration, lock, schema, or unexpected pipeline errors
+can exit before a JSON summary is produced.
 
 ## Safe smoke-to-full workflow
 

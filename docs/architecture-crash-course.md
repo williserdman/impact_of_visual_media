@@ -62,7 +62,8 @@ flowchart LR
 7. The transaction updates the winner, candidate, duplicate, failure, and
    manifest state. Nonwinners retain metrics and provenance, not cleaned text.
 8. Validation checks the catalog and files while the mutating run still owns
-   the exclusive lock. The CLI returns a content-free JSON summary.
+   the exclusive lock. On the normal result path, the CLI returns a
+   content-free JSON summary.
 
 The final path is:
 
@@ -268,7 +269,7 @@ the deterministic target before catalog changes commit.
 |---|---|---|
 | before final-file replacement | old file/catalog remain | rerun |
 | after replacement, before transaction commit | file may be ahead of catalog | rerun deterministically republishes and commits |
-| date/identity change after new commit, before old-file cleanup | valid new row plus harmless old orphan | `validate` reports it; rerun/controlled cleanup repairs it |
+| date/identity change after new commit, before old-file cleanup | valid new row plus harmless old orphan | `validate` reports it; perform the controlled manual cleanup below |
 | extraction failure | content-free failure and failed manifest; no invalid research row | fix input/parser and rerun; a valid duplicate may be promoted |
 | validation failure | run status becomes failed and CLI is nonzero | inspect issue codes, repair cause, rerun |
 | process killed before lock cleanup | stale lock may remain | verify no process is active, remove only the stale lock, rerun |
@@ -278,6 +279,21 @@ Markdown replacement preceding transaction commit is intentional: committed
 catalog state never points to a new path that was not published. The stored
 hash exposes any temporary file/catalog mismatch. Cleanup never follows an
 unsafe path or directory symlink.
+
+An unchanged rerun does not sweep a post-commit orphan. To remove one safely:
+
+1. Verify no pipeline process is active and run `validate` to obtain the exact
+   output-relative `text/.../*.md` orphan path.
+2. Query `articles.cleaned_markdown_path` for that exact relative path and
+   continue only if the count is zero.
+3. Resolve the candidate beneath the configured output root. Verify every
+   parent is a real directory, the leaf is a regular non-symlink `.md` file,
+   and the resolved path remains inside the output root's `text/` directory.
+4. Delete only that verified file, leave the dated directories in place, and
+   run `validate` again.
+
+Never delete a directory tree, a catalogued path, a symlink, or anything below
+the source root as orphan recovery.
 
 ## 10. Validation
 

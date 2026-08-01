@@ -4,9 +4,12 @@
 > **Superseded history.** This completed plan describes the removed Parquet
 > prototype and is not current operating or architecture guidance. Use the
 > [2026-08-01 implementation plan](2026-08-01-simplified-markdown-catalog.md),
-> [current design](../specs/2026-07-29-wsj-preprocessing-index-design.md),
 > [README](../../../README.md), and
 > [architecture crash course](../../architecture-crash-course.md) instead.
+> The [approved architecture record](../specs/2026-07-29-wsj-preprocessing-index-design.md)
+> explains the design, but its `inventory [--limit N]` synopsis predates the
+> implemented no-option `inventory` command; use live help and the two current
+> user documents for CLI syntax.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
