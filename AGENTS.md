@@ -1,95 +1,102 @@
 # Repository guidance for coding agents
 
-## Scope
+## Read first
 
-This repository preprocesses the local licensed WSJ archive into canonical
-Parquet and a publication-date DuckDB index. Text/image embeddings, temporal
-knowledge graphs, market data, and trading strategies are separate downstream
-projects.
+The only user-facing documentation is:
 
-Read `README.md` and
-`docs/superpowers/specs/2026-07-29-wsj-preprocessing-index-design.md` before
-changing pipeline behavior.
+1. `README.md` for installation, safe operation, recovery, and queries.
+2. `docs/architecture-crash-course.md` for architecture and maintenance.
 
-## Nonnegotiable data safety
+Keep `AGENTS.md` as control guidance, not a third tutorial. Files under
+`docs/superpowers/` are decision and execution history, not current operator
+documentation.
 
-- Treat `data/wsj_archive/` as immutable input. Never rename, rewrite, move, or
-  delete raw HTML or companion images as part of pipeline work.
-- Do not stage or commit anything under `data/`, generated Parquet, DuckDB
-  databases, logs, archives, model artifacts, or licensed article excerpts.
-- Never run `wsj-pipeline process --full`, `run --full`, or
-  `--full --reprocess` unless the user explicitly authorizes that corpus-scale
-  operation in the current task. A full run is long-running.
-- Use `.venv/bin/wsj-pipeline smoke` for end-to-end verification. If real data
-  is genuinely needed, use a small explicit `--limit`.
-- Do not log article bodies or include licensed excerpts in exceptions,
-  snapshots, fixtures, documentation, or commits.
-- Missing header images are valid data and belong in the audit output, not a
-  fatal error.
-- Empty extracted bodies are retained with an `empty_body` warning so they can
-  participate in deterministic ranking and future parser reprocessing.
+## Data and scale safety
 
-## Archive facts
+- Treat `data/wsj_archive/` as immutable licensed input. Never rename, rewrite,
+  move, or delete raw HTML or images.
+- Write generated state only below the configured output root. Source and
+  output roots must remain disjoint.
+- Never stage or commit raw/derived data, DuckDB files, generated Markdown,
+  logs, model artifacts, archives, or licensed article excerpts.
+- Never put article bodies in errors, audit rows, snapshots, fixtures,
+  documentation, or commit messages.
+- Automated checks use generated temporary fixtures only. Use
+  `.venv/bin/wsj-pipeline smoke` for end-to-end verification.
+- Do not run `run --full` or `run --full --reprocess` against the real archive
+  unless the user explicitly authorizes that corpus-scale action in the
+  current task. A mutating real-data diagnostic must use an explicit small
+  `--limit`.
+- Before removing `pipeline.lock`, verify that no pipeline process is active.
+  Remove only the stale lock and rerun the idempotent command.
 
-- Current source years are 2016–2023; 2024–2026 will be added later.
-- Layouts vary between `YEAR/*.html` and `YEAR/YEAR/*.html`; discovery must
-  remain recursive.
-- A companion image is a sibling named
-  `<html-stem>_main_image.{jpg,jpeg,png,webp}`.
-- Hidden directories, `__MACOSX`, and the top-level `backup` directory are
-  excluded from discovery.
-- Publication timestamps are sourced from WSJ metadata, not filename epochs,
-  filesystem times, folder years, or `dateLastPubbed`.
+## Invariants
 
-## Architecture
+- Extract complete editorial content in reading order: headline, distinct
+  descriptive metadata, byline, paragraphs, headings, lists, tables, quotes,
+  editorial links, figures, captions/credits/creator text, and relevant visible
+  interactive text. Exclude chrome, ads, prompts, recommendations, sharing,
+  biographies, scripts/styles, hidden duplicates, and repeated metadata.
+- Normalization is deterministic and conservative. Do not summarize,
+  paraphrase, translate, stem, lowercase, or otherwise change editorial
+  meaning.
+- Preserve resolved remote HTTP(S) editorial image URLs in Markdown and the
+  ordered, deduplicated `inline_image_urls` list. Never download them. Keep the
+  optional local companion header image as a separate source-relative path;
+  a missing image is valid and warned, not fatal.
+- Publish one canonical Markdown file and one `articles` row per winning
+  `article_id`. Keep one DuckDB catalog for both the research interface and
+  minimal operational state. Operational tables must not store cleaned bodies.
+- Preserve identity fallback order: trimmed WSJ ID, normalized canonical-URL
+  hash, then source-HTML hash. Preserve winner ordering: nonempty content,
+  character count, block count, metadata completeness, later update time, then
+  lexical source path.
+- Use authoritative timezone-aware publication metadata, normalize it to UTC,
+  and derive the indexed date with `America/New_York`. Never substitute created,
+  updated, last-published, filename, directory, or filesystem time.
+- Keep output paths deterministic:
+  `text/YYYY/MM/DD/<sha256-of-namespaced-article-id>.md`, using the New York
+  publication date.
+- `run` requires exactly one positive `--limit` or explicit `--full`.
+  Limited/interrupted runs never infer deletion. Only a completed full run may
+  mark unseen sources missing and promote/remove affected winners.
+- Keep mutation under one exclusive lock and bounded transactions. Stage,
+  reopen, hash, and atomically replace Markdown before committing its catalog
+  state. Delete obsolete generated files only after commit; validation must
+  report harmless orphans left by interrupted cleanup.
+- Fail closed on incompatible or malformed generated schemas. Never silently
+  migrate, overwrite, or delete legacy derived output.
 
-- `discovery.py`: stable source enumeration and image pairing.
-- `extract.py`: versioned, content-free-failure HTML/JSON-LD extraction.
-- `state.py`: operational DuckDB manifest, batches, failures, and runs.
-- `canonical.py`: article identity, winner ranking, and duplicate audit logic.
-- `publish.py`: explicit Arrow schemas and atomic monthly/audit Parquet writes.
-- `index.py`: transactional body-free date index plus Parquet-backed views.
-- `validate.py`: cross-artifact invariants.
-- `service.py`: locking and end-to-end orchestration.
-- `cli.py`: safety gates and JSON command output.
+## Change workflow
 
-Keep these boundaries focused. Avoid putting research-specific embeddings,
-entity extraction, graph construction, or market logic into the shared
-preprocessing package.
+Use test-driven development for behavior changes. Every new archive variation,
+regression, interruption boundary, or invariant needs a focused generated
+fixture before implementation.
 
-## Invariants to preserve
+If extraction can change Markdown, identity metadata, inline image URLs, or
+ranking metrics:
 
-- Raw inputs are read-only; outputs are written only below the configured
-  output root.
-- `article_key` prefers WSJ ID, then normalized canonical URL hash, then HTML
-  content hash.
-- Canonical winner ordering is deterministic: valid publication time,
-  nonempty body, body word count, metadata completeness, update time, lexical
-  source path.
-- Store exact timezone-aware UTC publication time and derived
-  `America/New_York` time/date. Never silently substitute created, updated, or
-  last-published time.
-- Parquet partitions use New York publication year/month and contain unique
-  canonical article keys.
-- Unchanged runs do not re-extract or rewrite article partitions.
-- Committed extraction changes must enqueue durable article keys. Canonical
-  changes must enqueue durable old/new month partitions, and queues are cleared
-  only after their downstream transaction or atomic file replacement succeeds.
-- Only a completed `--full` inventory may mark previously known source paths
-  missing. A bounded `--limit` run must never reconcile unseen paths.
-- Changed partitions and the DuckDB index are staged, validated, and atomically
-  replaced.
-- Duplicate, failure, missing-image, and run audits contain provenance but no
-  article-body text.
-- Corpus validation must project only required provenance/date columns from
-  article Parquet, keep Python scans batch-local, and perform global comparisons
-  in DuckDB; do not materialize the corpus or body columns in Python.
-- `process` and `run` must continue to require exactly one of `--limit` or
-  `--full`.
+1. add and observe a failing fixture test;
+2. implement the smallest extraction change;
+3. bump `EXTRACTOR_VERSION`;
+4. verify stale rows are skipped without `--reprocess` and handled with an
+   explicit bounded reprocess; and
+5. update the crash-course contract if semantics changed.
 
-## Development workflow
+If a table, column, type, constraint, or index changes:
 
-Use test-driven development for behavior changes:
+1. update exact schema tests first;
+2. update catalog creation/validation, access methods, pipeline writes,
+   cross-artifact validation, and documented queries together;
+3. bump `CATALOG_SCHEMA_VERSION`; and
+4. test refusal of old/malformed output plus a complete fresh fixture run.
+
+There is no automatic schema migration. A version change instructs operators
+to move reproducible derived output aside or choose a fresh output root.
+
+## Verification and hygiene
+
+Run only fixture-safe checks:
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -97,32 +104,16 @@ Use test-driven development for behavior changes:
 .venv/bin/wsj-pipeline smoke
 ```
 
-All automated tests must use generated temporary fixtures. Add a focused
-fixture for every new WSJ HTML variation or regression.
+Verify documented CLI claims against live `--help`. Resolve relative Markdown
+links and audit all tracked Markdown for stale current-facing architecture
+claims before committing.
 
-When an extraction change can alter normalized records:
+Use `git status --short` and confirm no generated artifacts are tracked:
 
-1. add and observe a failing regression test;
-2. update the parser;
-3. bump `EXTRACTOR_VERSION`;
-4. verify stale rows are skipped without `--reprocess`;
-5. update the design/schema documentation if fields or semantics changed.
+```bash
+git ls-files | rg '^(data|artifacts|outputs)/'
+```
 
-When a schema changes, also update explicit Arrow schemas, state schema
-versioning/migration behavior, DuckDB index creation, validation, README
-examples, and tests.
-
-## Operations and repository hygiene
-
-- The default config is `config/wsj_pipeline.toml`.
-- Canonical output is `data/processed/wsj/parquet/articles/`.
-- The user-facing index is `data/processed/wsj/index/wsj.duckdb`.
-- If outputs move, rebuild the index because its views use resolved Parquet
-  paths.
-- Before removing a stale pipeline lock, verify no pipeline process is active.
-- Before committing, use `git status --short` and confirm no data artifact is
-  tracked with `git ls-files | rg '^(data|artifacts|outputs)/'`.
-- If machine configuration, services, Codex configuration, plugins, skills, or
-  environment-variable names change, follow the global instruction to update
-  `/home/willis/SETUP_REPLICATION.md` in the same task without recording
-  secrets.
+If machine configuration, services, Codex configuration, plugins, skills, or
+environment-variable names change, follow the global instruction to update
+`/home/willis/SETUP_REPLICATION.md` without recording secret values.

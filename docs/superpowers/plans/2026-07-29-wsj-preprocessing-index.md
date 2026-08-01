@@ -1,5 +1,13 @@
 # WSJ Preprocessing and Publication-Date Index Implementation Plan
 
+> [!WARNING]
+> **Superseded history.** This completed plan describes the removed Parquet
+> prototype and is not current operating or architecture guidance. Use the
+> [2026-08-01 implementation plan](2026-08-01-simplified-markdown-catalog.md),
+> [current design](../specs/2026-07-29-wsj-preprocessing-index-design.md),
+> [README](../../../README.md), and
+> [architecture crash course](../../architecture-crash-course.md) instead.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a safe, incremental Python pipeline that cleans WSJ HTML/image pairs into partitioned Parquet and publishes a DuckDB publication-date index.
