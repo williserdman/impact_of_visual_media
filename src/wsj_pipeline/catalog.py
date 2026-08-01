@@ -175,6 +175,8 @@ _EXTRACTOR_VERSION_PATTERN = re.compile(r"[1-9][0-9]*")
 _CATALOG_DIRECTORY_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 )
+_CATALOG_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+_CATALOG_WRITE_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
 
 
 class CatalogError(RuntimeError):
@@ -189,7 +191,7 @@ def _prepare_catalog_path(
     path: Path,
     *,
     create: bool,
-) -> tuple[int, str, tuple[int, int] | None]:
+) -> tuple[int, tuple[int, int] | None]:
     """Anchor one safe DuckDB leaf below a no-follow parent descriptor."""
 
     absolute_path = Path(os.path.abspath(path))
@@ -230,22 +232,13 @@ def _prepare_catalog_path(
                     "catalog path is missing",
                     code="missing_catalog",
                 ) from None
-            return (
-                parent_descriptor,
-                f"/proc/self/fd/{parent_descriptor}/{absolute_path.name}",
-                None,
-            )
+            return parent_descriptor, None
         if not stat.S_ISREG(leaf_stat.st_mode) or leaf_stat.st_nlink != 1:
             raise CatalogError(
                 "catalog path is unsafe",
                 code="unsafe_catalog_path",
             )
-        anchored_path = f"/proc/self/fd/{parent_descriptor}/{absolute_path.name}"
-        return (
-            parent_descriptor,
-            anchored_path,
-            (leaf_stat.st_dev, leaf_stat.st_ino),
-        )
+        return parent_descriptor, (leaf_stat.st_dev, leaf_stat.st_ino)
     except BaseException:
         os.close(parent_descriptor)
         raise
@@ -275,6 +268,37 @@ def _verify_catalog_leaf(
         or (leaf_stat.st_dev, leaf_stat.st_ino) != identity
     ):
         raise CatalogError("catalog path is unsafe", code="unsafe_catalog_path")
+
+
+def _open_catalog_leaf_descriptor(
+    parent_descriptor: int,
+    leaf_name: str,
+    identity: tuple[int, int],
+    *,
+    read_only: bool,
+) -> int:
+    """Anchor DuckDB to the verified inode instead of the mutable leaf name."""
+
+    try:
+        descriptor = os.open(
+            leaf_name,
+            _CATALOG_READ_FLAGS if read_only else _CATALOG_WRITE_FLAGS,
+            dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        raise CatalogError(
+            "catalog path is unsafe",
+            code="unsafe_catalog_path",
+        ) from error
+    leaf_stat = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(leaf_stat.st_mode)
+        or leaf_stat.st_nlink != 1
+        or (leaf_stat.st_dev, leaf_stat.st_ino) != identity
+    ):
+        os.close(descriptor)
+        raise CatalogError("catalog path is unsafe", code="unsafe_catalog_path")
+    return descriptor
 
 
 def _create_fresh_catalog_leaf(
@@ -387,34 +411,46 @@ class Catalog:
         self,
         connection: duckdb.DuckDBPyConnection,
         parent_descriptor: int | None = None,
+        leaf_descriptor: int | None = None,
     ) -> None:
         self.connection = connection
         self._parent_descriptor = parent_descriptor
+        self._leaf_descriptor = leaf_descriptor
 
     @classmethod
     def open(cls, path: Path) -> Catalog:
         """Open ``path``, creating schema version 1 only for a fresh database."""
 
-        parent_descriptor, anchored_path, identity = _prepare_catalog_path(
+        parent_descriptor, identity = _prepare_catalog_path(
             path,
             create=True,
         )
         connection: duckdb.DuckDBPyConnection | None = None
+        leaf_descriptor: int | None = None
         try:
             if identity is None:
                 identity = _create_fresh_catalog_leaf(
                     parent_descriptor,
                     path.name,
                 )
+            leaf_descriptor = _open_catalog_leaf_descriptor(
+                parent_descriptor,
+                path.name,
+                identity,
+                read_only=False,
+            )
+            anchored_path = f"/proc/self/fd/{leaf_descriptor}"
             connection = duckdb.connect(anchored_path)
             _verify_catalog_leaf(parent_descriptor, path.name, identity)
         except BaseException:
             if connection is not None:
                 connection.close()
+            if leaf_descriptor is not None:
+                os.close(leaf_descriptor)
             os.close(parent_descriptor)
             raise
         assert connection is not None
-        catalog = cls(connection, parent_descriptor)
+        catalog = cls(connection, parent_descriptor, leaf_descriptor)
         try:
             catalog._ensure_schema()
         except BaseException:
@@ -430,18 +466,29 @@ class Catalog:
     ) -> Iterator[duckdb.DuckDBPyConnection]:
         """Open a safe existing catalog through an anchored parent descriptor."""
 
-        parent_descriptor, anchored_path, identity = _prepare_catalog_path(
+        parent_descriptor, identity = _prepare_catalog_path(
             path,
             create=False,
         )
         connection: duckdb.DuckDBPyConnection | None = None
+        leaf_descriptor: int | None = None
         try:
+            assert identity is not None
+            leaf_descriptor = _open_catalog_leaf_descriptor(
+                parent_descriptor,
+                path.name,
+                identity,
+                read_only=True,
+            )
+            anchored_path = f"/proc/self/fd/{leaf_descriptor}"
             connection = duckdb.connect(anchored_path, read_only=True)
             _verify_catalog_leaf(parent_descriptor, path.name, identity)
             yield connection
         finally:
             if connection is not None:
                 connection.close()
+            if leaf_descriptor is not None:
+                os.close(leaf_descriptor)
             os.close(parent_descriptor)
 
     def __enter__(self) -> Catalog:
@@ -452,6 +499,9 @@ class Catalog:
 
     def close(self) -> None:
         self.connection.close()
+        if self._leaf_descriptor is not None:
+            os.close(self._leaf_descriptor)
+            self._leaf_descriptor = None
         if self._parent_descriptor is not None:
             os.close(self._parent_descriptor)
             self._parent_descriptor = None

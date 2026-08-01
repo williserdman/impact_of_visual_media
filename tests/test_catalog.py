@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
 import pytest
 
+import wsj_pipeline.catalog as catalog_module
 from wsj_pipeline.catalog import (
     ArticleRecord,
     Catalog,
@@ -279,6 +282,58 @@ def test_open_rejects_unsafe_catalog_leaf_before_duckdb_access(
     assert raised.value.code == "unsafe_catalog_path"
     assert str(raised.value) == "catalog path is unsafe"
     assert external.read_bytes() == before
+
+
+def test_open_does_not_recover_external_wal_if_catalog_leaf_is_swapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "output" / "catalog.duckdb"
+    with Catalog.open(database_path):
+        pass
+
+    external = tmp_path / "external.duckdb"
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import duckdb, os, sys; "
+                "connection = duckdb.connect(sys.argv[1]); "
+                "connection.execute('CREATE TABLE sentinel(value INTEGER)'); "
+                "connection.execute('BEGIN'); "
+                "connection.execute("
+                "'INSERT INTO sentinel SELECT range FROM range(100000)'); "
+                "connection.execute('COMMIT'); "
+                "os._exit(0)"
+            ),
+            str(external),
+        ],
+        check=True,
+    )
+    external_wal = external.with_name(f"{external.name}.wal")
+    assert external_wal.is_file()
+    external_before = external.read_bytes()
+    wal_before = external_wal.read_bytes()
+    real_connect = catalog_module.duckdb.connect
+    swapped = False
+
+    def swap_then_connect(*args: object, **kwargs: object):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            database_path.unlink()
+            database_path.symlink_to(external)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(catalog_module.duckdb, "connect", swap_then_connect)
+
+    with pytest.raises(CatalogError) as raised:
+        Catalog.open(database_path)
+
+    assert raised.value.code == "unsafe_catalog_path"
+    assert external.read_bytes() == external_before
+    assert external_wal.read_bytes() == wal_before
 
 
 @pytest.mark.parametrize(
