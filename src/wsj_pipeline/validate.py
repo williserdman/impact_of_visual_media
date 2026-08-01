@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 import duckdb
 
-from wsj_pipeline.catalog import CATALOG_SCHEMA_VERSION
+from wsj_pipeline.catalog import CATALOG_SCHEMA_VERSION, Catalog, CatalogError
 from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.extract import EXTRACTOR_VERSION, derive_publication_date_new_york
 
@@ -68,6 +68,29 @@ def validate_outputs(config: PipelineConfig) -> ValidationReport:
     issues: list[ValidationIssue] = []
     try:
         with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+            try:
+                Catalog.validate_schema(connection)
+            except CatalogError as error:
+                messages = {
+                    "malformed_catalog_schema": (
+                        "catalog schema does not match the supported contract"
+                    ),
+                    "unsupported_catalog_version": (
+                        "catalog schema version is not supported"
+                    ),
+                }
+                return ValidationReport(
+                    (
+                        ValidationIssue(
+                            error.code,
+                            messages.get(
+                                error.code,
+                                "catalog could not be queried with the "
+                                "supported schema",
+                            ),
+                        ),
+                    )
+                )
             _validate_relations(connection, issues)
             for item in _iter_catalog_files(connection):
                 _validate_catalog_file(config, item, issues)
@@ -713,6 +736,8 @@ def _walk_markdown(
     with os.scandir(directory_descriptor) as entries:
         for entry in entries:
             relative_path = relative_directory / entry.name
+            if entry.is_symlink():
+                continue
             if entry.is_dir(follow_symlinks=False):
                 try:
                     child_descriptor = os.open(

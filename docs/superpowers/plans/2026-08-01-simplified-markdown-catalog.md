@@ -193,6 +193,12 @@ Expected: failures reference legacy `relative_image_path` names.
 Keep `EXCLUDED_DIRECTORIES`, `IMAGE_EXTENSIONS`, stable global sorting, and the
 directory image cache. Do not read article contents in discovery.
 
+> **Task 12 repair clarification (2026-08-01):** Review later found that the
+> inherited global sort and corpus-lived directory cache violated the bounded
+> design. The final traversal preserves global lexical order with per-directory
+> sorting, retains only the current directory's image index, stops after a
+> limited yield, and excludes `backup` only at the source-root level.
+
 - [ ] **Step 4: Run focused tests and lint**
 
 ```bash
@@ -527,8 +533,10 @@ git commit -m "feat: publish Markdown incrementally"
 - Extend: `tests/test_recovery.py`
 
 **Interfaces:**
-- `Catalog.reconcile_missing(run_id: str) -> tuple[str, ...]` returns affected
-  article IDs.
+- `Catalog.reconcile_missing(run_id: str, *, batch_size: int) -> int` reconciles
+  one bounded source page; affected identities are then read in lexical pages
+  with `Catalog.affected_missing_article_ids(...)` after all missing candidates
+  have been removed.
 - `recompute_article(article_id: str, ...)` promotes the best remaining source
   or removes the research record when none remain.
 
@@ -552,7 +560,8 @@ recorded as the new winner.
 - [ ] **Step 4: Implement last-seen tracking and full-only reconciliation**
 
 Do not reconcile after an interrupted inventory. Perform it only after source
-iteration completes successfully in explicit full mode.
+iteration completes successfully in explicit full mode. Page missing-source
+updates, affected-identity recomputation, and cleanup by configured batch size.
 
 - [ ] **Step 5: Run focused tests and lint**
 
@@ -845,8 +854,10 @@ Expected: wheel build succeeds without restoring removed dependencies.
 .venv/bin/wsj-pipeline smoke
 ```
 
-Expected JSON: validation is true, two canonical articles exist, the duplicate
-count is one, and generated Markdown paths are date-partitioned.
+Expected JSON: validation is true, two canonical articles exist, and the
+duplicate count is one. Date-partitioned Markdown paths are intentionally
+test-only evidence asserted inside the temporary smoke fixture before cleanup;
+the content-free CLI summary exposes counts rather than ephemeral paths.
 
 - [ ] **Step 4: Audit Git and the real archive boundary**
 

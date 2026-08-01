@@ -7,9 +7,8 @@
 > [README](../../../README.md), and
 > [architecture crash course](../../architecture-crash-course.md) instead.
 > The [approved architecture record](../specs/2026-07-29-wsj-preprocessing-index-design.md)
-> explains the design, but its `inventory [--limit N]` synopsis predates the
-> implemented no-option `inventory` command; use live help and the two current
-> user documents for CLI syntax.
+> explains the design and records the final optionless `inventory` decision;
+> use live help and the two current user documents for CLI syntax.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

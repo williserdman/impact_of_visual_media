@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+import wsj_pipeline.discovery as discovery_module
 from wsj_pipeline.discovery import discover_sources
 
 
@@ -35,6 +38,24 @@ def test_excludes_hidden_macos_and_backup_directories(tmp_path: Path) -> None:
     candidates = list(discover_sources(archive))
 
     assert [item.relative_html_path for item in candidates] == ["2016/included.html"]
+
+
+def test_excludes_only_top_level_backup_while_retaining_all_depth_rules(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    create_file(archive / "backup" / "top-level-copy.html")
+    create_file(archive / "2024" / "backup" / "editorial.html")
+    create_file(archive / "2024" / "backup" / ".hidden" / "hidden.html")
+    create_file(
+        archive / "2024" / "backup" / "__MACOSX" / "artifact.html"
+    )
+
+    candidates = list(discover_sources(archive))
+
+    assert [item.relative_html_path for item in candidates] == [
+        "2024/backup/editorial.html"
+    ]
 
 
 def test_missing_image_is_valid_and_warned(tmp_path: Path) -> None:
@@ -73,6 +94,48 @@ def test_limit_is_applied_after_global_sorting(tmp_path: Path) -> None:
         "2016/a.html",
         "2019/b.html",
     ]
+
+
+def test_global_lexical_order_merges_files_and_directories(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+    for relative_path in (
+        "a/story.html",
+        "a.html",
+        "a-early.html",
+        "z.html",
+    ):
+        create_file(archive / relative_path)
+
+    candidates = list(discover_sources(archive))
+
+    assert [item.relative_html_path for item in candidates] == [
+        "a-early.html",
+        "a.html",
+        "a/story.html",
+        "z.html",
+    ]
+
+
+def test_limited_discovery_yields_before_traversing_later_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    create_file(archive / "a" / "first.html")
+    blocked_directory = archive / "z"
+    create_file(blocked_directory / "later.html")
+    real_scandir = discovery_module.os.scandir
+
+    def guarded_scandir(path):
+        if Path(path) == blocked_directory:
+            raise AssertionError("limited discovery traversed beyond its first yield")
+        return real_scandir(path)
+
+    monkeypatch.setattr(discovery_module.os, "scandir", guarded_scandir)
+
+    iterator = discover_sources(archive, limit=1)
+
+    assert next(iterator).relative_html_path == "a/first.html"
 
 
 def test_candidate_records_html_stat_fingerprint(tmp_path: Path) -> None:

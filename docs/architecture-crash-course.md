@@ -42,8 +42,9 @@ flowchart LR
 ## 2. One article's journey
 
 1. `discovery.py` recursively finds `.html` files in lexical relative-path
-   order. Hidden directories, `__MACOSX`, and any directory named `backup` are
-   skipped.
+   order. Hidden directories and `__MACOSX` are skipped at every depth; only a
+   top-level directory named `backup` is skipped. A nested editorial directory
+   named `backup` remains discoverable.
 2. Discovery looks beside the HTML for
    `<stem>_main_image.{jpg,jpeg,png,webp}`. That extension order is the winner
    priority. No image is valid; multiple images produce a warning.
@@ -143,7 +144,8 @@ is not injected into article Markdown.
 `catalog.duckdb` is both the research catalog and the operational state store.
 Opening an unsupported or malformed schema fails with instructions to move the
 derived output aside or choose a fresh output root. There is no silent
-migration or deletion.
+migration or deletion. Public validation uses the same exact table, column,
+key, constraint, and index contract through a read-only connection.
 
 ### Research-facing table
 
@@ -249,11 +251,14 @@ stateDiagram-v2
     succeeded --> missing: unseen in a completed full run only
 ```
 
-Runs process lexical discovery in configured-size batches. A limited run sees
-only the first `N` paths and never infers deletion. A completed full run marks
-previously known unseen paths missing, removes vanished unique winners, or
-re-extracts and promotes the next valid duplicate. An interrupted full run
-does not perform that reconciliation.
+Runs process lexical discovery in configured-size batches. Discovery sorts and
+retains only one directory at a time, keeps only the current directory's image
+index, and stops traversal once a limited run yields its first `N` paths. A
+limited run never infers deletion. A completed full run reconciles missing
+sources in configured-size catalog pages, removes vanished unique winners, or
+re-extracts and promotes the next valid duplicate. An absent/non-directory
+source root is rejected before run state is created; an interrupted or failed
+traversal does not perform reconciliation.
 
 Changing `EXTRACTOR_VERSION` makes prior manifest rows stale. Without
 `--reprocess`, they are counted and marked seen but left untouched. This is a
@@ -313,7 +318,10 @@ the corpus in Python. It reports stable, sorted, content-free issue codes for:
 
 Validation detects; it does not mutate or repair. It hashes each catalogued
 Markdown file, so full validation is I/O-intensive even though memory use is
-bounded.
+bounded. Orphan traversal does not follow directory symlinks outside the
+generated tree. Symlink entries in the orphan walk are ignored rather than
+reported; a catalogued path that is a symlink is still reported as unsafe by
+the catalog-file checks.
 
 ## 11. Test map
 

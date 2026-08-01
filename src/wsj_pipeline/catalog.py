@@ -148,6 +148,10 @@ _EXTRACTOR_VERSION_PATTERN = re.compile(r"[1-9][0-9]*")
 class CatalogError(RuntimeError):
     """Raised when the catalog is missing required compatible metadata."""
 
+    def __init__(self, message: str, *, code: str = "invalid_catalog") -> None:
+        super().__init__(message)
+        self.code = code
+
 
 @dataclass(frozen=True, slots=True)
 class CandidateStatus:
@@ -229,30 +233,10 @@ class Catalog:
         self.connection.close()
 
     def _ensure_schema(self) -> None:
-        table_types = {
-            row[0]: row[1]
-            for row in self.connection.execute(
-                """
-                SELECT table_name, table_type
-                FROM information_schema.tables
-                WHERE table_catalog = current_database()
-                  AND table_schema = 'main'
-                """
-            ).fetchall()
-        }
-        if "metadata" in table_types:
-            try:
-                row = self.connection.execute(
-                    "SELECT value FROM metadata WHERE key = 'schema_version'"
-                ).fetchone()
-            except duckdb.Error:
-                row = None
-            version = str(row[0]) if row is not None else "missing"
-            self._refuse_unsupported_version(version)
-            self._validate_existing_schema(table_types)
+        table_types = self._table_types(self.connection)
+        if table_types:
+            self.validate_schema(self.connection, table_types=table_types)
             return
-        elif table_types:
-            self._refuse_unsupported_version("missing")
 
         self.connection.execute("BEGIN TRANSACTION")
         try:
@@ -271,24 +255,66 @@ class Catalog:
         else:
             self.connection.execute("COMMIT")
 
+    @classmethod
+    def validate_schema(
+        cls,
+        connection: duckdb.DuckDBPyConnection,
+        *,
+        table_types: dict[str, str] | None = None,
+    ) -> None:
+        """Validate the exact supported contract without modifying the catalog."""
+
+        current_table_types = table_types or cls._table_types(connection)
+        try:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+        except duckdb.Error:
+            row = None
+        version = str(row[0]) if row is not None else "missing"
+        cls._refuse_unsupported_version(version)
+        cls._validate_existing_schema(connection, current_table_types)
+
+    @staticmethod
+    def _table_types(
+        connection: duckdb.DuckDBPyConnection,
+    ) -> dict[str, str]:
+        return {
+            row[0]: row[1]
+            for row in connection.execute(
+                """
+                SELECT table_name, table_type
+                FROM information_schema.tables
+                WHERE table_catalog = current_database()
+                  AND table_schema = 'main'
+                """
+            ).fetchall()
+        }
+
     @staticmethod
     def _refuse_unsupported_version(version: str) -> None:
         if version != CATALOG_SCHEMA_VERSION:
             raise CatalogError(
                 f"unsupported catalog schema version {version}; "
                 f"expected {CATALOG_SCHEMA_VERSION}; move derived output "
-                "aside or choose a fresh output root"
+                "aside or choose a fresh output root",
+                code="unsupported_catalog_version",
             )
 
-    def _validate_existing_schema(self, table_types: dict[str, str]) -> None:
+    @classmethod
+    def _validate_existing_schema(
+        cls,
+        connection: duckdb.DuckDBPyConnection,
+        table_types: dict[str, str],
+    ) -> None:
         if set(table_types) != _CATALOG_TABLES or set(table_types.values()) != {
             "BASE TABLE"
         }:
-            self._raise_malformed_schema()
+            cls._raise_malformed_schema()
         table_columns = {
             table: tuple(
                 (row[1], row[2], row[3], row[4], row[5])
-                for row in self.connection.execute(
+                for row in connection.execute(
                     f"PRAGMA table_info('{table}')"
                 ).fetchall()
             )
@@ -296,7 +322,7 @@ class Catalog:
         }
         key_constraints = {
             (row[0], row[1], tuple(row[2]))
-            for row in self.connection.execute(
+            for row in connection.execute(
                 """
                 SELECT table_name, constraint_type, constraint_column_names
                 FROM duckdb_constraints()
@@ -304,7 +330,7 @@ class Catalog:
                 """
             ).fetchall()
         }
-        indexes = self.connection.execute(
+        indexes = connection.execute(
             """
             SELECT table_name, index_name, is_unique, expressions
             FROM duckdb_indexes()
@@ -323,13 +349,14 @@ class Catalog:
                 )
             ]
         ):
-            self._raise_malformed_schema()
+            cls._raise_malformed_schema()
 
     @staticmethod
     def _raise_malformed_schema() -> None:
         raise CatalogError(
             f"malformed catalog schema version {CATALOG_SCHEMA_VERSION}; "
-            "move derived output aside or choose a fresh output root"
+            "move derived output aside or choose a fresh output root",
+            code="malformed_catalog_schema",
         )
 
     def _create_tables(self) -> None:
@@ -551,10 +578,17 @@ class Catalog:
         if result.fetchone()[0] != 1:
             raise CatalogError("cannot mark an unknown source manifest row as seen")
 
-    def reconcile_missing(self, run_id: str) -> tuple[str, ...]:
-        """Mark unseen sources missing and discard their publishable candidates."""
+    def reconcile_missing(
+        self,
+        run_id: str,
+        *,
+        batch_size: int,
+    ) -> int:
+        """Mark one bounded page of unseen source rows missing."""
 
-        missing_paths = tuple(
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        missing_paths = [
             row[0]
             for row in self.connection.execute(
                 """
@@ -562,53 +596,63 @@ class Catalog:
                 FROM source_manifest
                 WHERE last_seen_run_id <> ? AND status <> 'missing'
                 ORDER BY source_html_path
+                LIMIT ?
                 """,
-                [run_id],
-            ).fetchall()
-        )
+                [run_id, batch_size],
+            ).fetchmany(batch_size)
+        ]
         if not missing_paths:
-            return ()
-
-        affected_article_ids = tuple(
-            row[0]
-            for row in self.connection.execute(
-                """
-                SELECT DISTINCT article_id
-                FROM (
-                    SELECT article_id
-                    FROM source_manifest
-                    WHERE source_html_path IN (
-                        SELECT unnest(?)
-                    )
-                    UNION ALL
-                    SELECT article_id
-                    FROM candidates
-                    WHERE source_html_path IN (
-                        SELECT unnest(?)
-                    )
-                )
-                WHERE article_id IS NOT NULL
-                ORDER BY article_id
-                """,
-                [list(missing_paths), list(missing_paths)],
-            ).fetchall()
-        )
+            return 0
         self.connection.execute(
             """
             UPDATE source_manifest
             SET status = 'missing', last_run_id = ?
             WHERE source_html_path IN (SELECT unnest(?))
             """,
-            [run_id, list(missing_paths)],
+            [run_id, missing_paths],
         )
         self.connection.execute(
             """
             DELETE FROM candidates
             WHERE source_html_path IN (SELECT unnest(?))
             """,
-            [list(missing_paths)],
+            [missing_paths],
         )
-        return affected_article_ids
+        return len(missing_paths)
+
+    def affected_missing_article_ids(
+        self,
+        run_id: str,
+        *,
+        after_article_id: str | None,
+        batch_size: int,
+    ) -> tuple[str, ...]:
+        """Return one lexical page of identities affected by this full run."""
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        after_clause = "" if after_article_id is None else "AND article_id > ?"
+        parameters: list[object] = [run_id]
+        if after_article_id is not None:
+            parameters.append(after_article_id)
+        parameters.append(batch_size)
+        return tuple(
+            row[0]
+            for row in self.connection.execute(
+                f"""
+                SELECT article_id
+                FROM source_manifest
+                WHERE status = 'missing'
+                  AND last_run_id = ?
+                  AND article_id IS NOT NULL
+                  {after_clause}
+                GROUP BY article_id
+                ORDER BY article_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchmany(batch_size)
+        )
 
     def replace_manifest(
         self,

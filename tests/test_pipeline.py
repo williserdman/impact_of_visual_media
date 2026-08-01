@@ -108,6 +108,34 @@ def test_pipeline_summary_exposes_only_approved_counts_and_validation() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("source_relative", "output_relative"),
+    [
+        ("archive", "archive"),
+        ("archive", "archive/processed"),
+        ("archive/raw", "archive"),
+    ],
+)
+def test_run_entry_rejects_tampered_overlapping_config_before_writing(
+    tmp_path: Path,
+    source_relative: str,
+    output_relative: str,
+) -> None:
+    source_root = (tmp_path / source_relative).resolve()
+    output_root = (tmp_path / output_relative).resolve()
+    source_root.mkdir(parents=True, exist_ok=True)
+    config = object.__new__(PipelineConfig)
+    object.__setattr__(config, "source_root", source_root)
+    object.__setattr__(config, "output_root", output_root)
+    object.__setattr__(config, "batch_size", 1)
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        run_pipeline(config, limit=1, full=False)
+
+    assert not (output_root / "pipeline.lock").exists()
+    assert not (output_root / "catalog.duckdb").exists()
+
+
 def test_atomic_markdown_reopens_and_verifies_staged_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -169,6 +197,25 @@ def test_failed_atomic_markdown_replace_preserves_target_and_cleans_staging(
         write_markdown_atomic("replacement", target, staging_root, "run-2")
 
     assert target.read_text(encoding="utf-8") == "original"
+    assert list(staging_root.rglob("*")) == []
+
+
+def test_target_parent_failure_cleans_run_staging(tmp_path: Path) -> None:
+    output_root = tmp_path / "processed"
+    staging_root = output_root / "staging"
+    blocked_parent = output_root / "text"
+    blocked_parent.parent.mkdir(parents=True)
+    blocked_parent.write_text("regular-file obstacle", encoding="utf-8")
+    target = blocked_parent / "2024" / "article.md"
+
+    with pytest.raises(NotADirectoryError):
+        write_markdown_atomic(
+            "synthetic replacement",
+            target,
+            staging_root,
+            "run-parent-failure",
+        )
+
     assert list(staging_root.rglob("*")) == []
 
 

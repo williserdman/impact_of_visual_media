@@ -57,13 +57,19 @@ documentation.
 - Keep output paths deterministic:
   `text/YYYY/MM/DD/<sha256-of-namespaced-article-id>.md`, using the New York
   publication date.
+- Discover in stable lexical order without inventorying the full corpus before
+  a limited yield. Exclude hidden directories and `__MACOSX` at every depth,
+  but exclude `backup` only when it is directly below the source root.
 - `run` requires exactly one positive `--limit` or explicit `--full`.
   Limited/interrupted runs never infer deletion. Only a completed full run may
-  mark unseen sources missing and promote/remove affected winners.
+  mark unseen sources missing and promote/remove affected winners. Reject an
+  absent, non-directory, or inaccessible source root before beginning a run;
+  traversal failure must abort before reconciliation.
 - Keep mutation under one exclusive lock and bounded transactions. Stage,
   reopen, hash, and atomically replace Markdown before committing its catalog
-  state. Delete obsolete generated files only after commit; validation must
-  report harmless orphans left by interrupted cleanup.
+  state. Reconcile full-run removals in bounded pages. Delete obsolete generated
+  files only after commit; validation must report harmless orphans left by
+  interrupted cleanup without following directory symlinks.
 - Fail closed on incompatible or malformed generated schemas. Never silently
   migrate, overwrite, or delete legacy derived output.
 

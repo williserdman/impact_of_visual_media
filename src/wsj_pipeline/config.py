@@ -19,6 +19,35 @@ class PipelineConfig:
     output_root: Path
     batch_size: int = 250
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "source_root",
+            Path(self.source_root).expanduser().resolve(),
+        )
+        object.__setattr__(
+            self,
+            "output_root",
+            Path(self.output_root).expanduser().resolve(),
+        )
+        self.validate()
+
+    def validate(self) -> None:
+        """Reject an invalid or tampered configuration without changing it."""
+
+        if self.batch_size < 1:
+            raise ConfigError("batch_size must be positive")
+        source_root = self.source_root.expanduser().resolve()
+        output_root = self.output_root.expanduser().resolve()
+        if source_root != self.source_root or output_root != self.output_root:
+            raise ConfigError("source and output paths must be resolved")
+        if (
+            source_root == output_root
+            or source_root.is_relative_to(output_root)
+            or output_root.is_relative_to(source_root)
+        ):
+            raise ConfigError("source and output paths must not overlap")
+
     @classmethod
     def from_toml(
         cls,
@@ -33,15 +62,6 @@ class PipelineConfig:
         source_root = _resolve_path(root, raw["paths"]["source"])
         output_root = _resolve_path(root, raw["paths"]["output"])
         batch_size = int(raw.get("pipeline", {}).get("batch_size", 250))
-
-        if batch_size < 1:
-            raise ConfigError("batch_size must be positive")
-        if (
-            source_root == output_root
-            or source_root.is_relative_to(output_root)
-            or output_root.is_relative_to(source_root)
-        ):
-            raise ConfigError("source and output paths must not overlap")
 
         return cls(
             source_root=source_root,

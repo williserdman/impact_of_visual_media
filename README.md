@@ -75,6 +75,11 @@ generated state:
 .venv/bin/wsj-pipeline inventory
 ```
 
+`inventory` and `run` require the configured source root to be an accessible
+real directory. If the root is absent, is not a directory, or traversal fails,
+the command stops; a full run does not reconcile unseen sources after such a
+failure.
+
 Create or update a bounded sample from the lexically first 20 source paths:
 
 ```bash
@@ -84,7 +89,8 @@ Create or update a bounded sample from the lexically first 20 source paths:
 
 The bounded run writes to the configured output root, but it never treats
 unseen source paths as deleted. Because selection is lexical, it is a safety
-sample rather than a way to target the newest year.
+sample rather than a way to target the newest year. Limited discovery stops
+after those paths instead of first inventorying the whole archive.
 
 A corpus-wide run is deliberately explicit and may be long-running:
 
@@ -158,6 +164,11 @@ start corpus-wide work. Reprocess an explicit scope:
 Review the JSON counters after every run. Extraction failures are isolated and
 recorded without article text; a valid duplicate may be promoted in place of a
 failed winner.
+
+`validate` opens the catalog read-only and checks the exact supported tables,
+columns, primary/unique constraints, and publication-date index before it
+checks relational data or generated files. Malformed and unsupported catalogs
+produce stable, content-free issues and are never repaired in place.
 
 ## Recovery
 

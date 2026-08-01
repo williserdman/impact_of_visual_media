@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from datetime import date
@@ -10,6 +11,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+import wsj_pipeline.discovery as discovery_module
 from tests.fixtures import write_article_fixture
 from wsj_pipeline.catalog import Catalog
 from wsj_pipeline.config import PipelineConfig
@@ -66,6 +68,107 @@ def test_batches_use_one_catalog_transaction_each(
 
     assert summary.succeeded == 3
     assert transaction_count == 2
+
+
+def test_full_reconciliation_processes_missing_sources_in_bounded_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    for number in range(5):
+        write_article_fixture(
+            archive,
+            f"2024/{number}.html",
+            article_id=f"WP-REMOVED-PAGE-{number}",
+        )
+    config = PipelineConfig(archive, tmp_path / "processed", batch_size=2)
+    run_pipeline(config, limit=None, full=True)
+    shutil.rmtree(archive)
+    archive.mkdir()
+    real_reconcile = Catalog.reconcile_missing
+    real_affected_ids = Catalog.affected_missing_article_ids
+    page_sizes: list[int] = []
+    identity_page_sizes: list[int] = []
+
+    def recording_reconcile(
+        catalog: Catalog,
+        run_id: str,
+        *,
+        batch_size: int,
+    ):
+        missing_count = real_reconcile(
+            catalog,
+            run_id,
+            batch_size=batch_size,
+        )
+        page_sizes.append(missing_count)
+        return missing_count
+
+    def recording_affected_ids(
+        catalog: Catalog,
+        run_id: str,
+        *,
+        after_article_id: str | None,
+        batch_size: int,
+    ) -> tuple[str, ...]:
+        affected_ids = real_affected_ids(
+            catalog,
+            run_id,
+            after_article_id=after_article_id,
+            batch_size=batch_size,
+        )
+        identity_page_sizes.append(len(affected_ids))
+        return affected_ids
+
+    monkeypatch.setattr(Catalog, "reconcile_missing", recording_reconcile)
+    monkeypatch.setattr(
+        Catalog,
+        "affected_missing_article_ids",
+        recording_affected_ids,
+    )
+
+    summary = run_pipeline(config, limit=None, full=True)
+
+    assert summary.removed == 5
+    assert summary.articles == 0
+    assert len([size for size in page_sizes if size]) == 3
+    assert all(size <= config.batch_size for size in page_sizes)
+    assert len([size for size in identity_page_sizes if size]) == 3
+    assert all(size <= config.batch_size for size in identity_page_sizes)
+
+
+def test_batched_reconciliation_removes_duplicate_identity_only_after_inventory(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/a.html",
+        article_id="WP-REMOVED-DUPLICATES",
+        paragraphs=("Longer synthetic winner body for removal.",),
+    )
+    write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-REMOVED-DUPLICATES",
+        paragraphs=("Short body.",),
+    )
+    config = PipelineConfig(archive, tmp_path / "processed", batch_size=1)
+    run_pipeline(config, limit=None, full=True)
+    shutil.rmtree(archive)
+    archive.mkdir()
+
+    summary = run_pipeline(config, limit=None, full=True)
+
+    assert summary.removed == 2
+    assert summary.articles == 0
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT status FROM source_manifest ORDER BY source_html_path"
+        ).fetchall() == [("missing",), ("missing",)]
+        assert connection.execute("SELECT count(*) FROM candidates").fetchone() == (
+            0,
+        )
 
 
 def test_file_before_catalog_interruption_is_repaired_on_retry(
@@ -171,6 +274,92 @@ def test_interrupted_full_inventory_does_not_reconcile_unseen_source(
     assert manifest_status == ("succeeded",)
     assert article == ("2024/b.html",)
     assert run_status == "failed"
+
+
+@pytest.mark.parametrize("source_failure", ["missing", "regular-file"])
+def test_full_run_rejects_unavailable_source_before_mutating_existing_outputs(
+    tmp_path: Path,
+    source_failure: str,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/retained.html",
+        article_id="WP-SOURCE-PREFLIGHT",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=None, full=True)
+    markdown_path = config.output_root / article_markdown_path(
+        "wsj:WP-SOURCE-PREFLIGHT",
+        date(2024, 1, 2),
+    )
+    markdown_bytes = markdown_path.read_bytes()
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        run_count = connection.execute("SELECT count(*) FROM runs").fetchone()[0]
+
+    if source_failure == "missing":
+        archive.rename(tmp_path / "detached-archive")
+    else:
+        shutil.rmtree(archive)
+        archive.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match="source root must be an accessible real directory",
+    ):
+        run_pipeline(config, limit=None, full=True)
+
+    assert markdown_path.read_bytes() == markdown_bytes
+    assert not config.lock_path.exists()
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM runs").fetchone()[0] == (
+            run_count
+        )
+        assert connection.execute(
+            "SELECT status FROM source_manifest"
+        ).fetchone() == ("succeeded",)
+        assert connection.execute("SELECT count(*) FROM articles").fetchone() == (1,)
+
+
+def test_full_run_does_not_reconcile_after_directory_traversal_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2024/a.html", article_id="WP-TRAVERSE-A")
+    removed_html = write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-TRAVERSE-B",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=None, full=True)
+    removed_html.unlink()
+    removed_html.with_name("b_main_image.jpg").unlink()
+    real_scandir = discovery_module.os.scandir
+
+    def denied_scandir(path):
+        if Path(path) == archive / "2024":
+            raise PermissionError("simulated traversal denial")
+        return real_scandir(path)
+
+    monkeypatch.setattr(discovery_module.os, "scandir", denied_scandir)
+
+    with pytest.raises(PermissionError, match="simulated traversal denial"):
+        run_pipeline(config, limit=None, full=True)
+
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT status FROM source_manifest "
+            "WHERE source_html_path = '2024/b.html'"
+        ).fetchone() == ("succeeded",)
+        assert connection.execute(
+            "SELECT source_html_path FROM articles "
+            "WHERE article_id = 'wsj:WP-TRAVERSE-B'"
+        ).fetchone() == ("2024/b.html",)
+        assert connection.execute(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone() == ("failed",)
 
 
 @pytest.mark.parametrize(

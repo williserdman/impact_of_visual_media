@@ -107,6 +107,8 @@ def ensure_no_legacy_output(config: PipelineConfig) -> None:
 def inventory_sources(config: PipelineConfig) -> InventorySummary:
     """Count source and paired header-image files without changing outputs."""
 
+    config.validate()
+    _ensure_source_root(config.source_root)
     discovered = 0
     with_image = 0
     for candidate in discover_sources(config.source_root):
@@ -126,6 +128,17 @@ def _is_single_path_component(value: str) -> bool:
 def _open_directory(path: Path) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     return os.open(path, flags)
+
+
+def _ensure_source_root(source_root: Path) -> None:
+    try:
+        descriptor = _open_directory(source_root)
+    except OSError as error:
+        raise RuntimeError(
+            "source root must be an accessible real directory"
+        ) from error
+    else:
+        os.close(descriptor)
 
 
 def _open_directory_components(
@@ -321,22 +334,42 @@ def _execute_pipeline_run(
                 _cleanup_orphans(catalog, config, orphan_candidates)
 
             if full:
-                orphan_candidates = []
-                with catalog.transaction():
-                    affected_article_ids = catalog.reconcile_missing(run_id)
-                    counters["removed"] += len(affected_article_ids)
-                    for article_id in affected_article_ids:
-                        _, orphans = _recompute_article_in_transaction(
-                            catalog,
-                            config,
-                            article_id,
+                while True:
+                    with catalog.transaction():
+                        missing_count = catalog.reconcile_missing(
                             run_id,
-                            current_articles=(),
-                            remove_if_empty=True,
-                            counters=counters,
+                            batch_size=config.batch_size,
                         )
-                        orphan_candidates.extend(orphans)
-                _cleanup_orphans(catalog, config, orphan_candidates)
+                        counters["removed"] += missing_count
+                    if not missing_count:
+                        break
+
+                after_article_id: str | None = None
+                while True:
+                    orphan_candidates = []
+                    with catalog.transaction():
+                        affected_article_ids = (
+                            catalog.affected_missing_article_ids(
+                                run_id,
+                                after_article_id=after_article_id,
+                                batch_size=config.batch_size,
+                            )
+                        )
+                        for article_id in affected_article_ids:
+                            _, orphans = _recompute_article_in_transaction(
+                                catalog,
+                                config,
+                                article_id,
+                                run_id,
+                                current_articles=(),
+                                remove_if_empty=True,
+                                counters=counters,
+                            )
+                            orphan_candidates.extend(orphans)
+                    _cleanup_orphans(catalog, config, orphan_candidates)
+                    if not affected_article_ids:
+                        break
+                    after_article_id = affected_article_ids[-1]
 
             summary = _pipeline_summary(
                 counters,
@@ -367,8 +400,8 @@ def _run_pipeline_lifecycle(
     """Own one lock across processing, optional validation, and finalization."""
 
     _require_scope(limit, full)
-    if config.batch_size < 1:
-        raise ValueError("batch_size must be positive")
+    config.validate()
+    _ensure_source_root(config.source_root)
     ensure_no_legacy_output(config)
 
     with pipeline_lock(config.lock_path):

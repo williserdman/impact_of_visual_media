@@ -52,6 +52,15 @@ def test_config_exposes_single_catalog_and_text_paths(tmp_path: Path) -> None:
     assert config.lock_path == tmp_path / "processed" / "pipeline.lock"
 
 
+def test_direct_config_resolves_paths(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    config = PipelineConfig(Path("archive"), Path("processed"))
+
+    assert config.source_root == (tmp_path / "archive").resolve()
+    assert config.output_root == (tmp_path / "processed").resolve()
+
+
 @pytest.mark.parametrize("batch_size", [0, -1])
 def test_config_rejects_nonpositive_batch_size(tmp_path: Path, batch_size: int) -> None:
     config_path = tmp_path / "config.toml"
@@ -82,3 +91,29 @@ def test_config_rejects_overlapping_source_and_output(
 
     with pytest.raises(ConfigError, match="must not overlap"):
         PipelineConfig.from_toml(config_path, project_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("source", "output"),
+    [
+        ("archive", "archive"),
+        ("archive", "archive/processed"),
+        ("archive/raw", "archive"),
+    ],
+)
+def test_direct_config_rejects_resolved_source_output_overlap(
+    tmp_path: Path,
+    source: str,
+    output: str,
+) -> None:
+    with pytest.raises(ConfigError, match="must not overlap"):
+        PipelineConfig(tmp_path / source, tmp_path / output)
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+def test_direct_config_rejects_nonpositive_batch_size(
+    tmp_path: Path,
+    batch_size: int,
+) -> None:
+    with pytest.raises(ConfigError, match="batch_size must be positive"):
+        PipelineConfig(tmp_path / "archive", tmp_path / "processed", batch_size)

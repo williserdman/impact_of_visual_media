@@ -74,6 +74,11 @@ Discovery recursively enumerates `.html` files in stable lexical order. It
 supports both observed layouts, such as `2016/*.html` and
 `2023/2023/*.html`, and future year directories without code changes.
 
+The implementation preserves that global ordering with a lazy, per-directory
+walk rather than a corpus-sized path list. A limited run stops traversal after
+the requested number of candidates, and only the current source directory's
+header-image index remains cached.
+
 Hidden directories, `__MACOSX`, and a top-level `backup` directory are excluded.
 A local header image is a sibling with the same HTML stem plus
 `_main_image` and one of these extensions, in priority order:
@@ -241,7 +246,9 @@ exact-day and bounded-range research queries.
 
 ### Operational tables
 
-- `metadata`: schema and extractor versions;
+- `metadata`: the catalog schema version; extractor versions live on
+  `source_manifest`, `candidates`, and `failures`, where per-source staleness
+  can be validated and reprocessed explicitly;
 - `runs`: command, scope, timestamps, status, and content-free counts;
 - `source_manifest`: source/image fingerprints, hashes, status, article ID,
   extractor version, and last-seen run;
@@ -280,10 +287,12 @@ Extractor-version changes never trigger automatic corpus-wide work. Stale
 sources are reported and require `--reprocess` together with `--limit` or
 `--full`.
 
-A completed `--full` inventory marks previously known unseen sources missing.
-A limited or interrupted run never infers deletion from unseen paths. Adding
-2024–2026 folders and rerunning `run --full` therefore processes only new or
-changed sources while safely reconciling genuine removals.
+A completed `--full` inventory marks previously known unseen sources missing
+in bounded catalog pages. A limited or interrupted run never infers deletion
+from unseen paths. An absent/non-directory source root is rejected before a run
+begins, and a traversal error aborts before reconciliation. Adding 2024–2026
+folders and rerunning `run --full` therefore processes only new or changed
+sources while safely reconciling genuine removals.
 
 ## Atomicity and Crash Recovery
 
@@ -315,7 +324,8 @@ stale lock, and reruns the idempotent command.
 
 The installed command is `wsj-pipeline` with four subcommands:
 
-- `inventory [--limit N]`: read-only discovery and image counts;
+- `inventory`: read-only discovery and image counts for the configured source
+  root;
 - `run (--limit N | --full) [--reprocess]`: incremental cleaning and catalog
   update;
 - `validate`: complete catalog/file/date/orphan validation; and
@@ -325,11 +335,16 @@ All commands emit deterministic JSON summaries. `validate` and `run` return a
 nonzero exit status when validation fails. `smoke` ignores the configured real
 archive and cannot process licensed corpus data.
 
+The optionless `inventory` synopsis is the implementation-time resolution of
+the earlier draft's `inventory [--limit N]`: bounded mutation remains explicit
+on `run --limit N`, while inventory describes the complete configured source.
+
 ## Validation
 
 Validation reports stable, content-free issue codes and checks:
 
-- supported catalog and extractor versions;
+- the exact same-version table/column/key/constraint/index contract through a
+  read-only connection, plus supported catalog and extractor versions;
 - unique article IDs, source paths, and cleaned Markdown paths;
 - existence of every catalogued Markdown file;
 - Markdown SHA-256 agreement;
@@ -340,7 +355,8 @@ Validation reports stable, content-free issue codes and checks:
 - candidate, duplicate-winner, manifest, and article consistency;
 - no `running` run left by a completed command;
 - no catalog row for a failed or missing winner; and
-- generated Markdown files not referenced by the catalog.
+- generated Markdown files not referenced by the catalog, without following
+  directory symlinks.
 
 Validation scans paths and files incrementally rather than retaining the corpus
 in Python memory. A full validation can still be I/O-intensive because it hashes

@@ -102,6 +102,80 @@ def test_clean_outputs_validate_successfully(tmp_path: Path) -> None:
     assert report.issues == ()
 
 
+@pytest.mark.parametrize(
+    ("damage", "expected_issue"),
+    [
+        (
+            "ALTER TABLE runs DROP COLUMN summary_json",
+            validation.ValidationIssue(
+                "malformed_catalog_schema",
+                "catalog schema does not match the supported contract",
+            ),
+        ),
+        (
+            "CREATE OR REPLACE TABLE articles AS SELECT * FROM articles",
+            validation.ValidationIssue(
+                "malformed_catalog_schema",
+                "catalog schema does not match the supported contract",
+            ),
+        ),
+        (
+            "DROP INDEX articles_publication_date_idx",
+            validation.ValidationIssue(
+                "malformed_catalog_schema",
+                "catalog schema does not match the supported contract",
+            ),
+        ),
+        (
+            "CREATE TABLE rogue (value VARCHAR)",
+            validation.ValidationIssue(
+                "malformed_catalog_schema",
+                "catalog schema does not match the supported contract",
+            ),
+        ),
+        (
+            "CREATE VIEW rogue AS SELECT 'private sentinel' AS value",
+            validation.ValidationIssue(
+                "malformed_catalog_schema",
+                "catalog schema does not match the supported contract",
+            ),
+        ),
+        (
+            "UPDATE metadata SET value = 'private sentinel' "
+            "WHERE key = 'schema_version'",
+            validation.ValidationIssue(
+                "unsupported_catalog_version",
+                "catalog schema version is not supported",
+            ),
+        ),
+    ],
+    ids=(
+        "operational-column",
+        "article-constraints",
+        "date-index",
+        "extra-table",
+        "extra-view",
+        "unsupported-version",
+    ),
+)
+def test_validation_enforces_exact_read_only_catalog_contract(
+    tmp_path: Path,
+    damage: str,
+    expected_issue: validation.ValidationIssue,
+) -> None:
+    config = PipelineConfig(tmp_path / "archive", tmp_path / "processed")
+    config.source_root.mkdir()
+    with Catalog.open(config.catalog_db):
+        pass
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(damage)
+
+    report = validation.validate_outputs(config)
+
+    assert report.issues == (expected_issue,)
+    assert all("private sentinel" not in issue.message for issue in report.issues)
+
+
 def test_validation_detects_unsupported_catalog_version(tmp_path: Path) -> None:
     config = _build_outputs(tmp_path)
     with duckdb.connect(str(config.catalog_db)) as connection:
@@ -157,17 +231,16 @@ def test_validation_detects_missing_header_image(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("duplicate_column", "expected_code"),
+    "duplicate_column",
     [
-        ("article_id", "duplicate_article_id"),
-        ("source_html_path", "duplicate_source_html_path"),
-        ("cleaned_markdown_path", "duplicate_markdown_path"),
+        "article_id",
+        "source_html_path",
+        "cleaned_markdown_path",
     ],
 )
-def test_validation_detects_duplicate_research_keys_if_constraints_are_bypassed(
+def test_validation_rejects_unconstrained_duplicate_research_keys(
     tmp_path: Path,
     duplicate_column: str,
-    expected_code: str,
 ) -> None:
     config = _build_outputs(tmp_path)
     with duckdb.connect(str(config.catalog_db)) as connection:
@@ -204,7 +277,7 @@ def test_validation_detects_duplicate_research_keys_if_constraints_are_bypassed(
             list(replacements.values()),
         )
 
-    assert expected_code in _codes(config)
+    assert _codes(config) == ["malformed_catalog_schema"]
 
 
 def test_catalog_constraints_reject_duplicate_article_and_paths(
@@ -437,6 +510,117 @@ def test_validation_detects_succeeded_manifest_without_candidate(
     assert "inconsistent_candidate_manifest" in _codes(config)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "header_image_path = NULL",
+        "inline_image_urls = ['https://images.example.test/alternate.jpg']",
+        "published_at_utc = published_at_utc + INTERVAL '1 minute'",
+        "publication_date_new_york = publication_date_new_york + 1",
+    ],
+    ids=("header", "inline-images", "published-at", "publication-date"),
+)
+def test_validation_reports_exact_article_candidate_disagreement_code(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config = _build_outputs(tmp_path)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(
+            f"""
+            UPDATE articles
+            SET {mutation}
+            WHERE article_id = 'wsj:WP-JANUARY'
+            """
+        )
+
+    assert "inconsistent_article_candidate" in _codes(config)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "source_html_sha256 = repeat('f', 64)",
+        "extractor_version = '999'",
+        "header_image_path = NULL",
+        "status = 'failed'",
+    ],
+    ids=("source-hash", "extractor", "header", "status"),
+)
+def test_validation_reports_exact_forward_candidate_manifest_code(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config = _build_outputs(tmp_path, with_duplicate=True)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(
+            f"""
+            UPDATE source_manifest
+            SET {mutation}
+            WHERE source_html_path = '2024/january-copy.html'
+            """
+        )
+
+    assert "inconsistent_candidate_manifest" in _codes(config)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "source_html_path = 'synthetic/missing-candidate.html'",
+        "winner_source_html_path = source_html_path",
+        "duplicate_rank = 1",
+    ],
+    ids=("candidate-membership", "self-winner", "invalid-rank"),
+)
+def test_validation_reports_exact_duplicate_candidate_code(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config = _build_outputs(tmp_path, with_duplicate=True)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute(
+            f"""
+            UPDATE duplicates
+            SET {mutation}
+            WHERE article_id = 'wsj:WP-JANUARY'
+              AND duplicate_rank = 2
+            """
+        )
+
+    assert "inconsistent_duplicate_candidate" in _codes(config)
+
+
+@pytest.mark.parametrize("mutation", ["winner-row", "missing-nonwinner"])
+def test_validation_reports_exact_candidate_set_membership_code(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config = _build_outputs(tmp_path, with_duplicate=True)
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        if mutation == "winner-row":
+            connection.execute(
+                """
+                INSERT INTO duplicates
+                SELECT article_id, winner_source_html_path,
+                       winner_source_html_path, 99, 'lexical_tiebreak', run_id
+                FROM duplicates
+                WHERE article_id = 'wsj:WP-JANUARY'
+                LIMIT 1
+                """
+            )
+        else:
+            connection.execute(
+                """
+                DELETE FROM duplicates
+                WHERE article_id = 'wsj:WP-JANUARY'
+                  AND duplicate_rank = 2
+                """
+            )
+
+    assert "inconsistent_candidate_set" in _codes(config)
+
+
 def test_validation_detects_running_run(tmp_path: Path) -> None:
     config = _build_outputs(tmp_path)
     with Catalog.open(config.catalog_db) as catalog:
@@ -471,6 +655,27 @@ def test_validation_detects_orphan_markdown(tmp_path: Path) -> None:
     orphan.write_text("Synthetic orphan.", encoding="utf-8")
 
     assert "orphan_markdown" in _codes(config)
+
+
+def test_validation_does_not_follow_symlinked_orphan_directory(
+    tmp_path: Path,
+) -> None:
+    config = _build_outputs(tmp_path)
+    external = tmp_path / "external-generated-tree"
+    external.mkdir()
+    (external / "orphan.md").write_text(
+        "Synthetic external Markdown.",
+        encoding="utf-8",
+    )
+    (config.text_root / "linked-tree.md").symlink_to(
+        external,
+        target_is_directory=True,
+    )
+
+    report = validation.validate_outputs(config)
+
+    assert report.ok
+    assert report.issues == ()
 
 
 def test_validation_rejects_output_path_traversal(tmp_path: Path) -> None:
