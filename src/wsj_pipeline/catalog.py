@@ -168,6 +168,26 @@ class DuplicateRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateRecord:
+    """Content-free quality metadata for one extracted source candidate."""
+
+    source_html_path: str
+    article_id: str
+    source_html_sha256: str
+    extractor_version: str
+    canonical_url: str | None
+    published_at_utc: datetime
+    publication_date_new_york: date
+    updated_at_utc: datetime | None
+    editorial_character_count: int
+    editorial_block_count: int
+    metadata_completeness: int
+    header_image_path: str | None
+    inline_image_urls: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ArticleRecord:
     """Research-facing paths, image references, date, and integrity hash."""
 
@@ -604,6 +624,46 @@ class Catalog:
             ],
         )
 
+    def candidates_for_article(
+        self,
+        article_id: str,
+    ) -> tuple[CandidateRecord, ...]:
+        """Return deterministic, content-free candidates for one identity."""
+
+        rows = self.connection.execute(
+            """
+            SELECT source_html_path, article_id, source_html_sha256,
+                   extractor_version, canonical_url, published_at_utc,
+                   publication_date_new_york, updated_at_utc,
+                   editorial_character_count, editorial_block_count,
+                   metadata_completeness, header_image_path,
+                   inline_image_urls, warnings
+            FROM candidates
+            WHERE article_id = ?
+            ORDER BY source_html_path
+            """,
+            [article_id],
+        ).fetchall()
+        return tuple(
+            CandidateRecord(
+                source_html_path=row[0],
+                article_id=row[1],
+                source_html_sha256=row[2],
+                extractor_version=row[3],
+                canonical_url=row[4],
+                published_at_utc=row[5],
+                publication_date_new_york=row[6],
+                updated_at_utc=row[7],
+                editorial_character_count=row[8],
+                editorial_block_count=row[9],
+                metadata_completeness=row[10],
+                header_image_path=row[11],
+                inline_image_urls=tuple(row[12]),
+                warnings=tuple(row[13]),
+            )
+            for row in rows
+        )
+
     def replace_duplicates(
         self,
         run_id: str,
@@ -702,6 +762,32 @@ class Catalog:
                 article.publication_date_new_york,
                 article.cleaned_markdown_sha256,
             ],
+        )
+
+    def article_for_id(self, article_id: str) -> ArticleRecord | None:
+        """Return the research record for one identity, if it exists."""
+
+        row = self.connection.execute(
+            """
+            SELECT article_id, source_html_path, cleaned_markdown_path,
+                   header_image_path, inline_image_urls, published_at_utc,
+                   publication_date_new_york, cleaned_markdown_sha256
+            FROM articles
+            WHERE article_id = ?
+            """,
+            [article_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return ArticleRecord(
+            article_id=row[0],
+            source_html_path=row[1],
+            cleaned_markdown_path=row[2],
+            header_image_path=row[3],
+            inline_image_urls=tuple(row[4]),
+            published_at_utc=row[5],
+            publication_date_new_york=row[6],
+            cleaned_markdown_sha256=row[7],
         )
 
 
