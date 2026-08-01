@@ -20,7 +20,54 @@ from wsj_pipeline.pipeline import (
     article_markdown_path,
     pipeline_lock,
     run_pipeline,
+    run_validated_pipeline,
 )
+
+
+def _build_reconciliation_retry_fixture(tmp_path: Path) -> PipelineConfig:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/a-unique.html",
+        article_id="WP-RETRY-UNIQUE",
+    )
+    write_article_fixture(
+        archive,
+        "2024/b-duplicate.html",
+        article_id="WP-RETRY-DUPLICATE",
+        paragraphs=("Longer synthetic duplicate winner body.",),
+    )
+    write_article_fixture(
+        archive,
+        "2024/c-duplicate.html",
+        article_id="WP-RETRY-DUPLICATE",
+        paragraphs=("Short body.",),
+    )
+    config = PipelineConfig(archive, tmp_path / "processed", batch_size=1)
+    initial = run_validated_pipeline(config, limit=None, full=True)
+    assert initial.articles == 2
+    assert initial.duplicate_count == 1
+    assert initial.validation_ok
+    shutil.rmtree(archive)
+    archive.mkdir()
+    return config
+
+
+def _assert_reconciliation_retry_complete(config: PipelineConfig) -> None:
+    assert list(config.text_root.rglob("*.md")) == []
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT status FROM source_manifest ORDER BY source_html_path"
+        ).fetchall() == [("missing",), ("missing",), ("missing",)]
+        assert connection.execute("SELECT count(*) FROM candidates").fetchone() == (
+            0,
+        )
+        assert connection.execute("SELECT count(*) FROM articles").fetchone() == (
+            0,
+        )
+        assert connection.execute("SELECT count(*) FROM duplicates").fetchone() == (
+            0,
+        )
 
 
 def test_pipeline_lock_is_exclusive_and_owned_lock_is_cleaned(
@@ -169,6 +216,123 @@ def test_batched_reconciliation_removes_duplicate_identity_only_after_inventory(
         assert connection.execute("SELECT count(*) FROM candidates").fetchone() == (
             0,
         )
+
+
+def test_full_retry_resumes_after_first_missing_source_page_commits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_reconciliation_retry_fixture(tmp_path)
+    real_reconcile = Catalog.reconcile_missing
+    calls = 0
+
+    def interrupt_after_first_page(
+        catalog: Catalog,
+        run_id: str,
+        *,
+        batch_size: int,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated failure after phase-one commit")
+        return real_reconcile(catalog, run_id, batch_size=batch_size)
+
+    monkeypatch.setattr(Catalog, "reconcile_missing", interrupt_after_first_page)
+
+    with pytest.raises(RuntimeError, match="after phase-one commit"):
+        run_pipeline(config, limit=None, full=True)
+
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        assert connection.execute(
+            "SELECT status FROM source_manifest ORDER BY source_html_path"
+        ).fetchall() == [("missing",), ("succeeded",), ("succeeded",)]
+        assert connection.execute("SELECT count(*) FROM candidates").fetchone() == (
+            2,
+        )
+        assert connection.execute("SELECT count(*) FROM articles").fetchone() == (
+            2,
+        )
+    monkeypatch.setattr(Catalog, "reconcile_missing", real_reconcile)
+
+    retry = run_validated_pipeline(config, limit=None, full=True)
+
+    assert retry.removed == 2
+    assert retry.articles == 0
+    assert retry.duplicate_count == 0
+    assert retry.validation_ok
+    _assert_reconciliation_retry_complete(config)
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "failed_articles", "failed_duplicates"),
+    [
+        ("between-phases", 2, 1),
+        ("mid-phase-two", 1, 0),
+    ],
+)
+def test_full_retry_resumes_pending_identity_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    failed_articles: int,
+    failed_duplicates: int,
+) -> None:
+    config = _build_reconciliation_retry_fixture(tmp_path)
+    real_affected_ids = Catalog.affected_missing_article_ids
+    calls = 0
+
+    def interrupt_identity_pages(
+        catalog: Catalog,
+        run_id: str,
+        *,
+        after_article_id: str | None,
+        batch_size: int,
+    ) -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        if failure_point == "between-phases" or calls == 2:
+            raise RuntimeError(f"simulated {failure_point} failure")
+        return real_affected_ids(
+            catalog,
+            run_id,
+            after_article_id=after_article_id,
+            batch_size=batch_size,
+        )
+
+    monkeypatch.setattr(
+        Catalog,
+        "affected_missing_article_ids",
+        interrupt_identity_pages,
+    )
+
+    with pytest.raises(RuntimeError, match=failure_point):
+        run_pipeline(config, limit=None, full=True)
+
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM candidates").fetchone() == (
+            0,
+        )
+        assert connection.execute("SELECT count(*) FROM articles").fetchone() == (
+            failed_articles,
+        )
+        assert connection.execute("SELECT count(*) FROM duplicates").fetchone() == (
+            failed_duplicates,
+        )
+    assert len(list(config.text_root.rglob("*.md"))) == failed_articles
+    monkeypatch.setattr(
+        Catalog,
+        "affected_missing_article_ids",
+        real_affected_ids,
+    )
+
+    retry = run_validated_pipeline(config, limit=None, full=True)
+
+    assert retry.removed == 0
+    assert retry.articles == 0
+    assert retry.duplicate_count == 0
+    assert retry.validation_ok
+    _assert_reconciliation_retry_complete(config)
 
 
 def test_file_before_catalog_interruption_is_repaired_on_retry(

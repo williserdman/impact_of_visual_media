@@ -74,9 +74,11 @@ Discovery recursively enumerates `.html` files in stable lexical order. It
 supports both observed layouts, such as `2016/*.html` and
 `2023/2023/*.html`, and future year directories without code changes.
 
-The implementation preserves that global ordering with a lazy, per-directory
-walk rather than a corpus-sized path list. A limited run stops traversal after
-the requested number of candidates, and only the current source directory's
+The implementation preserves that global ordering with a lazy recursive walk
+rather than a corpus-sized path list. Each active recursion frame retains its
+directory's sorted entries, so live traversal state is bounded by directory
+breadth across the active depth. A limited run stops traversal after the
+requested number of candidates, and only the current source directory's
 header-image index remains cached.
 
 Hidden directories, `__MACOSX`, and a top-level `backup` directory are excluded.

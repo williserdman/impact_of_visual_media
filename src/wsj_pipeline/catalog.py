@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -114,6 +115,30 @@ _KEY_CONSTRAINTS = {
     ("articles", "UNIQUE", ("source_html_path",)),
     ("articles", "UNIQUE", ("cleaned_markdown_path",)),
 }
+_EXPECTED_CONSTRAINTS = Counter(
+    (
+        table,
+        constraint_type,
+        columns,
+        None,
+        None,
+        (),
+    )
+    for table, constraint_type, columns in _KEY_CONSTRAINTS
+)
+_EXPECTED_CONSTRAINTS.update(
+    (
+        table,
+        "NOT NULL",
+        (name,),
+        None,
+        None,
+        (),
+    )
+    for table, columns in _TABLE_COLUMNS.items()
+    for name, _data_type, not_null, _default, _primary_key in columns
+    if not_null
+)
 _RUN_COMMANDS = {"inventory", "run", "validate", "smoke"}
 _RUN_SCOPE_PATTERN = re.compile(
     r"(?:limit:[1-9][0-9]*(?:,reprocess)?|full(?:,reprocess)?|fixture)"
@@ -320,16 +345,25 @@ class Catalog:
             )
             for table in _CATALOG_TABLES
         }
-        key_constraints = {
-            (row[0], row[1], tuple(row[2]))
+        constraints = Counter(
+            (
+                row[0],
+                row[1],
+                tuple(row[2] or ()),
+                row[3],
+                row[4],
+                tuple(row[5] or ()),
+            )
             for row in connection.execute(
                 """
-                SELECT table_name, constraint_type, constraint_column_names
+                SELECT table_name, constraint_type, constraint_column_names,
+                       expression, referenced_table, referenced_column_names
                 FROM duckdb_constraints()
-                WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+                WHERE database_name = current_database()
+                  AND schema_name = 'main'
                 """
             ).fetchall()
-        }
+        )
         indexes = connection.execute(
             """
             SELECT table_name, index_name, is_unique, expressions
@@ -338,7 +372,7 @@ class Catalog:
         ).fetchall()
         if (
             table_columns != _TABLE_COLUMNS
-            or key_constraints != _KEY_CONSTRAINTS
+            or constraints != _EXPECTED_CONSTRAINTS
             or indexes
             != [
                 (
@@ -622,17 +656,19 @@ class Catalog:
 
     def affected_missing_article_ids(
         self,
-        run_id: str,
+        _run_id: str,
         *,
         after_article_id: str | None,
         batch_size: int,
     ) -> tuple[str, ...]:
-        """Return one lexical page of identities affected by this full run."""
+        """Return one lexical page of durably pending missing identities."""
 
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
-        after_clause = "" if after_article_id is None else "AND article_id > ?"
-        parameters: list[object] = [run_id]
+        after_clause = (
+            "" if after_article_id is None else "AND manifest.article_id > ?"
+        )
+        parameters: list[object] = []
         if after_article_id is not None:
             parameters.append(after_article_id)
         parameters.append(batch_size)
@@ -640,14 +676,33 @@ class Catalog:
             row[0]
             for row in self.connection.execute(
                 f"""
-                SELECT article_id
-                FROM source_manifest
-                WHERE status = 'missing'
-                  AND last_run_id = ?
-                  AND article_id IS NOT NULL
+                SELECT manifest.article_id
+                FROM source_manifest AS manifest
+                WHERE manifest.status = 'missing'
+                  AND manifest.article_id IS NOT NULL
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM articles AS article
+                          WHERE article.article_id = manifest.article_id
+                            AND article.source_html_path =
+                                manifest.source_html_path
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM duplicates AS duplicate
+                          WHERE duplicate.article_id = manifest.article_id
+                            AND (
+                                duplicate.source_html_path =
+                                    manifest.source_html_path
+                                OR duplicate.winner_source_html_path =
+                                    manifest.source_html_path
+                            )
+                      )
+                  )
                   {after_clause}
-                GROUP BY article_id
-                ORDER BY article_id
+                GROUP BY manifest.article_id
+                ORDER BY manifest.article_id
                 LIMIT ?
                 """,
                 parameters,

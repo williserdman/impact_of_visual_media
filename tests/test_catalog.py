@@ -254,8 +254,32 @@ def test_open_rejects_malformed_version_one_schema_without_altering_it(
         "CREATE OR REPLACE TABLE articles AS SELECT * FROM articles",
         "DROP INDEX articles_publication_date_idx",
         "DROP TABLE runs; CREATE VIEW runs AS SELECT 'x'::VARCHAR AS run_id",
+        (
+            "CREATE TABLE metadata_checked (key VARCHAR PRIMARY KEY, "
+            "value VARCHAR NOT NULL CHECK (length(value) > 0)); "
+            "INSERT INTO metadata_checked SELECT * FROM metadata; "
+            "DROP TABLE metadata; "
+            "ALTER TABLE metadata_checked RENAME TO metadata"
+        ),
+        (
+            "INSERT INTO runs (run_id, command, scope, status, finished_at, "
+            "summary_json) VALUES ('1', 'run', 'limit:1', 'succeeded', "
+            "current_timestamp, '{}'); "
+            "CREATE TABLE metadata_foreign_key (key VARCHAR PRIMARY KEY, "
+            "value VARCHAR NOT NULL, FOREIGN KEY (value) REFERENCES runs(run_id)); "
+            "INSERT INTO metadata_foreign_key SELECT * FROM metadata; "
+            "DROP TABLE metadata; "
+            "ALTER TABLE metadata_foreign_key RENAME TO metadata"
+        ),
     ),
-    ids=("operational-column", "article-constraints", "date-index", "view"),
+    ids=(
+        "operational-column",
+        "article-constraints",
+        "date-index",
+        "view",
+        "extra-check",
+        "extra-foreign-key",
+    ),
 )
 def test_open_rejects_damaged_version_one_contract(
     tmp_path: Path,

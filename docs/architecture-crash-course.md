@@ -251,9 +251,11 @@ stateDiagram-v2
     succeeded --> missing: unseen in a completed full run only
 ```
 
-Runs process lexical discovery in configured-size batches. Discovery sorts and
-retains only one directory at a time, keeps only the current directory's image
-index, and stops traversal once a limited run yields its first `N` paths. A
+Runs process lexical discovery in configured-size batches. Discovery keeps one
+sorted entry list for each directory on the active recursion stack, so live
+path state is bounded by traversal depth times directory breadth rather than by
+the corpus-global HTML count. Only the current HTML directory's image index is
+retained, and traversal stops once a limited run yields its first `N` paths. A
 limited run never infers deletion. A completed full run reconciles missing
 sources in configured-size catalog pages, removes vanished unique winners, or
 re-extracts and promotes the next valid duplicate. An absent/non-directory
@@ -284,6 +286,14 @@ Markdown replacement preceding transaction commit is intentional: committed
 catalog state never points to a new path that was not published. The stored
 hash exposes any temporary file/catalog mismatch. Cleanup never follows an
 unsafe path or directory symlink.
+
+Full reconciliation also has a durable retry boundary. Source pages are marked
+missing before affected identities are recomputed. A missing source remains
+pending while an `articles` or `duplicates` row still refers to it, regardless
+of which run marked it missing. Each successful identity transaction removes
+that pending relation. A later full run therefore resumes after an interruption
+between source pages, between phases, or between identity pages without holding
+a corpus-sized Python work list.
 
 An unchanged rerun does not sweep a post-commit orphan. To remove one safely:
 

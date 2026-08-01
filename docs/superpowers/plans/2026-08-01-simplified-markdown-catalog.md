@@ -536,7 +536,9 @@ git commit -m "feat: publish Markdown incrementally"
 - `Catalog.reconcile_missing(run_id: str, *, batch_size: int) -> int` reconciles
   one bounded source page; affected identities are then read in lexical pages
   with `Catalog.affected_missing_article_ids(...)` after all missing candidates
-  have been removed.
+  have been removed. The latter selects durable relational work across run IDs:
+  a missing source remains pending while an article/duplicate row refers to it,
+  and falls out after its identity transaction commits.
 - `recompute_article(article_id: str, ...)` promotes the best remaining source
   or removes the research record when none remain.
 

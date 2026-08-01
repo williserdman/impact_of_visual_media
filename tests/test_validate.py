@@ -141,6 +141,31 @@ def test_clean_outputs_validate_successfully(tmp_path: Path) -> None:
             ),
         ),
         (
+            "CREATE TABLE metadata_checked (key VARCHAR PRIMARY KEY, "
+            "value VARCHAR NOT NULL CHECK (length(value) > 0)); "
+            "INSERT INTO metadata_checked SELECT * FROM metadata; "
+            "DROP TABLE metadata; "
+            "ALTER TABLE metadata_checked RENAME TO metadata",
+            validation.ValidationIssue(
+                "malformed_catalog_schema",
+                "catalog schema does not match the supported contract",
+            ),
+        ),
+        (
+            "INSERT INTO runs (run_id, command, scope, status, finished_at, "
+            "summary_json) VALUES ('1', 'run', 'limit:1', 'succeeded', "
+            "current_timestamp, '{}'); "
+            "CREATE TABLE metadata_foreign_key (key VARCHAR PRIMARY KEY, "
+            "value VARCHAR NOT NULL, FOREIGN KEY (value) REFERENCES runs(run_id)); "
+            "INSERT INTO metadata_foreign_key SELECT * FROM metadata; "
+            "DROP TABLE metadata; "
+            "ALTER TABLE metadata_foreign_key RENAME TO metadata",
+            validation.ValidationIssue(
+                "malformed_catalog_schema",
+                "catalog schema does not match the supported contract",
+            ),
+        ),
+        (
             "UPDATE metadata SET value = 'private sentinel' "
             "WHERE key = 'schema_version'",
             validation.ValidationIssue(
@@ -155,6 +180,8 @@ def test_clean_outputs_validate_successfully(tmp_path: Path) -> None:
         "date-index",
         "extra-table",
         "extra-view",
+        "extra-check",
+        "extra-foreign-key",
         "unsupported-version",
     ),
 )
