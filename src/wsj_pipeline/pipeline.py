@@ -8,7 +8,7 @@ import json
 import os
 import stat
 import tempfile
-from collections.abc import Collection, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import date
@@ -25,7 +25,7 @@ from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.discovery import discover_sources
 from wsj_pipeline.extract import EXTRACTOR_VERSION, ExtractionError, extract_article
 from wsj_pipeline.models import ExtractedArticle, SourceCandidate
-from wsj_pipeline.validate import validate_outputs
+from wsj_pipeline.validate import ValidationReport, validate_outputs
 
 
 class PipelineLockedError(RuntimeError):
@@ -271,18 +271,32 @@ def run_pipeline(
     full: bool,
     reprocess: bool = False,
 ) -> PipelineSummary:
-    """Incrementally extract and publish bounded transactional batches."""
+    """Run the lower-level pipeline lifecycle without output validation."""
 
-    _require_scope(limit, full)
-    if config.batch_size < 1:
-        raise ValueError("batch_size must be positive")
-    ensure_no_legacy_output(config)
+    return _run_pipeline_lifecycle(
+        config,
+        limit=limit,
+        full=full,
+        reprocess=reprocess,
+        validator=None,
+    )
+
+
+def _execute_pipeline_run(
+    config: PipelineConfig,
+    *,
+    limit: int | None,
+    full: bool,
+    reprocess: bool,
+) -> tuple[str, PipelineSummary]:
+    """Process one run while the caller owns the pipeline lock."""
+
     scope = "full" if full else f"limit:{limit}"
     if reprocess:
         scope = f"{scope},reprocess"
     counters = _new_summary_counters()
 
-    with pipeline_lock(config.lock_path), Catalog.open(config.catalog_db) as catalog:
+    with Catalog.open(config.catalog_db) as catalog:
         run_id = catalog.begin_run("run", scope)
         try:
             candidates = discover_sources(
@@ -330,7 +344,7 @@ def run_pipeline(
                 catalog.duplicate_count(),
             )
             catalog.finish_run(run_id, "succeeded", asdict(summary))
-            return summary
+            return run_id, summary
         except Exception:
             with suppress(Exception):
                 failed_summary = _pipeline_summary(
@@ -339,6 +353,47 @@ def run_pipeline(
                     catalog.duplicate_count(),
                 )
                 catalog.finish_run(run_id, "failed", asdict(failed_summary))
+            raise
+
+
+def _run_pipeline_lifecycle(
+    config: PipelineConfig,
+    *,
+    limit: int | None,
+    full: bool,
+    reprocess: bool,
+    validator: Callable[[PipelineConfig], ValidationReport] | None,
+) -> PipelineSummary:
+    """Own one lock across processing, optional validation, and finalization."""
+
+    _require_scope(limit, full)
+    if config.batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    ensure_no_legacy_output(config)
+
+    with pipeline_lock(config.lock_path):
+        run_id, summary = _execute_pipeline_run(
+            config,
+            limit=limit,
+            full=full,
+            reprocess=reprocess,
+        )
+        if validator is None:
+            return summary
+
+        try:
+            validation = validator(config)
+            summary = replace(summary, validation_ok=validation.ok)
+            with Catalog.open(config.catalog_db) as catalog:
+                catalog.finish_run(
+                    run_id,
+                    "succeeded" if validation.ok else "failed",
+                    asdict(summary),
+                )
+            return summary
+        except Exception:
+            with suppress(Exception), Catalog.open(config.catalog_db) as catalog:
+                catalog.finish_run(run_id, "failed", asdict(summary))
             raise
 
 
@@ -351,14 +406,13 @@ def run_validated_pipeline(
 ) -> PipelineSummary:
     """Run the pipeline and report validation of the completed outputs."""
 
-    summary = run_pipeline(
+    return _run_pipeline_lifecycle(
         config,
         limit=limit,
         full=full,
         reprocess=reprocess,
+        validator=validate_outputs,
     )
-    validation = validate_outputs(config)
-    return replace(summary, validation_ok=validation.ok)
 
 
 def run_smoke() -> PipelineSummary:

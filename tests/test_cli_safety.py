@@ -4,10 +4,14 @@ import argparse
 import json
 from pathlib import Path
 
+import duckdb
 import pytest
 
+import wsj_pipeline.pipeline as pipeline_module
 from tests.fixtures import write_article_fixture
 from wsj_pipeline.cli import build_parser, main
+from wsj_pipeline.config import PipelineConfig
+from wsj_pipeline.validate import validate_outputs
 
 
 def _command_names(parser: argparse.ArgumentParser) -> set[str]:
@@ -153,6 +157,48 @@ def test_run_reports_an_isolated_extraction_failure_without_failing_command(
 
     assert exit_code == 0
     assert payload["failed"] == 1
+
+
+def test_failed_run_validation_persists_cli_summary_and_failed_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    archive = tmp_path / "archive"
+    output = tmp_path / "processed"
+    write_article_fixture(archive, "2024/a.html", article_id="A")
+    config_path = tmp_path / "pipeline.toml"
+    _write_config(config_path, archive, output)
+
+    def remove_markdown_then_validate(config: PipelineConfig):
+        [markdown_path] = config.text_root.rglob("*.md")
+        markdown_path.unlink()
+        return validate_outputs(config)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "validate_outputs",
+        remove_markdown_then_validate,
+    )
+
+    exit_code = main(
+        ["--config", str(config_path), "run", "--limit", "1"]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    with duckdb.connect(str(output / "catalog.duckdb"), read_only=True) as connection:
+        status, summary_json = connection.execute(
+            """
+            SELECT status, summary_json
+            FROM runs
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    assert exit_code == 1
+    assert payload["validation_ok"] is False
+    assert status == "failed"
+    assert json.loads(summary_json) == payload
 
 
 def test_validate_returns_one_for_an_invalid_output(

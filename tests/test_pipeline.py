@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from contextlib import contextmanager
 from dataclasses import asdict, replace
@@ -10,6 +11,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+import wsj_pipeline.pipeline as pipeline_module
 from tests.fixtures import write_article_fixture
 from wsj_pipeline.catalog import Catalog
 from wsj_pipeline.config import PipelineConfig
@@ -22,8 +24,10 @@ from wsj_pipeline.pipeline import (
     candidate_rank,
     recompute_article,
     run_pipeline,
+    run_validated_pipeline,
     write_markdown_atomic,
 )
+from wsj_pipeline.validate import validate_outputs
 
 
 def _article(
@@ -299,6 +303,40 @@ def test_pipeline_extracts_new_sources_then_skips_unchanged_rerun(
             "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1"
         ).fetchone()[0]
     assert seen_run_ids == [(latest_run_id,)]
+
+
+def test_validated_pipeline_holds_lock_and_persists_returned_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2024/one.html", article_id="WP-ONE")
+    config = PipelineConfig(archive, tmp_path / "processed")
+
+    def inspect_lock_then_validate(candidate_config: PipelineConfig):
+        assert candidate_config.lock_path.is_file()
+        return validate_outputs(candidate_config)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "validate_outputs",
+        inspect_lock_then_validate,
+    )
+
+    summary = run_validated_pipeline(config, limit=1, full=False)
+
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        status, summary_json = connection.execute(
+            """
+            SELECT status, summary_json
+            FROM runs
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    assert status == "succeeded"
+    assert json.loads(summary_json) == asdict(summary)
+    assert summary.validation_ok is True
 
 
 def test_completed_full_run_removes_unseen_unique_article_and_markdown(
