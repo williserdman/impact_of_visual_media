@@ -299,6 +299,269 @@ def test_pipeline_extracts_new_sources_then_skips_unchanged_rerun(
     assert seen_run_ids == [(latest_run_id,)]
 
 
+def test_completed_full_run_removes_unseen_unique_article_and_markdown(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    removed_html = write_article_fixture(
+        archive,
+        "2024/a.html",
+        article_id="WP-REMOVED",
+    )
+    write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-RETAINED",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=None, full=True)
+    removed_markdown = config.output_root / article_markdown_path(
+        "wsj:WP-REMOVED",
+        date(2024, 1, 2),
+    )
+    removed_html.unlink()
+    removed_html.with_name("a_main_image.jpg").unlink()
+
+    summary = run_pipeline(config, limit=None, full=True)
+
+    assert summary.removed == 1
+    assert summary.articles == 1
+    assert not removed_markdown.exists()
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        articles = connection.execute(
+            "SELECT article_id FROM articles ORDER BY article_id"
+        ).fetchall()
+        manifests = connection.execute(
+            "SELECT source_html_path, status FROM source_manifest "
+            "ORDER BY source_html_path"
+        ).fetchall()
+        candidates = connection.execute(
+            "SELECT source_html_path FROM candidates ORDER BY source_html_path"
+        ).fetchall()
+    assert articles == [("wsj:WP-RETAINED",)]
+    assert manifests == [
+        ("2024/a.html", "missing"),
+        ("2024/b.html", "succeeded"),
+    ]
+    assert candidates == [("2024/b.html",)]
+
+
+def test_limited_run_does_not_reconcile_unseen_source(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2024/a.html", article_id="WP-SEEN")
+    unseen_html = write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-UNSEEN",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    unseen_markdown = config.output_root / article_markdown_path(
+        "wsj:WP-UNSEEN",
+        date(2024, 1, 2),
+    )
+    unseen_html.unlink()
+    unseen_html.with_name("b_main_image.jpg").unlink()
+
+    summary = run_pipeline(config, limit=1, full=False)
+
+    assert summary.removed == 0
+    assert summary.articles == 2
+    assert unseen_markdown.is_file()
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        manifest = connection.execute(
+            "SELECT status FROM source_manifest WHERE source_html_path = '2024/b.html'"
+        ).fetchone()
+        article = connection.execute(
+            "SELECT source_html_path FROM articles WHERE article_id = 'wsj:WP-UNSEEN'"
+        ).fetchone()
+    assert manifest == ("succeeded",)
+    assert article == ("2024/b.html",)
+
+
+def test_completed_full_run_promotes_reextracted_surviving_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/a.html",
+        article_id="WP-FULL-PROMOTION",
+        paragraphs=("Short surviving body.",),
+    )
+    removed_html = write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-FULL-PROMOTION",
+        paragraphs=("This removed winner originally had much more content.",),
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=None, full=True)
+    markdown_path = config.output_root / article_markdown_path(
+        "wsj:WP-FULL-PROMOTION",
+        date(2024, 1, 2),
+    )
+    removed_html.unlink()
+    removed_html.with_name("b_main_image.jpg").unlink()
+    real_extract = extract_article
+    extracted_paths: list[str] = []
+
+    def recording_extract(candidate, source_root):
+        extracted_paths.append(candidate.relative_html_path)
+        return real_extract(candidate, source_root)
+
+    monkeypatch.setattr("wsj_pipeline.pipeline.extract_article", recording_extract)
+
+    summary = run_pipeline(config, limit=None, full=True)
+
+    assert summary.removed == 1
+    assert summary.articles == 1
+    assert extracted_paths == ["2024/a.html"]
+    assert "Short surviving body." in markdown_path.read_text(encoding="utf-8")
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        winner = connection.execute(
+            "SELECT source_html_path, cleaned_markdown_path FROM articles"
+        ).fetchone()
+        missing = connection.execute(
+            "SELECT status FROM source_manifest WHERE source_html_path = '2024/b.html'"
+        ).fetchone()
+        candidates = connection.execute(
+            "SELECT source_html_path FROM candidates ORDER BY source_html_path"
+        ).fetchall()
+        duplicates = connection.execute("SELECT * FROM duplicates").fetchall()
+    assert winner == (
+        "2024/a.html",
+        markdown_path.relative_to(config.output_root).as_posix(),
+    )
+    assert missing == ("missing",)
+    assert candidates == [("2024/a.html",)]
+    assert duplicates == []
+
+
+def test_failed_current_winner_promotes_valid_duplicate(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/a.html",
+        article_id="WP-FAILED-PROMOTION",
+        paragraphs=("Short valid fallback.",),
+    )
+    winner_html = write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-FAILED-PROMOTION",
+        paragraphs=("This initial winner has substantially more editorial content.",),
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-FAILED-PROMOTION",
+        published=None,
+    )
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.failed == 1
+    assert summary.articles == 1
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        winner = connection.execute(
+            "SELECT source_html_path FROM articles"
+        ).fetchone()
+        failed = connection.execute(
+            "SELECT status FROM source_manifest WHERE source_html_path = ?",
+            [winner_html.relative_to(archive).as_posix()],
+        ).fetchone()
+        candidates = connection.execute(
+            "SELECT source_html_path FROM candidates ORDER BY source_html_path"
+        ).fetchall()
+    assert winner == ("2024/a.html",)
+    assert failed == ("failed",)
+    assert candidates == [("2024/a.html",)]
+
+
+def test_failed_only_candidate_removes_article_and_markdown(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    html_path = write_article_fixture(
+        archive,
+        "2024/one.html",
+        article_id="WP-FAILED-REMOVAL",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    markdown_path = config.output_root / article_markdown_path(
+        "wsj:WP-FAILED-REMOVAL",
+        date(2024, 1, 2),
+    )
+    write_article_fixture(
+        archive,
+        html_path.relative_to(archive).as_posix(),
+        article_id="WP-FAILED-REMOVAL",
+        published=None,
+    )
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.failed == 1
+    assert summary.articles == 0
+    assert not markdown_path.exists()
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        manifest_status = connection.execute(
+            "SELECT status FROM source_manifest"
+        ).fetchone()
+        candidate_count = connection.execute(
+            "SELECT count(*) FROM candidates"
+        ).fetchone()[0]
+        article_count = connection.execute(
+            "SELECT count(*) FROM articles"
+        ).fetchone()[0]
+    assert manifest_status == ("failed",)
+    assert candidate_count == 0
+    assert article_count == 0
+
+
+def test_unchanged_failed_winner_retained_by_prior_run_is_removed(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/one.html",
+        article_id="WP-DEFERRED-FAILED-WINNER",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed")
+    run_pipeline(config, limit=10, full=False)
+    markdown_path = config.output_root / article_markdown_path(
+        "wsj:WP-DEFERRED-FAILED-WINNER",
+        date(2024, 1, 2),
+    )
+    with duckdb.connect(str(config.catalog_db)) as connection:
+        connection.execute("UPDATE source_manifest SET status = 'failed'")
+
+    summary = run_pipeline(config, limit=10, full=False)
+
+    assert summary.unchanged == 1
+    assert summary.articles == 0
+    assert not markdown_path.exists()
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        candidate_count = connection.execute(
+            "SELECT count(*) FROM candidates"
+        ).fetchone()[0]
+        manifest_status = connection.execute(
+            "SELECT status FROM source_manifest"
+        ).fetchone()
+    assert candidate_count == 0
+    assert manifest_status == ("failed",)
+
+
 def test_mtime_only_change_updates_manifest_without_extraction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

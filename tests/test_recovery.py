@@ -123,6 +123,56 @@ def test_file_before_catalog_interruption_is_repaired_on_retry(
     assert stored_hash == sha256(published.read_bytes()).hexdigest()
 
 
+def test_interrupted_full_inventory_does_not_reconcile_unseen_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2024/a.html", article_id="WP-FIRST")
+    removed_html = write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-INTERRUPTED-UNSEEN",
+    )
+    config = PipelineConfig(archive, tmp_path / "processed", batch_size=1)
+    run_pipeline(config, limit=None, full=True)
+    removed_markdown = config.output_root / article_markdown_path(
+        "wsj:WP-INTERRUPTED-UNSEEN",
+        date(2024, 1, 2),
+    )
+    removed_html.unlink()
+    removed_html.with_name("b_main_image.jpg").unlink()
+    from wsj_pipeline.discovery import discover_sources as real_discover
+
+    def interrupted_discovery(source_root: Path, limit: int | None = None):
+        yield from real_discover(source_root, limit=limit)
+        raise RuntimeError("simulated interrupted full inventory")
+
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.discover_sources",
+        interrupted_discovery,
+    )
+
+    with pytest.raises(RuntimeError, match="interrupted full inventory"):
+        run_pipeline(config, limit=None, full=True)
+
+    assert removed_markdown.is_file()
+    with duckdb.connect(str(config.catalog_db), read_only=True) as connection:
+        manifest_status = connection.execute(
+            "SELECT status FROM source_manifest WHERE source_html_path = '2024/b.html'"
+        ).fetchone()
+        article = connection.execute(
+            "SELECT source_html_path FROM articles "
+            "WHERE article_id = 'wsj:WP-INTERRUPTED-UNSEEN'"
+        ).fetchone()
+        run_status = connection.execute(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()[0]
+    assert manifest_status == ("succeeded",)
+    assert article == ("2024/b.html",)
+    assert run_status == "failed"
+
+
 @pytest.mark.parametrize(
     "legacy_marker",
     [

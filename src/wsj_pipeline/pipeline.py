@@ -277,6 +277,23 @@ def run_pipeline(
                         )
                 _cleanup_orphans(catalog, config, orphan_candidates)
 
+            if full:
+                orphan_candidates = []
+                with catalog.transaction():
+                    affected_article_ids = catalog.reconcile_missing(run_id)
+                    counters["removed"] += len(affected_article_ids)
+                    for article_id in affected_article_ids:
+                        _, orphans = _recompute_article_in_transaction(
+                            catalog,
+                            config,
+                            article_id,
+                            run_id,
+                            current_articles=(),
+                            remove_if_empty=True,
+                        )
+                        orphan_candidates.extend(orphans)
+                _cleanup_orphans(catalog, config, orphan_candidates)
+
             summary = _pipeline_summary(counters, catalog.article_count())
             catalog.finish_run(run_id, "succeeded", asdict(summary))
             return summary
@@ -346,11 +363,23 @@ def _process_candidate(
     if classification.kind == "unchanged":
         counters["unchanged"] += 1
         catalog.mark_seen(run_id, candidate.relative_html_path)
-        return ()
+        return _reconcile_failed_candidate(
+            catalog,
+            config,
+            candidate.relative_html_path,
+            run_id,
+            was_failed=classification.was_failed,
+        )
     if classification.kind == "stale_extractor" and not reprocess:
         counters["stale"] += 1
         catalog.mark_seen(run_id, candidate.relative_html_path)
-        return ()
+        return _reconcile_failed_candidate(
+            catalog,
+            config,
+            candidate.relative_html_path,
+            run_id,
+            was_failed=classification.was_failed,
+        )
 
     html_path = config.source_root / candidate.relative_html_path
     source_html_sha256 = hashlib.sha256(html_path.read_bytes()).hexdigest()
@@ -397,7 +426,13 @@ def _process_candidate(
             source_html_sha256=source_html_sha256,
             article_id=classification.old_article_id,
         )
-        return ()
+        return _reconcile_failed_candidate(
+            catalog,
+            config,
+            candidate.relative_html_path,
+            run_id,
+            was_failed=True,
+        )
 
     orphan_candidates: tuple[tuple[str, str], ...] = ()
     if (
@@ -433,6 +468,30 @@ def _process_candidate(
         article_id=article.article_id,
     )
     counters["succeeded"] += 1
+    return orphan_candidates
+
+
+def _reconcile_failed_candidate(
+    catalog: Catalog,
+    config: PipelineConfig,
+    source_html_path: str,
+    run_id: str,
+    *,
+    was_failed: bool,
+) -> tuple[tuple[str, str], ...]:
+    if not was_failed:
+        return ()
+    affected_article_id = catalog.remove_candidate(source_html_path)
+    if affected_article_id is None:
+        return ()
+    _, orphan_candidates = _recompute_article_in_transaction(
+        catalog,
+        config,
+        affected_article_id,
+        run_id,
+        current_articles=(),
+        remove_if_empty=True,
+    )
     return orphan_candidates
 
 

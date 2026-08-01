@@ -550,6 +550,65 @@ class Catalog:
         if result.fetchone()[0] != 1:
             raise CatalogError("cannot mark an unknown source manifest row as seen")
 
+    def reconcile_missing(self, run_id: str) -> tuple[str, ...]:
+        """Mark unseen sources missing and discard their publishable candidates."""
+
+        missing_paths = tuple(
+            row[0]
+            for row in self.connection.execute(
+                """
+                SELECT source_html_path
+                FROM source_manifest
+                WHERE last_seen_run_id <> ? AND status <> 'missing'
+                ORDER BY source_html_path
+                """,
+                [run_id],
+            ).fetchall()
+        )
+        if not missing_paths:
+            return ()
+
+        affected_article_ids = tuple(
+            row[0]
+            for row in self.connection.execute(
+                """
+                SELECT DISTINCT article_id
+                FROM (
+                    SELECT article_id
+                    FROM source_manifest
+                    WHERE source_html_path IN (
+                        SELECT unnest(?)
+                    )
+                    UNION ALL
+                    SELECT article_id
+                    FROM candidates
+                    WHERE source_html_path IN (
+                        SELECT unnest(?)
+                    )
+                )
+                WHERE article_id IS NOT NULL
+                ORDER BY article_id
+                """,
+                [list(missing_paths), list(missing_paths)],
+            ).fetchall()
+        )
+        self.connection.execute(
+            """
+            UPDATE source_manifest
+            SET status = 'missing', last_run_id = ?
+            WHERE source_html_path IN (SELECT unnest(?))
+            """,
+            [run_id, list(missing_paths)],
+        )
+        self.connection.execute(
+            """
+            DELETE FROM candidates
+            WHERE source_html_path IN (SELECT unnest(?))
+            """,
+            [list(missing_paths)],
+        )
+        return affected_article_ids
+
     def replace_manifest(
         self,
         run_id: str,
@@ -682,6 +741,21 @@ class Catalog:
             )
             for row in rows
         )
+
+    def remove_candidate(self, source_html_path: str) -> str | None:
+        """Discard one invalid candidate and return its affected identity."""
+
+        row = self.connection.execute(
+            "SELECT article_id FROM candidates WHERE source_html_path = ?",
+            [source_html_path],
+        ).fetchone()
+        if row is None:
+            return None
+        self.connection.execute(
+            "DELETE FROM candidates WHERE source_html_path = ?",
+            [source_html_path],
+        )
+        return str(row[0])
 
     def replace_duplicates(
         self,
