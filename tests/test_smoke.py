@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from datetime import date
 from pathlib import Path
@@ -11,6 +12,11 @@ import wsj_pipeline.pipeline as pipeline_module
 from wsj_pipeline.cli import main
 from wsj_pipeline.config import PipelineConfig
 from wsj_pipeline.validate import validate_outputs
+
+
+def test_legacy_parquet_modules_are_absent() -> None:
+    assert importlib.util.find_spec("wsj_pipeline.publish") is None
+    assert importlib.util.find_spec("wsj_pipeline.index") is None
 
 
 def test_fixture_smoke_proves_the_complete_markdown_catalog(

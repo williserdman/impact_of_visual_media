@@ -12,8 +12,6 @@ dependencies = [
   "beautifulsoup4>=4.12,<5",
   "duckdb>=1.2,<2",
   "lxml>=5,<7",
-  "pyarrow>=18,<23",
-  "pytz>=2025.1",
 ]
 
 [project.optional-dependencies]
