@@ -48,13 +48,13 @@ flowchart LR
 2. Discovery looks beside the HTML for
    `<stem>_main_image.{jpg,jpeg,png,webp}`. That extension order is the winner
    priority. No image is valid; multiple images produce a warning.
-3. The coordinator compares manifest state, then bounded worker threads perform
-   source stat checks, safe reads, hashing, and extraction. Workers never own a
-   catalog connection or generated-output write capability.
-4. The manifest compares HTML and selected-image sizes and nanosecond mtimes.
-   Matching fingerprints skip extraction. An HTML stat-only change is hashed;
-   if the hash matches and the image fingerprint did not change, only the
-   manifest is refreshed.
+3. The coordinator compares the manifest's HTML and selected-image sizes and
+   nanosecond mtimes, then classifies the source for preparation.
+4. A bounded worker verifies regular source files and safely reads only what
+   that classification requires. Matching fingerprints skip extraction. An
+   HTML stat-only change is hashed; if the hash matches and the image
+   fingerprint did not change, only the manifest is refreshed. Workers never
+   own a catalog connection or generated-output write capability.
 5. `extract.py` hashes the HTML, reads authoritative publication metadata,
    derives identity, and renders editorial content to deterministic Markdown.
    Missing, malformed, or timezone-naive publication time is a structured

@@ -152,7 +152,7 @@ def test_run_worker_override_controls_pipeline_concurrency(
     real_extract = extract_article
 
     def synchronized_extract(candidate, source_root):
-        rendezvous.wait(timeout=2)
+        rendezvous.wait(timeout=10)
         return real_extract(candidate, source_root)
 
     monkeypatch.setattr(

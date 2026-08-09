@@ -392,7 +392,7 @@ def test_pipeline_prepares_sources_with_bounded_concurrency(
             active += 1
             maximum_active = max(maximum_active, active)
         try:
-            rendezvous.wait(timeout=2)
+            rendezvous.wait(timeout=10)
             return real_extract(candidate, source_root)
         finally:
             with state_lock:
@@ -412,6 +412,56 @@ def test_pipeline_prepares_sources_with_bounded_concurrency(
         articles=article_count,
     )
     assert maximum_active == expected_active
+
+
+def test_pipeline_applies_prepared_sources_in_completion_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2024/a.html", article_id="WP-SLOW")
+    write_article_fixture(archive, "2024/b.html", article_id="WP-FAST")
+    config = PipelineConfig(
+        archive,
+        tmp_path / "processed",
+        batch_size=2,
+        workers=2,
+    )
+    real_extract = extract_article
+    real_apply = pipeline_module._apply_prepared_candidate
+    fast_prepared = threading.Event()
+    release_slow = threading.Event()
+    applied_paths: list[str] = []
+
+    def ordered_extract(candidate, source_root):
+        if candidate.relative_html_path == "2024/a.html":
+            if not release_slow.wait(timeout=10):
+                raise TimeoutError("fast source was not applied first")
+        else:
+            fast_prepared.set()
+        return real_extract(candidate, source_root)
+
+    def recording_apply(*args, **kwargs):
+        prepared = args[2]
+        applied_paths.append(prepared.candidate.relative_html_path)
+        if prepared.candidate.relative_html_path == "2024/b.html":
+            release_slow.set()
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.extract_article",
+        ordered_extract,
+    )
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline._apply_prepared_candidate",
+        recording_apply,
+    )
+
+    summary = run_pipeline(config, limit=2, full=False)
+
+    assert fast_prepared.is_set()
+    assert summary.succeeded == 2
+    assert applied_paths == ["2024/b.html", "2024/a.html"]
 
 
 def test_worker_count_does_not_change_completed_research_outputs(
