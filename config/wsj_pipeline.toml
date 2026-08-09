@@ -4,3 +4,4 @@ output = "data/processed/wsj"
 
 [pipeline]
 batch_size = 250
+workers = 4

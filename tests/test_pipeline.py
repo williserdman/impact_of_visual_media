@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
@@ -128,6 +129,7 @@ def test_run_entry_rejects_tampered_overlapping_config_before_writing(
     object.__setattr__(config, "source_root", source_root)
     object.__setattr__(config, "output_root", output_root)
     object.__setattr__(config, "batch_size", 1)
+    object.__setattr__(config, "workers", 1)
 
     with pytest.raises(ValueError, match="must not overlap"):
         run_pipeline(config, limit=1, full=False)
@@ -350,6 +352,160 @@ def test_pipeline_extracts_new_sources_then_skips_unchanged_rerun(
             "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1"
         ).fetchone()[0]
     assert seen_run_ids == [(latest_run_id,)]
+
+
+@pytest.mark.parametrize(
+    ("workers", "batch_size", "article_count", "expected_active"),
+    [(2, 4, 4, 2), (4, 2, 2, 2)],
+    ids=("worker-bound", "batch-bound"),
+)
+def test_pipeline_prepares_sources_with_bounded_concurrency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workers: int,
+    batch_size: int,
+    article_count: int,
+    expected_active: int,
+) -> None:
+    archive = tmp_path / "archive"
+    for index in range(article_count):
+        write_article_fixture(
+            archive,
+            f"2024/{index}.html",
+            article_id=f"WP-PARALLEL-{index}",
+        )
+    config = PipelineConfig(
+        archive,
+        tmp_path / "processed",
+        batch_size=batch_size,
+        workers=workers,
+    )
+    real_extract = extract_article
+    rendezvous = threading.Barrier(2)
+    state_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def synchronized_extract(candidate, source_root):
+        nonlocal active, maximum_active
+        with state_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            rendezvous.wait(timeout=2)
+            return real_extract(candidate, source_root)
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.extract_article",
+        synchronized_extract,
+    )
+
+    summary = run_pipeline(config, limit=article_count, full=False)
+
+    assert summary == PipelineSummary(
+        discovered=article_count,
+        new=article_count,
+        succeeded=article_count,
+        articles=article_count,
+    )
+    assert maximum_active == expected_active
+
+
+def test_worker_count_does_not_change_completed_research_outputs(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(
+        archive,
+        "2024/a.html",
+        article_id="WP-PARALLEL-DUPLICATE",
+        paragraphs=("Short duplicate.",),
+    )
+    write_article_fixture(
+        archive,
+        "2024/b.html",
+        article_id="WP-PARALLEL-DUPLICATE",
+        paragraphs=("The longer duplicate remains the deterministic winner.",),
+    )
+    write_article_fixture(
+        archive,
+        "2024/c.html",
+        article_id="WP-PARALLEL-UNIQUE",
+    )
+    single = PipelineConfig(
+        archive,
+        tmp_path / "single",
+        batch_size=3,
+        workers=1,
+    )
+    parallel = replace(single, output_root=tmp_path / "parallel", workers=3)
+
+    single_summary = run_validated_pipeline(single, limit=3, full=False)
+    parallel_summary = run_validated_pipeline(parallel, limit=3, full=False)
+
+    def research_snapshot(config: PipelineConfig):
+        with Catalog.read_only(config.catalog_db) as connection:
+            articles = connection.execute(
+                """
+                SELECT article_id, source_html_path, cleaned_markdown_path,
+                       header_image_path, inline_image_urls, published_at_utc,
+                       publication_date_new_york, cleaned_markdown_sha256
+                FROM articles
+                ORDER BY article_id
+                """
+            ).fetchall()
+        markdown = {
+            path.relative_to(config.output_root).as_posix(): path.read_bytes()
+            for path in sorted(config.text_root.rglob("*.md"))
+        }
+        return articles, markdown
+
+    assert parallel_summary == single_summary
+    assert research_snapshot(parallel) == research_snapshot(single)
+
+
+def test_unexpected_worker_error_aborts_and_remains_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / "archive"
+    write_article_fixture(archive, "2024/a.html", article_id="WP-WORKER-A")
+    write_article_fixture(archive, "2024/b.html", article_id="WP-WORKER-B")
+    config = PipelineConfig(
+        archive,
+        tmp_path / "processed",
+        batch_size=2,
+        workers=2,
+    )
+    real_extract = extract_article
+
+    def fail_one_source(candidate, source_root):
+        if candidate.relative_html_path == "2024/b.html":
+            raise RuntimeError("synthetic unexpected worker failure")
+        return real_extract(candidate, source_root)
+
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.extract_article",
+        fail_one_source,
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected worker failure"):
+        run_validated_pipeline(config, limit=2, full=False)
+
+    assert not config.lock_path.exists()
+    with Catalog.read_only(config.catalog_db) as connection:
+        assert connection.execute(
+            "SELECT status FROM runs ORDER BY started_at DESC LIMIT 1"
+        ).fetchone() == ("failed",)
+
+    monkeypatch.setattr("wsj_pipeline.pipeline.extract_article", real_extract)
+    retried = run_validated_pipeline(config, limit=2, full=False)
+
+    assert retried.articles == 2
+    assert retried.validation_ok is True
 
 
 def test_validated_pipeline_holds_lock_and_persists_returned_summary(

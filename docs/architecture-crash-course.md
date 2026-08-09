@@ -48,21 +48,25 @@ flowchart LR
 2. Discovery looks beside the HTML for
    `<stem>_main_image.{jpg,jpeg,png,webp}`. That extension order is the winner
    priority. No image is valid; multiple images produce a warning.
-3. The manifest compares HTML and selected-image sizes and nanosecond mtimes.
+3. The coordinator compares manifest state, then bounded worker threads perform
+   source stat checks, safe reads, hashing, and extraction. Workers never own a
+   catalog connection or generated-output write capability.
+4. The manifest compares HTML and selected-image sizes and nanosecond mtimes.
    Matching fingerprints skip extraction. An HTML stat-only change is hashed;
    if the hash matches and the image fingerprint did not change, only the
    manifest is refreshed.
-4. `extract.py` hashes the HTML, reads authoritative publication metadata,
+5. `extract.py` hashes the HTML, reads authoritative publication metadata,
    derives identity, and renders editorial content to deterministic Markdown.
    Missing, malformed, or timezone-naive publication time is a structured
    extraction failure.
-5. The candidate is compared with every source carrying the same `article_id`.
+6. The candidate is compared with every source carrying the same `article_id`.
    The deterministic best candidate becomes the winner.
-6. Its Markdown is written to a run-specific staging directory, reopened,
+7. Its Markdown is written to a run-specific staging directory, reopened,
    SHA-256 checked, and atomically replaced at its dated final path.
-7. The transaction updates the winner, candidate, duplicate, failure, and
+8. The serialized coordinator updates the winner, candidate, duplicate,
+   failure, and
    manifest state. Nonwinners retain metrics and provenance, not cleaned text.
-8. Validation checks the catalog and files while the mutating run still owns
+9. Validation checks the catalog and files while the mutating run still owns
    the exclusive lock. On the normal result path, the CLI returns a
    content-free JSON summary.
 
@@ -79,7 +83,7 @@ date.
 
 | Module | Owns | Does not own |
 |---|---|---|
-| `config.py` | resolved source/output roots, batch size, nonoverlap check | command behavior |
+| `config.py` | resolved source/output roots, batch size, worker count, nonoverlap check | command behavior |
 | `models.py` | immutable records crossing discovery/extraction boundaries | persistence |
 | `discovery.py` | stable HTML enumeration and header-image pairing | HTML parsing |
 | `extract.py` | metadata, dates, identity, editorial Markdown, remote image URLs | winner persistence |
@@ -90,7 +94,8 @@ date.
 
 The command surface is exactly `inventory`, `run`, `validate`, and `smoke`.
 Only `run` mutates configured state. It requires exactly one of a positive
-`--limit N` or `--full`; `--reprocess` is valid only with that scope.
+`--limit N` or `--full`; `--reprocess` and a positive `--workers N` override
+are valid only with that scope. Configuration defaults to four workers.
 `inventory` is read-only and inventories the whole configured source root.
 `smoke` ignores configuration and uses a generated temporary archive.
 
@@ -251,7 +256,15 @@ stateDiagram-v2
     succeeded --> missing: unseen in a completed full run only
 ```
 
-Runs process lexical discovery in configured-size batches. Discovery keeps one
+Runs process lexical discovery in configured-size batches. Within one batch,
+source preparation is submitted to a bounded thread pool and applied by the
+serialized coordinator as results complete. At most one batch is submitted at
+a time, so live work is bounded by both batch size and worker count. Thread
+scheduling may change which prepared result is applied first, but identity,
+winner ranking, Markdown bytes and paths, research-facing rows, and validation
+remain deterministic after a successful run.
+
+Discovery keeps one
 sorted entry list for each directory on the active recursion stack, so live
 path state is bounded by traversal depth times directory breadth rather than by
 the corpus-global HTML count. Only the current HTML directory's image index is
@@ -271,7 +284,8 @@ publication timestamp remains strict and timezone-aware.
 
 ## 9. Atomicity and recovery
 
-One `pipeline.lock` covers mutation and final validation. A validated run stays
+One `pipeline.lock` covers worker preparation, serialized mutation, and final
+validation. A validated run stays
 `running`, with no finish time or summary, until validation and final-summary
 persistence complete; only then does it make one terminal `succeeded` or
 `failed` transition. Publication uses a run-specific staging directory,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from wsj_pipeline.config import PipelineConfig
@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     scope.add_argument("--limit", type=positive_int)
     scope.add_argument("--full", action="store_true")
     run_parser.add_argument("--reprocess", action="store_true")
+    run_parser.add_argument("--workers", type=positive_int)
     subparsers.add_parser("validate")
     subparsers.add_parser("smoke")
     return parser
@@ -61,6 +62,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "inventory":
             result = inventory_sources(config)
         elif args.command == "run":
+            if args.workers is not None:
+                config = replace(config, workers=args.workers)
             result = run_validated_pipeline(
                 config,
                 limit=args.limit,

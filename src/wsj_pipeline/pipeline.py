@@ -9,6 +9,7 @@ import os
 import stat
 import tempfile
 from collections.abc import Callable, Collection, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import date
@@ -330,22 +331,53 @@ def _execute_pipeline_run(
                 config.source_root,
                 limit=None if full else limit,
             )
-            for batch in _batches(candidates, config.batch_size):
-                orphan_candidates: list[tuple[str, str]] = []
-                with catalog.transaction():
-                    for candidate in batch:
-                        counters["discovered"] += 1
-                        orphan_candidates.extend(
-                            _process_candidate(
-                                catalog,
-                                config,
+            with ThreadPoolExecutor(max_workers=config.workers) as executor:
+                for batch in _batches(candidates, config.batch_size):
+                    orphan_candidates: list[tuple[str, str]] = []
+                    with catalog.transaction():
+                        futures = []
+                        for candidate in batch:
+                            counters["discovered"] += 1
+                            classification = catalog.classify(
                                 candidate,
-                                run_id,
-                                counters,
-                                reprocess=reprocess,
+                                EXTRACTOR_VERSION,
                             )
-                        )
-                _cleanup_orphans(catalog, config, orphan_candidates)
+                            futures.append(
+                                executor.submit(
+                                    _prepare_candidate,
+                                    config.source_root,
+                                    candidate,
+                                    classification,
+                                    reprocess=reprocess,
+                                )
+                            )
+                        try:
+                            for future in as_completed(futures):
+                                prepared = future.result()
+                                current_classification = catalog.classify(
+                                    prepared.candidate,
+                                    EXTRACTOR_VERSION,
+                                )
+                                if current_classification != prepared.classification:
+                                    prepared = replace(
+                                        prepared,
+                                        classification=current_classification,
+                                    )
+                                orphan_candidates.extend(
+                                    _apply_prepared_candidate(
+                                        catalog,
+                                        config,
+                                        prepared,
+                                        run_id,
+                                        counters,
+                                        reprocess=reprocess,
+                                    )
+                                )
+                        except BaseException:
+                            for future in futures:
+                                future.cancel()
+                            raise
+                    _cleanup_orphans(catalog, config, orphan_candidates)
 
             if full:
                 while True:
@@ -498,6 +530,7 @@ def run_smoke() -> PipelineSummary:
             source_root=source_root,
             output_root=root / "processed",
             batch_size=2,
+            workers=2,
         )
         return run_validated_pipeline(
             config,
@@ -592,32 +625,6 @@ def _batches(
     iterator = iter(candidates)
     while batch := tuple(islice(iterator, batch_size)):
         yield batch
-
-
-def _process_candidate(
-    catalog: Catalog,
-    config: PipelineConfig,
-    candidate: SourceCandidate,
-    run_id: str,
-    counters: dict[str, int],
-    *,
-    reprocess: bool,
-) -> tuple[tuple[str, str], ...]:
-    classification = catalog.classify(candidate, EXTRACTOR_VERSION)
-    prepared = _prepare_candidate(
-        config.source_root,
-        candidate,
-        classification,
-        reprocess=reprocess,
-    )
-    return _apply_prepared_candidate(
-        catalog,
-        config,
-        prepared,
-        run_id,
-        counters,
-        reprocess=reprocess,
-    )
 
 
 def _prepare_candidate(

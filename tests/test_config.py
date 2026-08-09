@@ -6,8 +6,16 @@ from wsj_pipeline.config import ConfigError, PipelineConfig
 
 
 def write_config(
-    path: Path, *, source: str, output: str, batch_size: int = 250
+    path: Path,
+    *,
+    source: str,
+    output: str,
+    batch_size: int = 250,
+    workers: int | None = None,
 ) -> None:
+    pipeline_lines = [f"batch_size = {batch_size}"]
+    if workers is not None:
+        pipeline_lines.append(f"workers = {workers}")
     path.write_text(
         "\n".join(
             [
@@ -16,7 +24,7 @@ def write_config(
                 f'output = "{output}"',
                 "",
                 "[pipeline]",
-                f"batch_size = {batch_size}",
+                *pipeline_lines,
                 "",
             ]
         ),
@@ -41,6 +49,21 @@ def test_config_resolves_relative_paths_from_project_root(tmp_path: Path) -> Non
     assert config.staging_root == config.output_root / "staging"
     assert config.lock_path == config.output_root / "pipeline.lock"
     assert config.batch_size == 250
+    assert config.workers == 4
+
+
+def test_config_reads_worker_count(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(
+        config_path,
+        source="data/wsj_archive",
+        output="data/processed/wsj",
+        workers=7,
+    )
+
+    config = PipelineConfig.from_toml(config_path, project_root=tmp_path)
+
+    assert config.workers == 7
 
 
 def test_config_exposes_single_catalog_and_text_paths(tmp_path: Path) -> None:
@@ -117,3 +140,33 @@ def test_direct_config_rejects_nonpositive_batch_size(
 ) -> None:
     with pytest.raises(ConfigError, match="batch_size must be positive"):
         PipelineConfig(tmp_path / "archive", tmp_path / "processed", batch_size)
+
+
+@pytest.mark.parametrize("workers", [0, -1])
+def test_config_rejects_nonpositive_worker_count(
+    tmp_path: Path,
+    workers: int,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    write_config(
+        config_path,
+        source="data/wsj_archive",
+        output="data/processed/wsj",
+        workers=workers,
+    )
+
+    with pytest.raises(ConfigError, match="workers must be positive"):
+        PipelineConfig.from_toml(config_path, project_root=tmp_path)
+
+
+@pytest.mark.parametrize("workers", [0, -1])
+def test_direct_config_rejects_nonpositive_worker_count(
+    tmp_path: Path,
+    workers: int,
+) -> None:
+    with pytest.raises(ConfigError, match="workers must be positive"):
+        PipelineConfig(
+            tmp_path / "archive",
+            tmp_path / "processed",
+            workers=workers,
+        )

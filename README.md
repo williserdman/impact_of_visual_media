@@ -32,6 +32,7 @@ output = "data/processed/wsj"
 
 [pipeline]
 batch_size = 250
+workers = 4
 ```
 
 Relative paths resolve from the project root. Source and output roots must not
@@ -50,6 +51,7 @@ command prints one deterministic JSON summary:
 inventory                 read-only counts for all discovered HTML/header images
 run (--limit N | --full)  incrementally update Markdown and the catalog
      [--reprocess]        explicitly process stale extractor-version rows
+     [--workers N]        override bounded source-preparation threads
 validate                  check the existing catalog and generated files
 smoke                     run the complete workflow on generated temporary fixtures
 ```
@@ -86,6 +88,16 @@ Create or update a bounded sample from the lexically first 20 source paths:
 .venv/bin/wsj-pipeline run --limit 20
 .venv/bin/wsj-pipeline validate
 ```
+
+Source reading, hashing, and extraction use four threads by default. Override
+that count for one run when the machine warrants it:
+
+```bash
+.venv/bin/wsj-pipeline run --limit 20 --workers 8
+```
+
+At most one configured batch is in flight. DuckDB changes, duplicate
+selection, Markdown publication, cleanup, and validation remain serialized.
 
 The bounded run writes to the configured output root, but it never treats
 unseen source paths as deleted. Because selection is lexical, it is a safety
@@ -151,7 +163,9 @@ references only; the pipeline never downloads them.
 Normal reruns skip matching source/image fingerprints. If file stats change,
 the pipeline hashes HTML before deciding whether extraction is necessary.
 New content, changed HTML, and changed selected header images are processed in
-bounded transactions; unchanged content is not republished.
+bounded transactions; unchanged content is not republished. Source preparation
+may complete in worker order, while canonical ranking and the completed
+research output remain deterministic.
 
 Discovery and later source reads reject symlinked HTML or local header-image
 leaves and reopen accepted paths through no-follow source-relative descriptors.

@@ -70,6 +70,9 @@ documentation.
   state. Reconcile full-run removals in bounded pages. Delete obsolete generated
   files only after commit; validation must report harmless orphans left by
   interrupted cleanup without following directory symlinks.
+- Keep worker threads source-only: stat, safe read, hash, and extract within one
+  bounded batch. DuckDB access, ranking, Markdown publication, cleanup, and
+  validation remain serialized on the coordinator.
 - Fail closed on incompatible or malformed generated schemas. Never silently
   migrate, overwrite, or delete legacy derived output.
 

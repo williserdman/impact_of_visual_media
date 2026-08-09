@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from pathlib import Path
 
 import duckdb
@@ -11,6 +12,7 @@ import wsj_pipeline.pipeline as pipeline_module
 from tests.fixtures import write_article_fixture
 from wsj_pipeline.cli import build_parser, main
 from wsj_pipeline.config import PipelineConfig
+from wsj_pipeline.extract import extract_article
 from wsj_pipeline.validate import validate_outputs
 
 
@@ -23,7 +25,16 @@ def _command_names(parser: argparse.ArgumentParser) -> set[str]:
     return set(subcommands.choices)
 
 
-def _write_config(path: Path, source: Path, output: Path) -> None:
+def _write_config(
+    path: Path,
+    source: Path,
+    output: Path,
+    *,
+    workers: int | None = None,
+) -> None:
+    pipeline_lines = ["batch_size = 2"]
+    if workers is not None:
+        pipeline_lines.append(f"workers = {workers}")
     path.write_text(
         "\n".join(
             [
@@ -31,7 +42,7 @@ def _write_config(path: Path, source: Path, output: Path) -> None:
                 f'source = "{source.as_posix()}"',
                 f'output = "{output.as_posix()}"',
                 "[pipeline]",
-                "batch_size = 2",
+                *pipeline_lines,
             ]
         ),
         encoding="utf-8",
@@ -106,6 +117,63 @@ def test_run_accepts_reprocess_with_an_explicit_scope(
     assert args.limit == limit
     assert args.full is full
     assert args.reprocess is True
+
+
+def test_run_accepts_positive_worker_override() -> None:
+    args = build_parser().parse_args(
+        ["run", "--limit", "3", "--workers", "7"]
+    )
+
+    assert args.workers == 7
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+def test_run_worker_override_must_be_positive(value: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(
+            ["run", "--limit", "3", "--workers", value]
+        )
+
+    assert exc.value.code == 2
+
+
+def test_run_worker_override_controls_pipeline_concurrency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    archive = tmp_path / "archive"
+    output = tmp_path / "processed"
+    write_article_fixture(archive, "2024/a.html", article_id="A")
+    write_article_fixture(archive, "2024/b.html", article_id="B")
+    config_path = tmp_path / "pipeline.toml"
+    _write_config(config_path, archive, output, workers=1)
+    rendezvous = threading.Barrier(2)
+    real_extract = extract_article
+
+    def synchronized_extract(candidate, source_root):
+        rendezvous.wait(timeout=2)
+        return real_extract(candidate, source_root)
+
+    monkeypatch.setattr(
+        "wsj_pipeline.pipeline.extract_article",
+        synchronized_extract,
+    )
+
+    exit_code = main(
+        [
+            "--config",
+            str(config_path),
+            "run",
+            "--limit",
+            "2",
+            "--workers",
+            "2",
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["succeeded"] == 2
 
 
 def test_real_commands_emit_one_deterministically_ordered_json_object(
