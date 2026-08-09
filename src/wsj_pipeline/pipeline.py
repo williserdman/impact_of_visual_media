@@ -18,6 +18,7 @@ from pathlib import Path
 from wsj_pipeline.catalog import (
     ArticleRecord,
     CandidateRecord,
+    CandidateStatus,
     Catalog,
     DuplicateRecord,
 )
@@ -59,6 +60,17 @@ class PipelineSummary:
     articles: int = 0
     duplicate_count: int = 0
     validation_ok: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedCandidate:
+    """Source-only work awaiting serialized catalog application."""
+
+    candidate: SourceCandidate
+    classification: CandidateStatus
+    source_html_sha256: str | None = None
+    article: ExtractedArticle | None = None
+    extraction_error_code: str | None = None
 
 
 @contextmanager
@@ -591,13 +603,85 @@ def _process_candidate(
     *,
     reprocess: bool,
 ) -> tuple[tuple[str, str], ...]:
-    stat_relative_regular(config.source_root, candidate.relative_html_path)
-    if candidate.relative_header_image_path is not None:
-        stat_relative_regular(
-            config.source_root,
-            candidate.relative_header_image_path,
-        )
     classification = catalog.classify(candidate, EXTRACTOR_VERSION)
+    prepared = _prepare_candidate(
+        config.source_root,
+        candidate,
+        classification,
+        reprocess=reprocess,
+    )
+    return _apply_prepared_candidate(
+        catalog,
+        config,
+        prepared,
+        run_id,
+        counters,
+        reprocess=reprocess,
+    )
+
+
+def _prepare_candidate(
+    source_root: Path,
+    candidate: SourceCandidate,
+    classification: CandidateStatus,
+    *,
+    reprocess: bool,
+) -> _PreparedCandidate:
+    """Read and extract one source without catalog or output access."""
+
+    stat_relative_regular(source_root, candidate.relative_html_path)
+    if candidate.relative_header_image_path is not None:
+        stat_relative_regular(source_root, candidate.relative_header_image_path)
+    if classification.kind == "unchanged" or (
+        classification.kind == "stale_extractor" and not reprocess
+    ):
+        return _PreparedCandidate(candidate, classification)
+
+    source_html_sha256 = hashlib.sha256(
+        read_relative_regular(source_root, candidate.relative_html_path).data
+    ).hexdigest()
+    if (
+        classification.kind == "stat_changed"
+        and not classification.was_failed
+        and not classification.image_changed
+        and source_html_sha256 == classification.old_html_sha256
+    ):
+        return _PreparedCandidate(
+            candidate,
+            classification,
+            source_html_sha256=source_html_sha256,
+        )
+
+    try:
+        article = extract_article(candidate, source_root)
+    except ExtractionError as error:
+        return _PreparedCandidate(
+            candidate,
+            classification,
+            source_html_sha256=source_html_sha256,
+            extraction_error_code=error.code,
+        )
+    return _PreparedCandidate(
+        candidate,
+        classification,
+        source_html_sha256=source_html_sha256,
+        article=article,
+    )
+
+
+def _apply_prepared_candidate(
+    catalog: Catalog,
+    config: PipelineConfig,
+    prepared: _PreparedCandidate,
+    run_id: str,
+    counters: dict[str, int],
+    *,
+    reprocess: bool,
+) -> tuple[tuple[str, str], ...]:
+    """Apply one prepared source through serialized catalog/output mutation."""
+
+    candidate = prepared.candidate
+    classification = prepared.classification
     if classification.kind == "unchanged":
         counters["unchanged"] += 1
         catalog.mark_seen(run_id, candidate.relative_html_path)
@@ -621,12 +705,9 @@ def _process_candidate(
             counters=counters,
         )
 
-    source_html_sha256 = hashlib.sha256(
-        read_relative_regular(
-            config.source_root,
-            candidate.relative_html_path,
-        ).data
-    ).hexdigest()
+    source_html_sha256 = prepared.source_html_sha256
+    if source_html_sha256 is None:
+        raise RuntimeError("prepared source is missing its HTML hash")
     if (
         classification.kind == "stat_changed"
         and not classification.was_failed
@@ -651,15 +732,13 @@ def _process_candidate(
     else:
         counters["changed"] += 1
 
-    try:
-        article = extract_article(candidate, config.source_root)
-    except ExtractionError as error:
+    if prepared.extraction_error_code is not None:
         counters["failed"] += 1
         catalog.replace_failure(
             run_id,
             candidate.relative_html_path,
             stage="extract",
-            error_code=error.code,
+            error_code=prepared.extraction_error_code,
             extractor_version=EXTRACTOR_VERSION,
         )
         catalog.replace_manifest(
@@ -679,6 +758,9 @@ def _process_candidate(
             counters=counters,
         )
 
+    article = prepared.article
+    if article is None:
+        raise RuntimeError("prepared source is missing its extracted article")
     orphan_candidates: tuple[tuple[str, str], ...] = ()
     if (
         classification.old_article_id is not None
