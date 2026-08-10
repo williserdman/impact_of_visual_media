@@ -5,12 +5,17 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
+import pytest
 
 from wsj_embeddings import (
+    EmbeddingCatalogError,
     EmbeddingPipelineConfig,
     EmbeddingRunResult,
+    EmbeddingValidationIssue,
+    EmbeddingValidationResult,
     FakeEmbeddingAdapter,
     run_embedding_pipeline,
+    validate_embedding_outputs,
 )
 
 
@@ -99,3 +104,91 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
     assert vector_type == "FLOAT[2048]"
     assert row[7] == (1.0,) + (0.0,) * 2047
     assert snapshot_fixture_inputs(config) == before
+
+
+def test_validator_accepts_fresh_synthetic_embedding_output(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(issues=())
+
+
+def test_pipeline_refuses_unknown_existing_embedding_schema(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("CREATE TABLE legacy_vectors(value INTEGER)")
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+
+def test_validator_reports_changed_canonical_markdown_without_text(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    markdown_path = (
+        config.preprocessing_output_root / "text" / "2024" / "01" / "02" / "article.md"
+    )
+    markdown_path.write_text("# changed\n", encoding="utf-8")
+
+    result = validate_embedding_outputs(config)
+
+    assert result == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "input_hash_mismatch",
+                "embedding input hash differs from canonical Markdown",
+            ),
+        )
+    )
+
+
+def test_validator_reports_vector_and_publication_metadata_corruption(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            UPDATE embeddings
+            SET published_at_utc = ?, vector = ?
+            """,
+            [datetime(2024, 1, 3, 15, 30, tzinfo=UTC), [0.0] * 2048],
+        )
+
+    result = validate_embedding_outputs(config)
+
+    assert result == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "publication_metadata_mismatch",
+                "embedding publication metadata differs from the canonical article",
+            ),
+            EmbeddingValidationIssue(
+                "vector_hash_mismatch",
+                "embedding vector hashes do not match float32 values",
+            ),
+            EmbeddingValidationIssue(
+                "zero_vector",
+                "embedding rows contain zero vectors",
+            ),
+        )
+    )
+
+
+def test_validator_reports_run_without_configuration_reference(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("UPDATE runs SET configuration_id = 'missing'")
+
+    result = validate_embedding_outputs(config)
+
+    assert result == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "missing_run_configuration_reference",
+                "embedding runs lack a configuration reference",
+            ),
+        )
+    )
