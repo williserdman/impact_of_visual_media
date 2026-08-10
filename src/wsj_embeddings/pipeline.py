@@ -81,13 +81,12 @@ def run_embedding_pipeline(
     prepared = tuple(
         _prepare_embedding(config, adapter, article) for article in articles
     )
-    if not prepared:
-        return EmbeddingRunResult(articles=0, embeddings=0)
-
     profile_id = configuration_id(profile)
     with embedding_pipeline_lock(config.embedding_lock_path), EmbeddingCatalog.open(
         config.embedding_catalog
     ) as catalog, catalog.transaction():
+        if not prepared:
+            return EmbeddingRunResult(articles=0, embeddings=0)
         catalog.connection.execute(
             """
             INSERT INTO embedding_configurations

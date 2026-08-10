@@ -118,6 +118,20 @@ def test_pipeline_refuses_unknown_existing_embedding_schema(tmp_path):
         run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
 
 
+def test_pipeline_validates_existing_embedding_catalog_for_empty_article_slice(
+    tmp_path,
+):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+    config.embedding_output_root.mkdir()
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("CREATE TABLE legacy_vectors(value INTEGER)")
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+
 def test_pipeline_refuses_embedding_catalog_with_unexpected_index(tmp_path):
     config = write_generated_preprocessing_fixture(tmp_path)
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
