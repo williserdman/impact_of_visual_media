@@ -264,6 +264,10 @@ class EmbeddingCatalog:
         try:
             if identity is None:
                 identity = _create_fresh_catalog_leaf(parent_descriptor, path.name)
+            else:
+                with cls.read_only(path):
+                    pass
+                _verify_catalog_leaf(parent_descriptor, path.name, identity)
             leaf_descriptor = _open_catalog_leaf_descriptor(
                 parent_descriptor,
                 path.name,
@@ -284,8 +288,6 @@ class EmbeddingCatalog:
         try:
             if is_fresh:
                 catalog.ensure_schema()
-            else:
-                catalog.validate_schema()
             yield catalog
         finally:
             catalog.close()

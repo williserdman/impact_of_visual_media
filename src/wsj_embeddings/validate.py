@@ -1,4 +1,4 @@
-"""Credential-free integrity validation for published article embeddings."""
+"""Credential-free integrity validation for published article text embeddings."""
 
 from __future__ import annotations
 
@@ -7,10 +7,13 @@ import math
 import struct
 from dataclasses import dataclass
 from datetime import date, datetime
-from pathlib import Path
 
 import duckdb
 
+from wsj_embeddings.canonical_markdown import (
+    CanonicalMarkdownError,
+    read_canonical_markdown,
+)
 from wsj_embeddings.catalog import (
     EmbeddingCatalog,
     EmbeddingCatalogError,
@@ -61,6 +64,7 @@ def validate_embedding_outputs(
             articles = _canonical_articles(config, issues)
             if articles is not None:
                 _validate_configurations(catalog.connection, issues)
+                _validate_run_coverage(catalog.connection, issues)
                 _validate_embeddings(catalog.connection, config, articles, issues)
     except EmbeddingCatalogError:
         issues.append(
@@ -138,6 +142,37 @@ def _validate_configurations(
                 "missing_run_configuration_reference",
                 "embedding runs lack a configuration reference",
             )
+        )
+
+
+def _validate_run_coverage(
+    connection: duckdb.DuckDBPyConnection,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    missing = connection.execute(
+        """
+        WITH run_claims AS (
+            SELECT runs.configuration_id,
+                   max(runs.embeddings) AS expected_embeddings
+            FROM runs
+            JOIN embedding_configurations USING (configuration_id)
+            GROUP BY runs.configuration_id
+        ), vector_counts AS (
+            SELECT configuration_id, count(*) AS published_embeddings
+            FROM embeddings
+            GROUP BY configuration_id
+        )
+        SELECT count(*)
+        FROM run_claims
+        LEFT JOIN vector_counts USING (configuration_id)
+        WHERE coalesce(published_embeddings, 0) < expected_embeddings
+        """
+    ).fetchone()[0]
+    if missing:
+        _append(
+            issues,
+            "missing_published_embedding",
+            "successful embedding runs lack their published vectors",
         )
 
 
@@ -219,22 +254,24 @@ def _validate_markdown_hash(
     input_sha256: str,
     issues: list[EmbeddingValidationIssue],
 ) -> None:
-    relative_path = Path(article.cleaned_markdown_path)
-    if relative_path.is_absolute():
-        _append(issues, "unsafe_markdown_path", "canonical Markdown path is unsafe")
-        return
-    path = (config.preprocessing_output_root / relative_path).resolve()
-    if not path.is_relative_to(config.preprocessing_output_root):
-        _append(issues, "unsafe_markdown_path", "canonical Markdown path is unsafe")
-        return
     try:
-        markdown_bytes = path.read_bytes()
-    except OSError:
-        _append(
-            issues,
-            "missing_canonical_markdown",
-            "canonical Markdown is unavailable",
+        markdown_bytes = read_canonical_markdown(
+            config.preprocessing_output_root,
+            article.cleaned_markdown_path,
         )
+    except CanonicalMarkdownError as error:
+        if error.status == "missing":
+            _append(
+                issues,
+                "missing_canonical_markdown",
+                "canonical Markdown is unavailable",
+            )
+        else:
+            _append(
+                issues,
+                "unsafe_markdown_path",
+                "canonical Markdown path is unsafe",
+            )
         return
     if hashlib.sha256(markdown_bytes).hexdigest() != input_sha256:
         _append(

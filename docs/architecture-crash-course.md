@@ -22,8 +22,16 @@ The shared layer answers only four research questions:
 3. Which local header image and remote editorial-image URLs belong to it?
 4. Where did it come from, and can the result be reproduced incrementally?
 
-Embeddings, entity extraction, knowledge graphs, market joins, labels,
-backtests, and remote-image retrieval are downstream concerns.
+Production embeddings, entity extraction, knowledge graphs, market joins,
+labels, backtests, and remote-image retrieval remain downstream concerns; the
+shared preprocessing catalog does not own them.
+
+Ticket 01 now supplies one fixture-only downstream tracer for article text
+embeddings. It consumes a generated `articles` row and its canonical Markdown
+through the same public seam a future real job will use, injects a deterministic
+fake adapter, and publishes a separate embedding catalog. It does not expose a
+real-corpus run, Jina request, credential path, image embedding, or resume
+workflow.
 
 ```mermaid
 flowchart LR
@@ -37,6 +45,9 @@ flowchart LR
     F --> R
     H --> R
     U[Remote image URLs] --> F
+    E --> T[Fixture-only article text embedding tracer]
+    F --> T
+    T --> G[(Separate embedding catalog)]
 ```
 
 ## 2. One article's journey
@@ -81,6 +92,8 @@ date.
 
 ## 3. Module map
 
+### Preprocessing modules
+
 | Module | Owns | Does not own |
 |---|---|---|
 | `config.py` | resolved source/output roots, batch size, worker count, nonoverlap check | command behavior |
@@ -98,6 +111,25 @@ Only `run` mutates configured state. It requires exactly one of a positive
 are valid only with that scope. Configuration defaults to four workers.
 `inventory` is read-only and inventories the whole configured source root.
 `smoke` ignores configuration and uses a generated temporary archive.
+
+### Article text embedding tracer modules
+
+| Module | Owns | Does not own |
+|---|---|---|
+| `wsj_embeddings/config.py` | resolved source, preprocessing-output, and embedding-output roots; pairwise disjointness | CLI configuration loading |
+| `wsj_embeddings/adapters.py` | injected adapter protocol and deterministic fake adapter | Jina HTTP or credentials |
+| `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
+| `wsj_embeddings/catalog.py` | separate schema version 1, exact read-only inspection, bounded publication transaction | preprocessing catalog mutation |
+| `wsj_embeddings/pipeline.py` | bounded canonical-row selection, text encoding, normalization, hashes, run/vector publication | real-corpus CLI scope or network policy |
+| `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, hash, metadata, and vector checks | repair |
+| `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
+| `wsj_embeddings/cli.py` | the single `smoke` command and deterministic content-free JSON | `run`, Jina configuration, or preprocessing commands |
+
+The installed `wsj-embeddings` command currently accepts exactly `smoke`. It
+creates three disjoint temporary roots, publishes one fake 2,048-dimensional
+`article_text` vector, validates it, emits
+`{"articles": 1, "embeddings": 1, "validation_ok": true}`, and deletes the
+temporary fixture. The existing `wsj-pipeline` command surface is unchanged.
 
 ## 4. Cleaned Markdown contract
 
@@ -146,11 +178,12 @@ is not injected into article Markdown.
 
 ## 5. Catalog schema
 
-`catalog.duckdb` is both the research catalog and the operational state store.
-Opening an unsupported or malformed schema fails with instructions to move the
-derived output aside or choose a fresh output root. There is no silent
-migration or deletion. Public validation uses the same exact table, column,
-key, constraint, and index contract through a read-only connection.
+The preprocessing output's `catalog.duckdb` is both its research catalog and
+operational state store. Opening an unsupported or malformed schema fails with
+instructions to move the derived output aside or choose a fresh output root.
+There is no silent migration or deletion. Public validation uses the same exact
+table, column, key, constraint, and index contract through a read-only
+connection.
 
 ### Research-facing table
 
@@ -199,6 +232,59 @@ WHERE publication_date_new_york
       BETWEEN DATE '2024-01-01' AND DATE '2024-01-31'
 ORDER BY published_at_utc, article_id;
 ```
+
+### Separate article text embedding catalog
+
+The fixture tracer writes a second `catalog.duckdb` only below its disjoint
+embedding output root. It never adds fields or tables to the preprocessing
+catalog. Embedding schema version 1 has exactly four base tables, no views, and
+no indexes. Every column is non-null.
+
+| Table | Ordered columns and DuckDB types | Primary key |
+|---|---|---|
+| `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
+| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR` | `configuration_id` |
+| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
+| `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
+
+`configuration_id` is the SHA-256 of compact, key-sorted JSON for every
+`EmbeddingProfile` field: `model`, `task`, `dimensions`, `output_type`, and
+`normalization`. The current fake profile is a contract fixture, not a claim
+that the real Jina integration exists. `input_sha256` covers the exact UTF-8
+canonical Markdown bytes. After finite/nonzero checks and L2 normalization,
+values are rounded to float32; `stored_vector_sha256` covers their concatenated
+little-endian float32 representation. Only the exact modality `article_text`
+and dimension 2,048 are supported.
+
+One bounded coordinator transaction upserts its configuration and article text
+embedding rows, then inserts a content-free `runs` row. A run row therefore
+claims completed vector publication for its configuration. Ticket-01
+validation compares the greatest claimed `embeddings` count per valid
+configuration with the currently published rows, which catches a deleted sole
+vector without assuming later resume or full-reconciliation semantics.
+
+The research query seam is:
+
+```sql
+SELECT
+    e.article_id,
+    e.published_at_utc,
+    e.publication_date_new_york,
+    e.input_sha256,
+    e.stored_vector_sha256,
+    e.vector,
+    c.model,
+    c.task,
+    c.normalization
+FROM embeddings AS e
+JOIN embedding_configurations AS c USING (configuration_id)
+WHERE e.modality = 'article_text'
+ORDER BY e.published_at_utc, e.article_id;
+```
+
+Consumers join `article_id` back to preprocessing `articles` when they need
+paths or image references. Neither embedding table stores canonical Markdown,
+article excerpts, image bytes, credentials, or adapter responses.
 
 ## 6. Identity and duplicate ranking
 
@@ -314,6 +400,22 @@ catalog state never points to a new path that was not published. The stored
 hash exposes any temporary file/catalog mismatch. Cleanup never follows an
 unsafe path or directory symlink.
 
+The downstream coordinator applies the same boundary independently. Its three
+roots are resolved and pairwise disjoint, it treats the preprocessing catalog
+and canonical Markdown as read-only, and it holds an embedding-output
+`pipeline.lock` for catalog mutation. Canonical Markdown components are opened
+relative to the preprocessing root through no-follow directory descriptors.
+The leaf must remain the same regular single-link file across the read;
+symlinks, directories, hard links, and replacement races fail with
+content-free errors.
+
+An existing embedding catalog leaf must also be a regular single-link file.
+The coordinator anchors it, opens and validates its complete schema read-only,
+closes that connection, verifies the anchored identity again, then opens the
+writable connection. Descriptor identity checks reject replacement before or
+during the transition. A malformed catalog never reaches writable DuckDB
+access and is not migrated, repaired, or overwritten.
+
 Full reconciliation also has a durable retry boundary. Source pages are marked
 missing before affected identities are recomputed. A missing source remains
 pending while an `articles` or `duplicates` row still refers to it, regardless
@@ -361,6 +463,16 @@ generated tree. Symlink entries in the orphan walk are ignored rather than
 reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
+`wsj_embeddings/validate.py` is a second read-only validator for article text
+embeddings. It checks the exact four-table embedding schema first, opens the
+preprocessing catalog through its public exact-schema contract, and reports
+stable sorted issues for configuration identity/reference failures, missing
+vectors claimed by completed runs, unsupported modality/dimension, orphaned
+canonical identities, publication mismatch, unsafe or missing canonical
+Markdown, input-hash mismatch, non-finite/zero/non-unit vectors, and float32
+vector-hash mismatch. Messages never contain Markdown, vector values, or
+credentials. Ticket 01 does not attempt repair, resume, or corpus-wide coverage.
+
 ## 11. Test map
 
 All automated tests build synthetic HTML and image fixtures under temporary
@@ -376,9 +488,11 @@ directories. They must never read the licensed archive.
 | `test_recovery.py` | lock, interruptions, legacy refusal, path moves, orphan and symlink safety |
 | `test_validate.py` | every cross-artifact invariant and streaming behavior |
 | `test_smoke.py` | complete generated-fixture workflow and isolation from configured data |
+| `test_embeddings_pipeline.py` | exact downstream schema, no-follow reads, read-only-before-write opening, publication, run coverage, and validation |
+| `test_embeddings_cli.py` | deterministic fixture-only `wsj-embeddings smoke` command |
 
-The standard verification set is `pytest -q`, `ruff check .`, and
-`wsj-pipeline smoke`.
+The standard verification set is `pytest -q`, `ruff check .`,
+`wsj-pipeline smoke`, and `wsj-embeddings smoke`.
 
 ## 12. Safe extension recipes
 
@@ -418,8 +532,12 @@ orphan cleanup, and full-only missing-source reconciliation.
 
 ## 13. Downstream boundaries
 
-- A text embedding job queries `articles`, opens `cleaned_markdown_path`, and
-  writes vectors outside the preprocessing output root.
+- The fixture tracer queries `articles`, opens `cleaned_markdown_path`, and
+  writes article text embeddings outside the preprocessing output root. It
+  proves this seam only for generated inputs and an injected fake adapter.
+- Real Jina calls, credentials, configured `wsj-embeddings run` scopes,
+  licensed-corpus access, retries, resume, invalidation, and full reconciliation
+  are not implemented in ticket 01.
 - A multimodal job may combine Markdown with the source-relative
   `header_image_path`. It may independently choose whether to retrieve remote
   `inline_image_urls`; this pipeline never does so.
@@ -437,6 +555,11 @@ methods in `catalog.py`, followed by the lifecycle, ranking, and publication
 helpers in `pipeline.py`. Finish with `validate.py`, `cli.py`, and the matching
 test files. This order follows one source from discovery to research query.
 
+For the tracer slice, read `wsj_embeddings/config.py`, `models.py`, and
+`adapters.py`; then `canonical_markdown.py`, `catalog.py`, and `pipeline.py`;
+finish with `validate.py`, `smoke.py`, `cli.py`, and the two embedding test
+files. This follows one generated canonical article into the separate catalog.
+
 ## 15. Glossary
 
 - **article identity**: namespaced stable key beginning `wsj:`, `url:`, or
@@ -446,6 +569,8 @@ test files. This order follows one source from discovery to research query.
   row.
 - **header image**: optional local sibling file referenced relative to the
   source root.
+- **article text embedding**: vector representation of a canonical article's
+  complete editorial text; avoid the ambiguous term “article embedding.”
 - **inline image URL**: remote HTTP(S) editorial reference preserved in order,
   never downloaded here.
 - **manifest**: cheap source/image fingerprints plus processing status used for

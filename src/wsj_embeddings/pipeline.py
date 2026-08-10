@@ -15,6 +15,10 @@ from uuid import uuid4
 import duckdb
 
 from wsj_embeddings.adapters import EmbeddingAdapter
+from wsj_embeddings.canonical_markdown import (
+    CanonicalMarkdownError,
+    read_canonical_markdown,
+)
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingPipelineConfig
 from wsj_embeddings.models import EmbeddingRunResult
@@ -165,15 +169,14 @@ def _prepare_embedding(
     article: tuple[str, str, datetime, date],
 ) -> tuple[tuple[str, str, datetime, date], str, str, tuple[float, ...]]:
     article_id, relative_markdown_path, _published_at, _publication_date = article
-    path = _resolve_markdown_path(
-        config.preprocessing_output_root,
-        article_id,
-        relative_markdown_path,
-    )
     try:
-        markdown_bytes = path.read_bytes()
-    except OSError as error:
-        raise EmbeddingPipelineError("read_markdown", article_id) from error
+        markdown_bytes = read_canonical_markdown(
+            config.preprocessing_output_root,
+            relative_markdown_path,
+        )
+    except CanonicalMarkdownError as error:
+        code = "read_markdown" if error.status == "missing" else "unsafe_markdown_path"
+        raise EmbeddingPipelineError(code, article_id) from error
     try:
         markdown = markdown_bytes.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
@@ -187,22 +190,6 @@ def _prepare_embedding(
     return article, hashlib.sha256(markdown_bytes).hexdigest(), hashlib.sha256(
         packed
     ).hexdigest(), vector
-
-
-def _resolve_markdown_path(
-    root: Path,
-    article_id: str,
-    relative_markdown_path: str,
-) -> Path:
-    candidate = Path(relative_markdown_path)
-    if candidate.is_absolute():
-        raise EmbeddingPipelineError("unsafe_markdown_path", article_id)
-    resolved = (root / candidate).resolve()
-    if not resolved.is_relative_to(root):
-        raise EmbeddingPipelineError("unsafe_markdown_path", article_id)
-    return resolved
-
-
 def _normalized_vector(
     values: tuple[float, ...],
     article_id: str,
