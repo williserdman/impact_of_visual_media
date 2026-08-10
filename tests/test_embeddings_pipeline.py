@@ -192,3 +192,27 @@ def test_validator_reports_run_without_configuration_reference(tmp_path):
             ),
         )
     )
+
+
+def test_validator_checks_intrinsic_properties_for_orphaned_embedding_rows(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "UPDATE embeddings SET article_id = 'orphan', modality = 'unsupported'"
+        )
+
+    result = validate_embedding_outputs(config)
+
+    assert result == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "invalid_modality",
+                "embedding rows use an unsupported modality",
+            ),
+            EmbeddingValidationIssue(
+                "missing_canonical_article",
+                "embedding rows lack a canonical article",
+            ),
+        )
+    )

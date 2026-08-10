@@ -173,13 +173,6 @@ def _validate_embeddings(
             vector,
         ) = row
         article = articles.get(article_id)
-        if article is None:
-            _append(
-                issues,
-                "missing_canonical_article",
-                "embedding rows lack a canonical article",
-            )
-            continue
         if profile_id not in configuration_ids:
             _append(
                 issues,
@@ -198,6 +191,14 @@ def _validate_embeddings(
                 "invalid_dimensions",
                 "embedding rows use an unsupported dimension",
             )
+        _validate_vector(vector, stored_vector_sha256, issues)
+        if article is None:
+            _append(
+                issues,
+                "missing_canonical_article",
+                "embedding rows lack a canonical article",
+            )
+            continue
         if (
             published_at_utc != article.published_at_utc
             or publication_date != article.publication_date_new_york
@@ -208,7 +209,6 @@ def _validate_embeddings(
                 "embedding publication metadata differs from the canonical article",
             )
         _validate_markdown_hash(config, article, input_sha256, issues)
-        _validate_vector(vector, stored_vector_sha256, issues)
 
 
 def _validate_markdown_hash(
