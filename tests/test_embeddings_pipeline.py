@@ -366,6 +366,43 @@ def test_damaged_embedding_catalog_fails_before_writable_open(tmp_path, monkeypa
     assert open_modes == [True]
 
 
+def test_embedding_catalog_rejects_in_place_schema_damage_at_writable_open(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "catalog.duckdb"
+    with EmbeddingCatalog.open(database_path):
+        pass
+    real_connect = embedding_catalog_module.duckdb.connect
+    inspected_read_only = False
+    mutated = False
+
+    def mutate_at_writable_open(*args, **kwargs):
+        nonlocal inspected_read_only, mutated
+        if kwargs.get("read_only", False):
+            inspected_read_only = True
+        elif not mutated:
+            assert inspected_read_only
+            with real_connect(str(database_path)) as competing_connection:
+                competing_connection.execute("ALTER TABLE runs DROP COLUMN embeddings")
+            mutated = True
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(
+        embedding_catalog_module.duckdb,
+        "connect",
+        mutate_at_writable_open,
+    )
+
+    with (
+        pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"),
+        EmbeddingCatalog.open(database_path),
+    ):
+        pass
+
+    assert mutated
+
+
 def test_embedding_catalog_rejects_leaf_replaced_after_read_only_inspection(
     tmp_path,
     monkeypatch,

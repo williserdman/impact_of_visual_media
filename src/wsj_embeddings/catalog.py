@@ -265,7 +265,11 @@ class EmbeddingCatalog:
             if identity is None:
                 identity = _create_fresh_catalog_leaf(parent_descriptor, path.name)
             else:
-                with cls.read_only(path):
+                with cls._read_only_anchored(
+                    parent_descriptor,
+                    path.name,
+                    identity,
+                ):
                     pass
                 _verify_catalog_leaf(parent_descriptor, path.name, identity)
             leaf_descriptor = _open_catalog_leaf_descriptor(
@@ -288,6 +292,45 @@ class EmbeddingCatalog:
         try:
             if is_fresh:
                 catalog.ensure_schema()
+            else:
+                catalog.validate_schema()
+            yield catalog
+        finally:
+            catalog.close()
+
+    @classmethod
+    @contextmanager
+    def _read_only_anchored(
+        cls,
+        parent_descriptor: int,
+        leaf_name: str,
+        identity: tuple[int, int],
+    ) -> Iterator[EmbeddingCatalog]:
+        """Inspect one existing catalog through its original path anchor."""
+
+        connection: duckdb.DuckDBPyConnection | None = None
+        leaf_descriptor: int | None = None
+        try:
+            leaf_descriptor = _open_catalog_leaf_descriptor(
+                parent_descriptor,
+                leaf_name,
+                identity,
+                read_only=True,
+            )
+            connection = duckdb.connect(
+                f"/proc/self/fd/{leaf_descriptor}", read_only=True
+            )
+            _verify_catalog_leaf(parent_descriptor, leaf_name, identity)
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            if leaf_descriptor is not None:
+                os.close(leaf_descriptor)
+            raise
+        assert connection is not None
+        catalog = cls(connection, leaf_descriptor=leaf_descriptor)
+        try:
+            catalog.validate_schema()
             yield catalog
         finally:
             catalog.close()
@@ -298,34 +341,16 @@ class EmbeddingCatalog:
         """Open only a compatible existing catalog without mutating it."""
 
         parent_descriptor, identity = _prepare_catalog_path(path, create=False)
-        connection: duckdb.DuckDBPyConnection | None = None
-        leaf_descriptor: int | None = None
         try:
             assert identity is not None
-            leaf_descriptor = _open_catalog_leaf_descriptor(
+            with cls._read_only_anchored(
                 parent_descriptor,
                 path.name,
                 identity,
-                read_only=True,
-            )
-            connection = duckdb.connect(
-                f"/proc/self/fd/{leaf_descriptor}", read_only=True
-            )
-            _verify_catalog_leaf(parent_descriptor, path.name, identity)
-        except BaseException:
-            if connection is not None:
-                connection.close()
-            if leaf_descriptor is not None:
-                os.close(leaf_descriptor)
-            os.close(parent_descriptor)
-            raise
-        assert connection is not None
-        catalog = cls(connection, parent_descriptor, leaf_descriptor)
-        try:
-            catalog.validate_schema()
-            yield catalog
+            ) as catalog:
+                yield catalog
         finally:
-            catalog.close()
+            os.close(parent_descriptor)
 
     def close(self) -> None:
         """Close the catalog and its anchored filesystem descriptors."""
