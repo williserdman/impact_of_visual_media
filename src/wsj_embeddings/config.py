@@ -39,6 +39,10 @@ class EmbeddingPipelineConfig:
     def embedding_catalog(self) -> Path:
         return self.embedding_output_root / "catalog.duckdb"
 
+    @property
+    def embedding_lock_path(self) -> Path:
+        return self.embedding_output_root / "pipeline.lock"
+
     def validate(self) -> None:
         """Reject equal or nested roots before any coordinator access."""
 

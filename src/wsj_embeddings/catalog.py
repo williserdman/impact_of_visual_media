@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
+from collections import Counter
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict
 from pathlib import Path
+from uuid import uuid4
 
 import duckdb
 
@@ -53,10 +57,175 @@ _TABLE_COLUMNS = {
         ("vector", "FLOAT[2048]", True, None, False),
     ),
 }
+_KEY_CONSTRAINTS = {
+    ("metadata", "PRIMARY KEY", ("key",)),
+    ("embedding_configurations", "PRIMARY KEY", ("configuration_id",)),
+    ("runs", "PRIMARY KEY", ("run_id",)),
+    (
+        "embeddings",
+        "PRIMARY KEY",
+        ("article_id", "modality", "configuration_id"),
+    ),
+}
+_EXPECTED_CONSTRAINTS = Counter(
+    (table, constraint_type, columns, None, None, ())
+    for table, constraint_type, columns in _KEY_CONSTRAINTS
+)
+_EXPECTED_CONSTRAINTS.update(
+    (
+        table,
+        "NOT NULL",
+        (name,),
+        None,
+        None,
+        (),
+    )
+    for table, columns in _TABLE_COLUMNS.items()
+    for name, _data_type, not_null, _default, _primary_key in columns
+    if not_null
+)
+_CATALOG_DIRECTORY_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+)
+_CATALOG_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+_CATALOG_WRITE_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
 
 
 class EmbeddingCatalogError(RuntimeError):
     """Raised when the embedding catalog cannot be safely published."""
+
+
+def _raise_unsafe_catalog_path() -> None:
+    raise EmbeddingCatalogError(
+        "unsafe embedding catalog path; move derived output aside "
+        "or choose a fresh output root"
+    )
+
+
+def _prepare_catalog_path(
+    path: Path,
+    *,
+    create: bool,
+) -> tuple[int, tuple[int, int] | None]:
+    """Anchor one safe embedding-catalog leaf below its parent descriptor."""
+
+    absolute_path = Path(os.path.abspath(path))
+    if (
+        not absolute_path.name
+        or absolute_path.name in {".", ".."}
+        or Path(absolute_path.name).name != absolute_path.name
+    ):
+        _raise_unsafe_catalog_path()
+    if create:
+        absolute_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        parent_descriptor = os.open(absolute_path.parent, _CATALOG_DIRECTORY_FLAGS)
+    except OSError:
+        _raise_unsafe_catalog_path()
+    try:
+        try:
+            leaf_stat = os.stat(
+                absolute_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if not create:
+                _raise_unsafe_catalog_path()
+            return parent_descriptor, None
+        if not stat.S_ISREG(leaf_stat.st_mode) or leaf_stat.st_nlink != 1:
+            _raise_unsafe_catalog_path()
+        return parent_descriptor, (leaf_stat.st_dev, leaf_stat.st_ino)
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+
+
+def _verify_catalog_leaf(
+    parent_descriptor: int,
+    leaf_name: str,
+    identity: tuple[int, int],
+) -> None:
+    """Reject a catalog leaf replaced while DuckDB opens it."""
+
+    try:
+        leaf_stat = os.stat(
+            leaf_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        _raise_unsafe_catalog_path()
+    if (
+        not stat.S_ISREG(leaf_stat.st_mode)
+        or leaf_stat.st_nlink != 1
+        or (leaf_stat.st_dev, leaf_stat.st_ino) != identity
+    ):
+        _raise_unsafe_catalog_path()
+
+
+def _open_catalog_leaf_descriptor(
+    parent_descriptor: int,
+    leaf_name: str,
+    identity: tuple[int, int],
+    *,
+    read_only: bool,
+) -> int:
+    """Open the verified catalog inode without following a leaf symlink."""
+
+    try:
+        descriptor = os.open(
+            leaf_name,
+            _CATALOG_READ_FLAGS if read_only else _CATALOG_WRITE_FLAGS,
+            dir_fd=parent_descriptor,
+        )
+    except OSError:
+        _raise_unsafe_catalog_path()
+    leaf_stat = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(leaf_stat.st_mode)
+        or leaf_stat.st_nlink != 1
+        or (leaf_stat.st_dev, leaf_stat.st_ino) != identity
+    ):
+        os.close(descriptor)
+        _raise_unsafe_catalog_path()
+    return descriptor
+
+
+def _create_fresh_catalog_leaf(
+    parent_descriptor: int,
+    leaf_name: str,
+) -> tuple[int, int]:
+    """Create a fresh catalog atomically without overwriting a raced-in leaf."""
+
+    temporary_name = f".{leaf_name}.{uuid4().hex}.tmp"
+    temporary_path = f"/proc/self/fd/{parent_descriptor}/{temporary_name}"
+    try:
+        duckdb.connect(temporary_path).close()
+        temporary_stat = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(temporary_stat.st_mode) or temporary_stat.st_nlink != 1:
+            _raise_unsafe_catalog_path()
+        try:
+            os.link(
+                temporary_name,
+                leaf_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            _raise_unsafe_catalog_path()
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=parent_descriptor)
+    leaf_stat = os.stat(leaf_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if not stat.S_ISREG(leaf_stat.st_mode) or leaf_stat.st_nlink != 1:
+        _raise_unsafe_catalog_path()
+    return leaf_stat.st_dev, leaf_stat.st_ino
 
 
 def configuration_id(profile: EmbeddingProfile) -> str:
@@ -73,41 +242,99 @@ def configuration_id(profile: EmbeddingProfile) -> str:
 class EmbeddingCatalog:
     """Own the transaction used to publish one bounded embedding batch."""
 
-    def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+    def __init__(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        parent_descriptor: int | None = None,
+        leaf_descriptor: int | None = None,
+    ) -> None:
         self.connection = connection
+        self._parent_descriptor = parent_descriptor
+        self._leaf_descriptor = leaf_descriptor
 
     @classmethod
     @contextmanager
     def open(cls, path: Path) -> Iterator[EmbeddingCatalog]:
         """Open a new catalog or reject every incompatible existing file."""
 
-        is_existing = path.exists()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = duckdb.connect(str(path))
-        catalog = cls(connection)
+        parent_descriptor, identity = _prepare_catalog_path(path, create=True)
+        is_fresh = identity is None
+        connection: duckdb.DuckDBPyConnection | None = None
+        leaf_descriptor: int | None = None
         try:
-            if is_existing:
-                catalog.validate_schema()
-            else:
+            if identity is None:
+                identity = _create_fresh_catalog_leaf(parent_descriptor, path.name)
+            leaf_descriptor = _open_catalog_leaf_descriptor(
+                parent_descriptor,
+                path.name,
+                identity,
+                read_only=False,
+            )
+            connection = duckdb.connect(f"/proc/self/fd/{leaf_descriptor}")
+            _verify_catalog_leaf(parent_descriptor, path.name, identity)
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            if leaf_descriptor is not None:
+                os.close(leaf_descriptor)
+            os.close(parent_descriptor)
+            raise
+        assert connection is not None
+        catalog = cls(connection, parent_descriptor, leaf_descriptor)
+        try:
+            if is_fresh:
                 catalog.ensure_schema()
+            else:
+                catalog.validate_schema()
             yield catalog
         finally:
-            connection.close()
+            catalog.close()
 
     @classmethod
     @contextmanager
     def read_only(cls, path: Path) -> Iterator[EmbeddingCatalog]:
         """Open only a compatible existing catalog without mutating it."""
 
-        if not path.is_file():
-            cls._raise_unsupported_schema()
-        connection = duckdb.connect(str(path), read_only=True)
-        catalog = cls(connection)
+        parent_descriptor, identity = _prepare_catalog_path(path, create=False)
+        connection: duckdb.DuckDBPyConnection | None = None
+        leaf_descriptor: int | None = None
+        try:
+            assert identity is not None
+            leaf_descriptor = _open_catalog_leaf_descriptor(
+                parent_descriptor,
+                path.name,
+                identity,
+                read_only=True,
+            )
+            connection = duckdb.connect(
+                f"/proc/self/fd/{leaf_descriptor}", read_only=True
+            )
+            _verify_catalog_leaf(parent_descriptor, path.name, identity)
+        except BaseException:
+            if connection is not None:
+                connection.close()
+            if leaf_descriptor is not None:
+                os.close(leaf_descriptor)
+            os.close(parent_descriptor)
+            raise
+        assert connection is not None
+        catalog = cls(connection, parent_descriptor, leaf_descriptor)
         try:
             catalog.validate_schema()
             yield catalog
         finally:
-            connection.close()
+            catalog.close()
+
+    def close(self) -> None:
+        """Close the catalog and its anchored filesystem descriptors."""
+
+        self.connection.close()
+        if self._leaf_descriptor is not None:
+            os.close(self._leaf_descriptor)
+            self._leaf_descriptor = None
+        if self._parent_descriptor is not None:
+            os.close(self._parent_descriptor)
+            self._parent_descriptor = None
 
     def ensure_schema(self) -> None:
         """Install the initial exact tables for a fresh downstream catalog."""
@@ -202,7 +429,36 @@ class EmbeddingCatalog:
             )
             for table in _EMBEDDING_CATALOG_TABLES
         }
-        if table_columns != _TABLE_COLUMNS:
+        constraints = Counter(
+            (
+                row[0],
+                row[1],
+                tuple(row[2] or ()),
+                row[3],
+                row[4],
+                tuple(row[5] or ()),
+            )
+            for row in self.connection.execute(
+                """
+                SELECT table_name, constraint_type, constraint_column_names,
+                       expression, referenced_table, referenced_column_names
+                FROM duckdb_constraints()
+                WHERE database_name = current_database()
+                  AND schema_name = 'main'
+                """
+            ).fetchall()
+        )
+        indexes = self.connection.execute(
+            """
+            SELECT table_name, index_name, is_unique, expressions
+            FROM duckdb_indexes()
+            """
+        ).fetchall()
+        if (
+            table_columns != _TABLE_COLUMNS
+            or constraints != _EXPECTED_CONSTRAINTS
+            or indexes
+        ):
             self._raise_unsupported_schema()
         try:
             row = self.connection.execute(

@@ -17,6 +17,13 @@ from wsj_embeddings import (
     run_embedding_pipeline,
     validate_embedding_outputs,
 )
+from wsj_embeddings.catalog import EmbeddingCatalog
+from wsj_embeddings.pipeline import (
+    EmbeddingPipelineError,
+    EmbeddingPipelineLockedError,
+    embedding_pipeline_lock,
+)
+from wsj_pipeline.catalog import ArticleRecord, Catalog
 
 
 def write_generated_preprocessing_fixture(tmp_path: Path) -> EmbeddingPipelineConfig:
@@ -30,35 +37,22 @@ def write_generated_preprocessing_fixture(tmp_path: Path) -> EmbeddingPipelineCo
     markdown_path.parent.mkdir(parents=True)
     markdown = "#\n"
     markdown_path.write_text(markdown, encoding="utf-8")
-    with duckdb.connect(str(preprocessing_output_root / "catalog.duckdb")) as db:
-        db.execute(
-            """
-            CREATE TABLE articles (
-                article_id VARCHAR PRIMARY KEY,
-                source_html_path VARCHAR NOT NULL,
-                cleaned_markdown_path VARCHAR NOT NULL,
-                header_image_path VARCHAR,
-                inline_image_urls VARCHAR[] NOT NULL,
-                published_at_utc TIMESTAMP WITH TIME ZONE NOT NULL,
-                publication_date_new_york DATE NOT NULL,
-                cleaned_markdown_sha256 VARCHAR NOT NULL
+    with Catalog.open(
+        preprocessing_output_root / "catalog.duckdb"
+    ) as catalog, catalog.transaction():
+        catalog.replace_article(
+            ArticleRecord(
+                article_id="wsj:SYNTHETIC-EMBEDDING",
+                source_html_path="synthetic/article.html",
+                cleaned_markdown_path=markdown_path.relative_to(
+                    preprocessing_output_root
+                ).as_posix(),
+                header_image_path=None,
+                inline_image_urls=(),
+                published_at_utc=datetime(2024, 1, 2, 15, 30, tzinfo=UTC),
+                publication_date_new_york=date(2024, 1, 2),
+                cleaned_markdown_sha256=hashlib.sha256(markdown.encode()).hexdigest(),
             )
-            """
-        )
-        db.execute(
-            """
-            INSERT INTO articles VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                "wsj:SYNTHETIC-EMBEDDING",
-                "synthetic/article.html",
-                markdown_path.relative_to(preprocessing_output_root).as_posix(),
-                None,
-                [],
-                datetime(2024, 1, 2, 15, 30, tzinfo=UTC),
-                date(2024, 1, 2),
-                hashlib.sha256(markdown.encode()).hexdigest(),
-            ],
         )
     return EmbeddingPipelineConfig(
         source_root=source_root,
@@ -121,6 +115,79 @@ def test_pipeline_refuses_unknown_existing_embedding_schema(tmp_path):
         db.execute("CREATE TABLE legacy_vectors(value INTEGER)")
 
     with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+
+def test_pipeline_refuses_embedding_catalog_with_unexpected_index(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "CREATE UNIQUE INDEX unexpected_embedding_index "
+            "ON embedding_configurations(model)"
+        )
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+
+def test_pipeline_refuses_malformed_preprocessing_catalog(tmp_path):
+    source_root = tmp_path / "source"
+    preprocessing_output_root = tmp_path / "preprocessed"
+    source_root.mkdir()
+    preprocessing_output_root.mkdir()
+    with duckdb.connect(str(preprocessing_output_root / "catalog.duckdb")) as db:
+        db.execute("CREATE TABLE articles(article_id VARCHAR PRIMARY KEY)")
+    config = EmbeddingPipelineConfig(
+        source_root=source_root,
+        preprocessing_output_root=preprocessing_output_root,
+        embedding_output_root=tmp_path / "embeddings",
+    )
+
+    with pytest.raises(EmbeddingPipelineError, match="preprocessing_catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+
+def test_embedding_pipeline_lock_is_exclusive_and_owned_lock_is_cleaned(tmp_path):
+    lock_path = tmp_path / "embeddings" / "pipeline.lock"
+
+    with embedding_pipeline_lock(lock_path):
+        assert lock_path.is_file()
+        with (
+            pytest.raises(EmbeddingPipelineLockedError, match="already running"),
+            embedding_pipeline_lock(lock_path),
+        ):
+            raise AssertionError("unreachable")
+        assert lock_path.is_file()
+
+    assert not lock_path.exists()
+
+
+def test_validator_refuses_malformed_preprocessing_catalog(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.preprocessing_catalog)) as db:
+        db.execute("DROP TABLE runs")
+
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "invalid_preprocessing_catalog",
+                "canonical preprocessing catalog could not be queried",
+            ),
+        )
+    )
+
+
+def test_pipeline_refuses_symlinked_embedding_catalog(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    outside_catalog = tmp_path / "outside.duckdb"
+    with EmbeddingCatalog.open(outside_catalog):
+        pass
+    config.embedding_output_root.mkdir()
+    config.embedding_catalog.symlink_to(outside_catalog)
+
+    with pytest.raises(EmbeddingCatalogError, match="unsafe embedding catalog path"):
         run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
 
 

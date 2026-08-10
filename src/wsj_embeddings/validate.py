@@ -19,6 +19,7 @@ from wsj_embeddings.catalog import (
 from wsj_embeddings.config import EmbeddingPipelineConfig
 from wsj_embeddings.models import EmbeddingProfile
 from wsj_embeddings.pipeline import _ARTICLE_TEXT_MODALITY, _VECTOR_DIMENSIONS
+from wsj_pipeline.catalog import Catalog, CatalogError
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +86,8 @@ def _canonical_articles(
     issues: list[EmbeddingValidationIssue],
 ) -> dict[str, _CanonicalArticle] | None:
     try:
-        with duckdb.connect(str(config.preprocessing_catalog), read_only=True) as db:
+        with Catalog.read_only(config.preprocessing_catalog) as db:
+            Catalog.validate_schema(db)
             rows = db.execute(
                 """
                 SELECT article_id, cleaned_markdown_path, published_at_utc,
@@ -93,7 +95,7 @@ def _canonical_articles(
                 FROM articles
                 """
             ).fetchall()
-    except duckdb.Error:
+    except (CatalogError, duckdb.Error, OSError):
         issues.append(
             EmbeddingValidationIssue(
                 "invalid_preprocessing_catalog",

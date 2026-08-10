@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import struct
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -15,6 +18,7 @@ from wsj_embeddings.adapters import EmbeddingAdapter
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingPipelineConfig
 from wsj_embeddings.models import EmbeddingRunResult
+from wsj_pipeline.catalog import Catalog, CatalogError
 
 _ARTICLE_TEXT_MODALITY = "article_text"
 _VECTOR_DIMENSIONS = 2048
@@ -27,6 +31,36 @@ class EmbeddingPipelineError(RuntimeError):
         self.code = code
         self.article_id = article_id
         super().__init__(f"[{code}] article_id={article_id}")
+
+
+class EmbeddingPipelineLockedError(RuntimeError):
+    """Raised when another embedding coordinator owns the output lock."""
+
+
+@contextmanager
+def embedding_pipeline_lock(lock_path: Path) -> Iterator[None]:
+    """Own one exclusive lock before mutating an embedding output root."""
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except FileExistsError as error:
+        raise EmbeddingPipelineLockedError(
+            f"embedding pipeline is already running; lock exists at {lock_path}"
+        ) from error
+    try:
+        try:
+            os.write(descriptor, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(descriptor)
+        yield
+    finally:
+        with suppress(FileNotFoundError):
+            lock_path.unlink()
 
 
 def run_embedding_pipeline(
@@ -51,10 +85,9 @@ def run_embedding_pipeline(
         return EmbeddingRunResult(articles=0, embeddings=0)
 
     profile_id = configuration_id(profile)
-    with (
-        EmbeddingCatalog.open(config.embedding_catalog) as catalog,
-        catalog.transaction(),
-    ):
+    with embedding_pipeline_lock(config.embedding_lock_path), EmbeddingCatalog.open(
+        config.embedding_catalog
+    ) as catalog, catalog.transaction():
         catalog.connection.execute(
             """
             INSERT INTO embedding_configurations
@@ -110,7 +143,8 @@ def _read_articles(
     limit: int,
 ) -> tuple[tuple[str, str, datetime, date], ...]:
     try:
-        with duckdb.connect(str(config.preprocessing_catalog), read_only=True) as db:
+        with Catalog.read_only(config.preprocessing_catalog) as db:
+            Catalog.validate_schema(db)
             rows = db.execute(
                 """
                 SELECT article_id, cleaned_markdown_path, published_at_utc,
@@ -121,7 +155,7 @@ def _read_articles(
                 """,
                 [limit],
             ).fetchall()
-    except duckdb.Error as error:
+    except (CatalogError, duckdb.Error, OSError) as error:
         raise EmbeddingPipelineError("preprocessing_catalog", "unknown") from error
     return tuple(rows)
 
