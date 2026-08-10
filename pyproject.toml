@@ -22,6 +22,7 @@ dev = [
 
 [project.scripts]
 wsj-pipeline = "wsj_pipeline.cli:main"
+wsj-embeddings = "wsj_embeddings.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

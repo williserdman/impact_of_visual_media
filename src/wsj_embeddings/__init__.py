@@ -5,6 +5,7 @@ from wsj_embeddings.catalog import EmbeddingCatalogError
 from wsj_embeddings.config import EmbeddingPipelineConfig
 from wsj_embeddings.models import EmbeddingProfile, EmbeddingRunResult
 from wsj_embeddings.pipeline import run_embedding_pipeline
+from wsj_embeddings.smoke import EmbeddingSmokeResult, run_embedding_smoke
 from wsj_embeddings.validate import (
     EmbeddingValidationIssue,
     EmbeddingValidationResult,
@@ -17,9 +18,11 @@ __all__ = [
     "EmbeddingPipelineConfig",
     "EmbeddingProfile",
     "EmbeddingRunResult",
+    "EmbeddingSmokeResult",
     "EmbeddingValidationIssue",
     "EmbeddingValidationResult",
     "FakeEmbeddingAdapter",
     "run_embedding_pipeline",
+    "run_embedding_smoke",
     "validate_embedding_outputs",
 ]
