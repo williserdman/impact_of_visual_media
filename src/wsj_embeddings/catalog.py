@@ -98,7 +98,7 @@ class EmbeddingCatalog:
                     dimensions INTEGER NOT NULL,
                     input_sha256 VARCHAR NOT NULL,
                     stored_vector_sha256 VARCHAR NOT NULL,
-                    vector FLOAT[] NOT NULL CHECK (array_length(vector) = 2048),
+                    vector FLOAT[2048] NOT NULL,
                     PRIMARY KEY (article_id, modality, configuration_id)
                 )
                 """

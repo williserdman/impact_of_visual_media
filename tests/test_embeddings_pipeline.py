@@ -23,7 +23,7 @@ def write_generated_preprocessing_fixture(tmp_path: Path) -> EmbeddingPipelineCo
         preprocessing_output_root / "text" / "2024" / "01" / "02" / "article.md"
     )
     markdown_path.parent.mkdir(parents=True)
-    markdown = "# Synthetic embedding article\n\nSynthetic editorial content.\n"
+    markdown = "#\n"
     markdown_path.write_text(markdown, encoding="utf-8")
     with duckdb.connect(str(preprocessing_output_root / "catalog.duckdb")) as db:
         db.execute(
@@ -88,6 +88,7 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
             FROM embeddings
             """
         ).fetchone()
+        vector_type = db.execute("PRAGMA table_info('embeddings')").fetchall()[8][2]
     assert row[:5] == (
         "wsj:SYNTHETIC-EMBEDDING",
         "article_text",
@@ -95,5 +96,6 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
         date(2024, 1, 2),
         2048,
     )
-    assert row[7] == [1.0] + [0.0] * 2047
+    assert vector_type == "FLOAT[2048]"
+    assert row[7] == (1.0,) + (0.0,) * 2047
     assert snapshot_fixture_inputs(config) == before
