@@ -87,6 +87,8 @@ class EmbeddingRunResult:
     retryable: int = 0
     terminal: int = 0
     interrupted: int = 0
+    header_absent: int = 0
+    header_failed: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -122,7 +122,7 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/adapters.py` | injected adapter protocol, deterministic fake adapter, and fixed hosted Jina adapter | corpus selection or output mutation |
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
-| `wsj_embeddings/catalog.py` | separate schema version 5, exact read-only inspection, bounded lifecycle/generation transactions | preprocessing catalog mutation |
+| `wsj_embeddings/catalog.py` | separate schema version 6, exact read-only inspection, bounded lifecycle/generation transactions | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection, text/image encoding, hashes, and publication | hosted credential loading |
 | `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
@@ -252,15 +252,15 @@ ORDER BY published_at_utc, article_id;
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 5 has exactly six base tables, no views, and
-no indexes. Versions 1 through 4 and malformed output are refused without
+catalog. Embedding schema version 6 has exactly six base tables, no views, and
+no indexes. Versions 1 through 5 and malformed output are refused without
 migration.
 
 | Table | Ordered columns and DuckDB types | Primary key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
 | `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
-| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
+| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
 | `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
@@ -280,24 +280,31 @@ representation. Work state is one of `queued`, `in_progress`, `succeeded`,
 vector modalities are `article_text` and `header_image`, both dimension 2,048.
 `source_relative_path` records the archive-relative path only for image work;
 no-header work keeps both path and input hash null and never publishes a vector.
+The only other null input hash is the narrow missing-header retryable
+disposition: it retains a safe canonical relative path and
+`missing_header_image`, has zero adapter attempts, and has no active vector or
+generation. Content-free `header_absent` and `header_failed` run counters keep
+that distinction visible in public summaries.
 `last_run_id` tracks the latest observation/attempt. `generation_run_id` is
 nullable except on successful active work, is immutable across reuse, and is
 the provenance copied into history when that vector is superseded.
 
 The coordinator commits content-free run/configuration setup separately, then
 registers or recovers each selected item in its own bounded transaction. When
-the selected article-text input identity changes, that registration transaction removes the
-same-configuration mismatched vector before replacement work begins. It also
-archives, removes, and requeues an existing same-article/configuration
-multimodal dependent while preserving header-image work, other articles, and
-other configurations. It then
+the selected text or exact image input identity changes, that registration
+transaction removes only the same-configuration mismatched vector before
+replacement work begins. It also archives, removes, and requeues an existing
+same-article/configuration multimodal dependent while preserving the other
+source modality, other articles, and other configurations. It then
 commits `in_progress` before each request. A validated vector insert, successful
 work transition, and run-count update share one bounded transaction. An
 interruption before that commit leaves requeueable work; an interruption after
 it reuses the proven success. Earlier registration and article checkpoints
 therefore survive a later retryable, terminal, or interrupted operation.
 Failure rows retain only stable adapter codes, numeric status/retry metadata,
-and attempt counts. A changed input or explicit bounded reprocess first records
+and attempt counts. Provider/transport image failures remain retryable;
+deterministic image-request rejection becomes terminal on its third attempt and
+never publishes a placeholder vector. A changed input or explicit bounded reprocess first records
 the superseded success's content-free input/vector hashes and run identities in
 `embedding_generation_history`. A changed configuration creates separate work
 and leaves prior-configuration vectors immutable and queryable.
@@ -588,7 +595,8 @@ orphan cleanup, and full-only missing-source reconciliation.
   limited-only: affirmative hosted-processing authorization and a positive
   lexical article limit are mandatory. Unchanged successful article text is
   reused; retryable/interrupted work resumes and terminal work is not retried
-  implicitly. `--reprocess` regenerates only that selected limit and retains
+  implicitly. Missing declared images are counted separately from true
+  no-header articles without failing successful text. `--reprocess` regenerates only that selected limit and retains
   superseded-generation provenance. Full reconciliation remains a later
   boundary.
 - Local header images are opened read-only without following symlinks, hashed,

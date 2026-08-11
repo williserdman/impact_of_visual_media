@@ -72,6 +72,8 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("retryable", "INTEGER", True, None, False),
         ("terminal", "INTEGER", True, None, False),
         ("interrupted", "INTEGER", True, None, False),
+        ("header_absent", "INTEGER", True, None, False),
+        ("header_failed", "INTEGER", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "embedding_work_items": (
@@ -253,6 +255,25 @@ def attach_generated_header_image(
     return relative_path
 
 
+def declare_missing_generated_header_image(
+    config: EmbeddingPipelineConfig,
+    *,
+    relative_path: str = "synthetic/missing-header.png",
+) -> str:
+    """Declare one generated fixture path without creating the optional file."""
+
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            """
+            UPDATE articles
+            SET header_image_path = ?
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+            """,
+            [relative_path],
+        )
+    return relative_path
+
+
 def seed_generated_modality_success(
     config: EmbeddingPipelineConfig,
     *,
@@ -381,6 +402,13 @@ class RecordingMultimodalAdapter(RecordingAdapter):
         return super().embed_image(image_base64)
 
 
+class InterruptingImageAdapter(RecordingMultimodalAdapter):
+    def embed_image(self, image_base64: str) -> tuple[float, ...]:
+        self.image_calls += 1
+        self.encoded_images.append(image_base64)
+        raise SyntheticInterruption
+
+
 class PriorConfigurationAdapter(FakeEmbeddingAdapter):
     profile = EmbeddingProfile(
         model="synthetic-prior-model",
@@ -502,6 +530,7 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
         embeddings=1,
         attempted=1,
         succeeded=1,
+        header_absent=1,
     )
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         row = db.execute(
@@ -598,6 +627,7 @@ def test_absent_then_added_header_image_does_not_regenerate_successful_text(tmp_
         embeddings=1,
         attempted=1,
         succeeded=1,
+        header_absent=1,
     )
     assert first_adapter.calls == 1
     assert first_adapter.image_calls == 0
@@ -648,6 +678,292 @@ def test_absent_then_added_header_image_does_not_regenerate_successful_text(tmp_
             "succeeded",
             1,
         )
+
+
+def test_missing_header_is_retryable_and_recovers_without_regenerating_text(tmp_path):
+    """Break caught: a missing optional image aborts text or cannot recover alone."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    relative_path = declare_missing_generated_header_image(config)
+    first_adapter = RecordingMultimodalAdapter()
+
+    first = run_embedding_pipeline(config, first_adapter, limit=1)
+
+    assert first == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=1,
+        succeeded=1,
+        retryable=1,
+        header_failed=1,
+    )
+    assert first_adapter.calls == 1
+    assert first_adapter.image_calls == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, source_relative_path, input_sha256, state,
+                   attempt_count, error_code
+            FROM embedding_work_items
+            ORDER BY modality
+            """
+        ).fetchall() == [
+            ("article_text", None, hashlib.sha256(b"#\n").hexdigest(),
+             "succeeded", 1, None),
+            ("header_image", relative_path, None, "retryable", 0,
+             "missing_header_image"),
+        ]
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [("article_text",)]
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "missing_header_image",
+                "canonical header image is unavailable",
+            ),
+        )
+    )
+
+    recovered_bytes = b"generated recovered header image"
+    recovered_path = config.source_root / relative_path
+    recovered_path.parent.mkdir(parents=True)
+    recovered_path.write_bytes(recovered_bytes)
+    recovered_adapter = RecordingMultimodalAdapter()
+
+    recovered = run_embedding_pipeline(config, recovered_adapter, limit=1)
+
+    assert recovered == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        reused=1,
+        attempted=1,
+        succeeded=1,
+    )
+    assert recovered_adapter.calls == 0
+    assert recovered_adapter.image_calls == 1
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(issues=())
+
+
+def test_retryable_header_failure_recovers_without_regenerating_text(tmp_path):
+    """Break caught: one image transport failure aborts or repurchases text."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated retryable image")
+
+    class RetryableImageAdapter(RecordingMultimodalAdapter):
+        def embed_image(self, image_base64: str) -> tuple[float, ...]:
+            self.image_calls += 1
+            self.encoded_images.append(image_base64)
+            raise JinaHostedAdapterError(
+                "rate_limit",
+                retryable=True,
+                status_code=429,
+                retry_after_seconds=2.0,
+            )
+
+    first_adapter = RetryableImageAdapter()
+    first = run_embedding_pipeline(config, first_adapter, limit=1)
+
+    assert first == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=2,
+        succeeded=1,
+        retryable=1,
+        header_failed=1,
+    )
+    assert first_adapter.calls == 1
+    assert first_adapter.image_calls == 1
+    assert {issue.code for issue in validate_embedding_outputs(config).issues} == {
+        "header_image_retryable_failure"
+    }
+
+    recovered_adapter = RecordingMultimodalAdapter()
+    recovered = run_embedding_pipeline(config, recovered_adapter, limit=1)
+
+    assert recovered == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        reused=1,
+        attempted=1,
+        succeeded=1,
+    )
+    assert recovered_adapter.calls == 0
+    assert recovered_adapter.image_calls == 1
+    assert validate_embedding_outputs(config).ok
+
+    unchanged_adapter = RecordingMultimodalAdapter()
+    unchanged = run_embedding_pipeline(config, unchanged_adapter, limit=1)
+
+    assert unchanged.reused == 2
+    assert unchanged_adapter.calls == 0
+    assert unchanged_adapter.image_calls == 0
+
+
+def test_deterministic_header_rejection_becomes_terminal_after_three_attempts(
+    tmp_path,
+):
+    """Break caught: deterministic image rejection retries forever or stores filler."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated rejected image")
+
+    class RejectingImageAdapter(RecordingMultimodalAdapter):
+        total_image_calls = 0
+
+        def embed_image(self, image_base64: str) -> tuple[float, ...]:
+            self.image_calls += 1
+            self.encoded_images.append(image_base64)
+            type(self).total_image_calls += 1
+            raise JinaHostedAdapterError(
+                "deterministic_request",
+                retryable=False,
+                status_code=413,
+            )
+
+    results = [
+        run_embedding_pipeline(config, RejectingImageAdapter(), limit=1)
+        for _ in range(4)
+    ]
+
+    assert [(result.retryable, result.terminal, result.header_failed)
+            for result in results] == [
+        (1, 0, 1),
+        (1, 0, 1),
+        (0, 1, 1),
+        (0, 1, 1),
+    ]
+    assert RejectingImageAdapter.total_image_calls == 3
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code, status_code
+            FROM embedding_work_items
+            WHERE modality = 'header_image'
+            """
+        ).fetchone() == ("terminal", 3, "deterministic_request", 413)
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [("article_text",)]
+    assert {issue.code for issue in validate_embedding_outputs(config).issues} == {
+        "header_image_terminal_failure"
+    }
+
+
+def test_changed_header_bytes_invalidate_only_image_and_same_config_multimodal(
+    tmp_path,
+):
+    """Break caught: changed image bytes invalidate text, siblings, or old configs."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    relative_path = attach_generated_header_image(config, b"generated image one")
+    run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), limit=1)
+    current_profile = FakeEmbeddingAdapter.profile
+    prior_profile = PriorConfigurationAdapter.profile
+    seed_generated_modality_success(
+        config,
+        article_id="wsj:SYNTHETIC-EMBEDDING",
+        modality="multimodal_article",
+        profile=current_profile,
+    )
+    seed_generated_modality_success(
+        config,
+        article_id="wsj:SYNTHETIC-EMBEDDING",
+        modality="multimodal_article",
+        profile=prior_profile,
+    )
+    replacement = b"generated image two"
+    (config.source_root / relative_path).write_bytes(replacement)
+    adapter = RecordingMultimodalAdapter()
+
+    result = run_embedding_pipeline(config, adapter, limit=1)
+
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        reused=1,
+        attempted=1,
+        succeeded=1,
+    )
+    assert adapter.calls == 0
+    assert adapter.image_calls == 1
+    current_id = configuration_id(current_profile)
+    prior_id = configuration_id(prior_profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT configuration_id, modality
+            FROM embeddings
+            ORDER BY configuration_id, modality
+            """
+        ).fetchall() == sorted(
+            [
+                (current_id, "article_text"),
+                (current_id, "header_image"),
+                (prior_id, "article_text"),
+                (prior_id, "header_image"),
+                (prior_id, "multimodal_article"),
+            ]
+        )
+        assert db.execute(
+            """
+            SELECT modality, superseded_reason
+            FROM embedding_generation_history
+            WHERE configuration_id = ?
+            ORDER BY modality
+            """,
+            [current_id],
+        ).fetchall() == [
+            ("header_image", "input_changed"),
+            ("multimodal_article", "input_changed"),
+        ]
+
+
+def test_interrupted_header_attempt_recovers_without_rebuying_successful_text(
+    tmp_path,
+):
+    """Break caught: interrupted image work loses text or appears successful."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated interrupted image")
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(config, InterruptingImageAdapter(), limit=1)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, state, attempt_count
+            FROM embedding_work_items
+            ORDER BY modality
+            """
+        ).fetchall() == [
+            ("article_text", "succeeded", 1),
+            ("header_image", "in_progress", 1),
+        ]
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [("article_text",)]
+    assert {issue.code for issue in validate_embedding_outputs(config).issues} == {
+        "header_image_in_progress"
+    }
+
+    recovered_adapter = RecordingMultimodalAdapter()
+    recovered = run_embedding_pipeline(config, recovered_adapter, limit=1)
+
+    assert recovered == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        reused=1,
+        attempted=1,
+        succeeded=1,
+        interrupted=1,
+    )
+    assert recovered_adapter.calls == 0
+    assert recovered_adapter.image_calls == 1
+    assert validate_embedding_outputs(config).ok
 
 
 @pytest.mark.parametrize("unsafe_path", ("../outside.png", "/absolute.png"))
@@ -829,6 +1145,7 @@ def test_replaying_unchanged_success_reuses_checkpoint_without_adapter_call(tmp_
         retryable=0,
         terminal=0,
         interrupted=0,
+        header_absent=1,
     )
     assert replay == EmbeddingRunResult(
         articles=1,
@@ -839,6 +1156,7 @@ def test_replaying_unchanged_success_reuses_checkpoint_without_adapter_call(tmp_
         retryable=0,
         terminal=0,
         interrupted=0,
+        header_absent=1,
     )
     assert first_adapter.calls == 1
     assert replay_adapter.calls == 0
@@ -1169,6 +1487,7 @@ def test_restart_recovers_in_progress_work_after_adapter_interruption(
         retryable=0,
         terminal=0,
         interrupted=1,
+        header_absent=1,
     )
     assert interrupted_adapter.calls == 1
     assert resumed_adapter.calls == 1
@@ -1308,6 +1627,7 @@ def test_retryable_failure_can_succeed_after_an_earlier_checkpoint(tmp_path):
         retryable=0,
         terminal=0,
         interrupted=0,
+        header_absent=2,
     )
     assert resumed_adapter.calls == 1
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
@@ -1342,6 +1662,7 @@ def test_terminal_failure_is_visible_and_not_retried_implicitly(tmp_path):
         retryable=0,
         terminal=1,
         interrupted=0,
+        header_absent=1,
     )
     assert replay_adapter.calls == 0
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
@@ -1550,6 +1871,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
         articles=1,
         embeddings=0,
         reused=1,
+        header_absent=1,
     )
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         article_ids = db.execute(
@@ -1561,7 +1883,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_five_image_generation_schema(tmp_path):
+def test_embedding_catalog_has_exact_version_six_header_disposition_schema(tmp_path):
     database_path = tmp_path / "catalog.duckdb"
 
     with EmbeddingCatalog.open(database_path):
@@ -1638,7 +1960,7 @@ def test_embedding_catalog_has_exact_version_five_image_generation_schema(tmp_pa
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "5")]
+    assert metadata == [("schema_version", "6")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -1731,6 +2053,37 @@ def test_pipeline_refuses_version_four_embedding_catalog_without_migration(tmp_p
         assert db.execute("SELECT * FROM metadata").fetchall() == [
             ("schema_version", "4")
         ]
+
+
+def test_pipeline_refuses_version_five_embedding_catalog_without_migration(tmp_path):
+    """Break caught: header disposition counters are silently added in place."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        run_columns = {
+            row[1] for row in db.execute("PRAGMA table_info('runs')").fetchall()
+        }
+        if "header_failed" in run_columns:
+            db.execute("ALTER TABLE runs DROP COLUMN header_failed")
+        if "header_absent" in run_columns:
+            db.execute("ALTER TABLE runs DROP COLUMN header_absent")
+        db.execute("UPDATE metadata SET value = '5' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("5",)
+        assert {
+            row[1] for row in db.execute("PRAGMA table_info('runs')").fetchall()
+        }.isdisjoint({"header_absent", "header_failed"})
 
 
 def test_validator_accepts_fresh_synthetic_embedding_output(tmp_path):

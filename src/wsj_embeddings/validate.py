@@ -75,7 +75,10 @@ def validate_embedding_outputs(
                         catalog.connection, selected_configuration_id, issues
                     )
                     _validate_work_items(
-                        catalog.connection, selected_configuration_id, issues
+                        catalog.connection,
+                        articles,
+                        selected_configuration_id,
+                        issues,
                     )
                     _validate_embeddings(
                         catalog.connection,
@@ -255,6 +258,7 @@ def _validate_run_coverage(
 
 def _validate_work_items(
     connection: duckdb.DuckDBPyConnection,
+    articles: dict[str, CanonicalArticle],
     configuration_id: str,
     issues: list[EmbeddingValidationIssue],
 ) -> None:
@@ -343,6 +347,12 @@ def _validate_work_items(
             value is not None
             for value in (error_code, status_code, retry_after_seconds)
         )
+        is_missing_header = (
+            modality == EmbeddingModality.HEADER_IMAGE.value
+            and work_state is WorkState.RETRYABLE
+            and error_code == "missing_header_image"
+            and input_sha256 is None
+        )
         if work_state is WorkState.NOT_APPLICABLE:
             if (
                 modality != EmbeddingModality.HEADER_IMAGE.value
@@ -357,12 +367,42 @@ def _validate_work_items(
                     "invalid_not_applicable_checkpoint",
                     "not-applicable image work retains generation metadata",
                 )
+            article = articles.get(article_id)
+            if article is not None and article.header_image_path is not None:
+                _append(
+                    issues,
+                    "invalid_not_applicable_checkpoint",
+                    "not-applicable image work retains generation metadata",
+                )
             if (article_id, modality, configuration_identifier) in embedding_keys:
                 _append(
                     issues,
                     "embedding_without_success_checkpoint",
                     "embedding rows lack a matching successful work checkpoint",
                 )
+        elif is_missing_header:
+            article = articles.get(article_id)
+            if (
+                not is_safe_source_relative_path(source_relative_path)
+                or article is None
+                or source_relative_path != article.header_image_path
+                or attempt_count != 0
+                or status_code is not None
+                or retry_after_seconds is not None
+                or generation_run_id is not None
+                or (article_id, modality, configuration_identifier)
+                in embedding_keys
+            ):
+                _append(
+                    issues,
+                    "invalid_missing_header_checkpoint",
+                    "missing-header work retains invalid generation metadata",
+                )
+            _append(
+                issues,
+                "missing_header_image",
+                "canonical header image is unavailable",
+            )
         else:
             if not _is_sha256(input_sha256):
                 _append(
@@ -397,7 +437,7 @@ def _validate_work_items(
                     "non-successful work retains a generating run identity",
                 )
         if work_state.is_failure:
-            if error_code is None or attempt_count < 1:
+            if not is_missing_header and (error_code is None or attempt_count < 1):
                 _append(
                     issues,
                     "invalid_failure_checkpoint",
@@ -409,6 +449,32 @@ def _validate_work_items(
                 "invalid_failure_checkpoint",
                 "non-failed embedding work items retain failure metadata",
             )
+        if modality == EmbeddingModality.HEADER_IMAGE.value and not is_missing_header:
+            issue_by_state = {
+                WorkState.QUEUED: (
+                    "header_image_queued",
+                    "header-image work remains queued",
+                ),
+                WorkState.IN_PROGRESS: (
+                    "header_image_in_progress",
+                    "header-image work remains in progress",
+                ),
+                WorkState.INTERRUPTED: (
+                    "header_image_interrupted",
+                    "header-image work remains interrupted",
+                ),
+                WorkState.RETRYABLE: (
+                    "header_image_retryable_failure",
+                    "header-image work has a retryable failure",
+                ),
+                WorkState.TERMINAL: (
+                    "header_image_terminal_failure",
+                    "header-image work has a terminal failure",
+                ),
+            }
+            issue = issue_by_state.get(work_state)
+            if issue is not None:
+                _append(issues, *issue)
 
 
 def _validate_embeddings(

@@ -171,12 +171,15 @@ attempted. Replaying the same limit reuses unchanged successes without another
 hosted request; when input changes, the mismatched vector is removed atomically
 with checkpoint invalidation before replacement is attempted. Any existing
 same-article/configuration multimodal dependent is archived, removed, and
-requeued in that transaction; header-image work and other articles or
-configurations remain unchanged. Retryable
-failures and interrupted in-progress work are attempted again, while terminal
-failures stay visible and are not retried implicitly. Limited runs never infer
-removal outside the selected scope. Success JSON includes content-free
-`reused`, `attempted`, `succeeded`, `retryable`, `terminal`, and `interrupted`
+requeued in that transaction; the other source modality, other articles, and
+other configurations remain unchanged. A missing declared local header records
+a retryable, content-free image disposition without failing or regenerating
+successful text. Provider/transport retryable failures and interrupted image
+work are attempted again. Deterministic image-request rejection is attempted at
+most three times before becoming terminal; terminal work stays visible and is
+not retried implicitly. Limited runs never infer removal outside the selected
+scope. Success JSON includes content-free `reused`, `attempted`, `succeeded`,
+`retryable`, `terminal`, `interrupted`, `header_absent`, and `header_failed`
 counts plus the deterministic, content-free `configuration_id` required for
 research queries.
 
@@ -274,7 +277,7 @@ The downstream catalog is a separate schema-version-5 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted, limit-only production CLI.
-Versions 1 through 4 are refused without migration; move reproducible derived
+Versions 1 through 5 are refused without migration; move reproducible derived
 output aside or choose a fresh embedding output root.
 
 The catalog has exactly six base tables and no indexes:
@@ -283,16 +286,23 @@ The catalog has exactly six base tables and no indexes:
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
 | `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
-| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
+| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
 | `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 
-The source path is nullable for article text and absent images; the input hash
-is nullable only for `not_applicable` image work. The three failure-detail
-columns retain classified codes and numeric response/retry metadata, never
-exception text or editorial content. Work states are `queued`, `in_progress`,
-`succeeded`, `retryable`, `terminal`, `interrupted`, and `not_applicable`.
+The source path is nullable for article text and absent images. The input hash
+is nullable for `not_applicable` image work and only one applicable case: a
+safe-path `retryable` header with `missing_header_image`, zero adapter attempts,
+and no active vector or generation. The three failure-detail columns retain
+classified codes and numeric response/retry metadata, never exception text or
+editorial content. Work states are `queued`, `in_progress`, `succeeded`,
+`retryable`, `terminal`, `interrupted`, and `not_applicable`. `not_applicable`
+means no canonical header; header failures remain distinct and count in
+`header_failed`. Changed exact image bytes archive the prior image generation
+as `input_changed` and invalidate only that image plus its same-configuration
+multimodal dependent. A changed configuration uses a separate work key and
+leaves the prior configuration queryable.
 `configuration_id` is the SHA-256 of compact,
 key-sorted JSON covering model alias, observed hosted model/API metadata, task,
 dimensions, output type, normalization, tokenizer/context rules, long-text
@@ -335,9 +345,11 @@ data, links each vector to a canonical `articles` row, rehashes canonical
 Markdown and local header images through no-follow descriptors, checks
 publication metadata and both hashes, and verifies that successful run counts
 still have published vectors.
-It emits stable issues without article text or vector values. When more than
-one configuration exists, callers must select an explicit `configuration_id`;
-validation never silently mixes generations.
+It emits stable issues without article text or vector values, including
+distinct missing, queued, in-progress, interrupted, retryable, and terminal
+header-image dispositions; a true no-header `not_applicable` row is valid and
+silent. When more than one configuration exists, callers must select an
+explicit `configuration_id`; validation never silently mixes generations.
 
 ## Incremental runs and reprocessing
 

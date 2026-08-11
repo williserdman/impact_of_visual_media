@@ -23,7 +23,7 @@ from wsj_embeddings.models import (
     WorkState,
 )
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "5"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "6"
 
 _EMBEDDING_CATALOG_TABLES = {
     "embedding_configurations",
@@ -67,6 +67,8 @@ _TABLE_COLUMNS = {
         ("retryable", "INTEGER", True, None, False),
         ("terminal", "INTEGER", True, None, False),
         ("interrupted", "INTEGER", True, None, False),
+        ("header_absent", "INTEGER", True, None, False),
+        ("header_failed", "INTEGER", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "embedding_work_items": (
@@ -152,7 +154,16 @@ _CATALOG_DIRECTORY_FLAGS = (
 _CATALOG_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _CATALOG_WRITE_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
 _RUN_COUNT_COLUMNS = frozenset(
-    {"reused", "attempted", "succeeded", "retryable", "terminal", "interrupted"}
+    {
+        "reused",
+        "attempted",
+        "succeeded",
+        "retryable",
+        "terminal",
+        "interrupted",
+        "header_absent",
+        "header_failed",
+    }
 )
 
 
@@ -536,6 +547,8 @@ class EmbeddingCatalog:
                     retryable INTEGER NOT NULL,
                     terminal INTEGER NOT NULL,
                     interrupted INTEGER NOT NULL,
+                    header_absent INTEGER NOT NULL,
+                    header_failed INTEGER NOT NULL,
                     started_at TIMESTAMP WITH TIME ZONE NOT NULL
                 )
                 """
@@ -728,9 +741,10 @@ class EmbeddingCatalog:
             """
             INSERT INTO runs (
                 run_id, configuration_id, articles, embeddings, reused,
-                attempted, succeeded, retryable, terminal, interrupted, started_at
+                attempted, succeeded, retryable, terminal, interrupted,
+                header_absent, header_failed, started_at
             )
-            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, current_timestamp)
+            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, current_timestamp)
             """,
             [run_id, configuration_identifier, article_count],
         )
@@ -793,7 +807,10 @@ class EmbeddingCatalog:
                 replacement_source_relative_path=source_relative_path,
                 replacement_input_sha256=input_sha256,
             )
-            if modality == EmbeddingModality.ARTICLE_TEXT.value:
+            if modality in {
+                EmbeddingModality.ARTICLE_TEXT.value,
+                EmbeddingModality.HEADER_IMAGE.value,
+            }:
                 self._invalidate_work_generation(
                     run_id=run_id,
                     article_id=article_id,
@@ -901,6 +918,7 @@ class EmbeddingCatalog:
                     run_id,
                 ],
             )
+            self.increment_run(run_id, "header_absent")
             return WorkState.NOT_APPLICABLE
         state = WorkState(str(row[0]))
         if state is not WorkState.NOT_APPLICABLE:
@@ -931,7 +949,95 @@ class EmbeddingCatalog:
                 configuration_identifier,
             ],
         )
+        self.increment_run(run_id, "header_absent")
         return WorkState.NOT_APPLICABLE
+
+    def register_missing_header(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        source_relative_path: str,
+    ) -> WorkState:
+        """Persist the narrow retryable disposition for one unavailable image."""
+
+        row = self.connection.execute(
+            """
+            SELECT state, source_relative_path, input_sha256, error_code
+            FROM embedding_work_items
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                article_id,
+                EmbeddingModality.HEADER_IMAGE.value,
+                configuration_identifier,
+            ],
+        ).fetchone()
+        already_missing = row == (
+            WorkState.RETRYABLE.value,
+            source_relative_path,
+            None,
+            "missing_header_image",
+        )
+        if row is None:
+            self.connection.execute(
+                """
+                INSERT INTO embedding_work_items
+                VALUES (?, ?, ?, ?, NULL, ?, 0, ?, NULL, NULL, ?, NULL,
+                        current_timestamp)
+                """,
+                [
+                    article_id,
+                    EmbeddingModality.HEADER_IMAGE.value,
+                    configuration_identifier,
+                    source_relative_path,
+                    WorkState.RETRYABLE.value,
+                    "missing_header_image",
+                    run_id,
+                ],
+            )
+        else:
+            if not already_missing:
+                for modality in (
+                    EmbeddingModality.HEADER_IMAGE.value,
+                    EmbeddingModality.MULTIMODAL_ARTICLE.value,
+                ):
+                    self._invalidate_work_generation(
+                        run_id=run_id,
+                        article_id=article_id,
+                        modality=modality,
+                        configuration_identifier=configuration_identifier,
+                        reason=SupersessionReason.INPUT_CHANGED,
+                        replacement_source_relative_path=(
+                            source_relative_path
+                            if modality == EmbeddingModality.HEADER_IMAGE.value
+                            else None
+                        ),
+                        replacement_input_sha256=None,
+                    )
+            self.connection.execute(
+                """
+                UPDATE embedding_work_items
+                SET source_relative_path = ?, input_sha256 = NULL, state = ?,
+                    attempt_count = 0, error_code = ?, status_code = NULL,
+                    retry_after_seconds = NULL, last_run_id = ?,
+                    generation_run_id = NULL, updated_at = current_timestamp
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [
+                    source_relative_path,
+                    WorkState.RETRYABLE.value,
+                    "missing_header_image",
+                    run_id,
+                    article_id,
+                    EmbeddingModality.HEADER_IMAGE.value,
+                    configuration_identifier,
+                ],
+            )
+        self.increment_run(run_id, "retryable")
+        self.increment_run(run_id, "header_failed")
+        return WorkState.RETRYABLE
 
     def _invalidate_work_generation(
         self,
@@ -1100,6 +1206,26 @@ class EmbeddingCatalog:
         )
         self.increment_run(run_id, state.value)
 
+    def attempt_count(
+        self,
+        *,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+    ) -> int:
+        """Return the committed bounded attempt count for one exact item."""
+
+        row = self.connection.execute(
+            """
+            SELECT attempt_count
+            FROM embedding_work_items
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [article_id, modality, configuration_identifier],
+        ).fetchone()
+        assert row is not None
+        return int(row[0])
+
     def publish_success(
         self,
         *,
@@ -1190,7 +1316,7 @@ class EmbeddingCatalog:
         row = self.connection.execute(
             """
             SELECT articles, embeddings, reused, attempted, succeeded,
-                   retryable, terminal, interrupted
+                   retryable, terminal, interrupted, header_absent, header_failed
             FROM runs
             WHERE run_id = ?
             """,

@@ -36,6 +36,7 @@ from wsj_pipeline.catalog import Catalog, CatalogError
 _ARTICLE_TEXT_MODALITY = EmbeddingModality.ARTICLE_TEXT.value
 _HEADER_IMAGE_MODALITY = EmbeddingModality.HEADER_IMAGE.value
 _VECTOR_DIMENSIONS = 2048
+_DETERMINISTIC_IMAGE_ATTEMPT_LIMIT = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,11 @@ class _PreparedHeaderImage:
     source_relative_path: str
     input_sha256: str
     data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _MissingHeaderImage:
+    source_relative_path: str
 
 
 class EmbeddingPipelineError(RuntimeError):
@@ -240,6 +246,10 @@ def run_embedding_pipeline(
                 if state is WorkState.TERMINAL:
                     with catalog.transaction():
                         catalog.increment_run(run_id, "terminal")
+                        if modality == _HEADER_IMAGE_MODALITY:
+                            catalog.increment_run(run_id, "header_failed")
+                    continue
+                if isinstance(prepared_image, _MissingHeaderImage):
                     continue
                 with catalog.transaction():
                     catalog.start_attempt(
@@ -257,10 +267,22 @@ def run_embedding_pipeline(
                         prepared_image=prepared_image,
                     )
                 except JinaHostedAdapterError as error:
-                    failure_state = (
-                        WorkState.RETRYABLE if error.retryable else WorkState.TERMINAL
-                    )
                     with catalog.transaction():
+                        attempt_count = catalog.attempt_count(
+                            article_id=article.article_id,
+                            modality=modality,
+                            configuration_identifier=configuration_identifier,
+                        )
+                        bounded_deterministic_image = (
+                            modality == _HEADER_IMAGE_MODALITY
+                            and error.code == "deterministic_request"
+                            and attempt_count < _DETERMINISTIC_IMAGE_ATTEMPT_LIMIT
+                        )
+                        failure_state = (
+                            WorkState.RETRYABLE
+                            if error.retryable or bounded_deterministic_image
+                            else WorkState.TERMINAL
+                        )
                         catalog.record_failure(
                             run_id=run_id,
                             article_id=article.article_id,
@@ -271,6 +293,10 @@ def run_embedding_pipeline(
                             status_code=error.status_code,
                             retry_after_seconds=error.retry_after_seconds,
                         )
+                        if modality == _HEADER_IMAGE_MODALITY:
+                            catalog.increment_run(run_id, "header_failed")
+                    if modality == _HEADER_IMAGE_MODALITY:
+                        continue
                     raise
                 source_relative_path = (
                     prepared_image.source_relative_path
@@ -326,7 +352,7 @@ def _register_header_work(
     run_id: str,
     configuration_identifier: str,
     article: CanonicalArticle,
-    prepared_image: _PreparedHeaderImage | None,
+    prepared_image: _PreparedHeaderImage | _MissingHeaderImage | None,
 ) -> WorkState:
     try:
         if prepared_image is None:
@@ -335,6 +361,13 @@ def _register_header_work(
                 article_id=article.article_id,
                 modality=_HEADER_IMAGE_MODALITY,
                 configuration_identifier=configuration_identifier,
+            )
+        if isinstance(prepared_image, _MissingHeaderImage):
+            return catalog.register_missing_header(
+                run_id=run_id,
+                article_id=article.article_id,
+                configuration_identifier=configuration_identifier,
+                source_relative_path=prepared_image.source_relative_path,
             )
         return catalog.register_work(
             run_id=run_id,
@@ -406,10 +439,10 @@ def _prepare_embedding(
     article: CanonicalArticle,
     *,
     modality: str,
-    prepared_image: _PreparedHeaderImage | None,
+    prepared_image: _PreparedHeaderImage | _MissingHeaderImage | None,
 ) -> tuple[str, str, tuple[float, ...]]:
     if modality == _HEADER_IMAGE_MODALITY:
-        assert prepared_image is not None
+        assert isinstance(prepared_image, _PreparedHeaderImage)
         embedded = adapter.embed_image(
             base64.b64encode(prepared_image.data).decode("ascii")
         )
@@ -449,12 +482,14 @@ def _prepare_embedding(
 def _prepare_header_image(
     config: EmbeddingPipelineConfig,
     article: CanonicalArticle,
-) -> _PreparedHeaderImage | None:
+) -> _PreparedHeaderImage | _MissingHeaderImage | None:
     if article.header_image_path is None:
         return None
     try:
         image_bytes = read_source_image(config.source_root, article.header_image_path)
     except SourceImageError as error:
+        if error.status == "missing":
+            return _MissingHeaderImage(article.header_image_path)
         code = (
             "missing_header_image"
             if error.status == "missing"

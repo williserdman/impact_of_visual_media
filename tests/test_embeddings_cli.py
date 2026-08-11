@@ -202,6 +202,8 @@ def test_authorized_limited_run_embeds_complete_lexical_winner_with_fake(
         "attempted": 2,
         "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
         "embeddings": 2,
+        "header_absent": 0,
+        "header_failed": 0,
         "interrupted": 0,
         "retryable": 0,
         "reused": 0,
@@ -277,6 +279,8 @@ def test_authorized_reprocess_flag_regenerates_only_the_limited_cli_scope(
         "attempted": 1,
         "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
         "embeddings": 1,
+        "header_absent": 0,
+        "header_failed": 0,
         "interrupted": 0,
         "retryable": 0,
         "reused": 1,
@@ -289,6 +293,64 @@ def test_authorized_reprocess_flag_regenerates_only_the_limited_cli_scope(
         assert db.execute(
             "SELECT article_id FROM embedding_generation_history"
         ).fetchall() == [("wsj:A",)]
+
+
+@pytest.mark.parametrize(
+    ("disposition", "expected_retryable", "expected_absent", "expected_failed"),
+    (
+        ("absent", 0, 1, 0),
+        ("missing", 1, 0, 1),
+    ),
+)
+def test_run_summary_distinguishes_absent_from_failed_header(
+    tmp_path: Path,
+    capsys,
+    disposition: str,
+    expected_retryable: int,
+    expected_absent: int,
+    expected_failed: int,
+) -> None:
+    """Break caught: CLI summaries merge no-header and failed-header coverage."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+    if disposition == "absent":
+        with (
+            Catalog.open(roots[1] / "catalog.duckdb") as catalog,
+            catalog.transaction(),
+        ):
+            catalog.connection.execute(
+                "UPDATE articles SET header_image_path = NULL "
+                "WHERE article_id = 'wsj:A'"
+            )
+    else:
+        (roots[0] / "headers" / "a.jpg").unlink()
+
+    exit_code = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--limit",
+            "1",
+            "--authorize-hosted-processing",
+        ],
+        adapter_factory=RecordingFakeAdapter,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload == {
+        "articles": 1,
+        "attempted": 1,
+        "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
+        "embeddings": 1,
+        "header_absent": expected_absent,
+        "header_failed": expected_failed,
+        "interrupted": 0,
+        "retryable": expected_retryable,
+        "reused": 0,
+        "succeeded": 1,
+        "terminal": 0,
+    }
 
 
 def test_authorized_run_reports_missing_credential_without_output_state(
