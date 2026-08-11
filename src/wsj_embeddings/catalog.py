@@ -892,6 +892,9 @@ class EmbeddingCatalog:
                 """,
                 [run_id, article_id, modality, configuration_identifier],
             )
+            self.increment_run(run_id, "terminal")
+            if modality == EmbeddingModality.HEADER_IMAGE.value:
+                self.increment_run(run_id, "header_failed")
         return state
 
     def register_not_applicable(

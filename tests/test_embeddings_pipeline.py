@@ -885,6 +885,83 @@ def test_deterministic_header_rejection_becomes_terminal_after_three_attempts(
     }
 
 
+def test_terminal_header_observation_and_summary_survive_registration_interrupt(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: terminal replay observation commits before its run counters."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated terminal replay image")
+
+    class RejectingImageAdapter(FakeEmbeddingAdapter):
+        def embed_image(self, image_base64: str) -> tuple[float, ...]:
+            del image_base64
+            raise JinaHostedAdapterError(
+                "deterministic_request",
+                retryable=False,
+                status_code=413,
+            )
+
+    for _ in range(3):
+        run_embedding_pipeline(config, RejectingImageAdapter(), limit=1)
+
+    real_transaction = EmbeddingCatalog.transaction
+    interrupted = False
+
+    @contextmanager
+    def interrupt_after_terminal_registration(catalog):
+        nonlocal interrupted
+        with real_transaction(catalog):
+            yield
+        latest_run_id = catalog.connection.execute(
+            "SELECT run_id FROM runs ORDER BY started_at DESC, run_id DESC LIMIT 1"
+        ).fetchone()[0]
+        terminal_observed = catalog.connection.execute(
+            """
+            SELECT count(*)
+            FROM embedding_work_items
+            WHERE modality = 'header_image' AND state = 'terminal'
+              AND last_run_id = ?
+            """,
+            [latest_run_id],
+        ).fetchone()[0]
+        if terminal_observed and not interrupted:
+            interrupted = True
+            raise SyntheticInterruption
+
+    monkeypatch.setattr(
+        EmbeddingCatalog,
+        "transaction",
+        interrupt_after_terminal_registration,
+    )
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
+    monkeypatch.setattr(EmbeddingCatalog, "transaction", real_transaction)
+
+    assert interrupted
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        latest_run_id, terminal, header_failed = db.execute(
+            """
+            SELECT run_id, terminal, header_failed
+            FROM runs
+            ORDER BY started_at DESC, run_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        assert (terminal, header_failed) == (1, 1)
+        assert db.execute(
+            """
+            SELECT last_run_id
+            FROM embedding_work_items
+            WHERE modality = 'header_image'
+            """
+        ).fetchone() == (latest_run_id,)
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+    assert "header_image_terminal_failure" in codes
+    assert "invalid_header_disposition_counts" not in codes
+
+
 def test_changed_header_bytes_invalidate_only_image_and_same_config_multimodal(
     tmp_path,
 ):

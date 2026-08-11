@@ -256,10 +256,6 @@ def run_embedding_pipeline(
                         catalog.increment_run(run_id, "reused")
                     continue
                 if state is WorkState.TERMINAL:
-                    with catalog.transaction():
-                        catalog.increment_run(run_id, "terminal")
-                        if modality == _HEADER_IMAGE_MODALITY:
-                            catalog.increment_run(run_id, "header_failed")
                     continue
                 if isinstance(prepared_image, _MissingHeaderImage):
                     continue

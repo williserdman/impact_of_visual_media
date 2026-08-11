@@ -243,3 +243,79 @@ was used.
   excluded from derivative counter reconciliation.
 
 Fix-round concerns: none.
+
+## Fix round 2: atomic terminal replay accounting
+
+### Review finding addressed
+
+An unchanged terminal work item previously updated `last_run_id` during its
+registration transaction, then relied on the processing loop to increment the
+run's `terminal` and `header_failed` counters in a second transaction. A process
+loss between those commits produced a legitimate interrupted run whose durable
+observation and summary disagreed.
+
+Terminal replay observation and summary accounting now live together inside
+`EmbeddingCatalog.register_work`, under the registration transaction already
+owned by the coordinator. The processing loop only skips the already-accounted
+terminal item. New terminal failures remain atomic in their existing
+`record_failure` transaction. Schema and lifecycle vocabulary remain version 6.
+
+### RED and GREEN
+
+The generated public coordinator failpoint commits terminal header registration
+and interrupts before the processing loop. Before the fix it observed RED:
+`1 failed, 97 deselected in 3.26s`; `last_run_id` named the new run while its
+`terminal` and `header_failed` counters were both zero.
+
+After moving replay accounting into the catalog registration transaction, the
+new failpoint plus deterministic-terminal, text-terminal, counter-validation,
+and fresh-validation cases observed GREEN:
+`6 passed, 92 deselected in 10.64s`.
+
+### Fix-round focused verification
+
+```bash
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_pipeline.py \
+  -k 'terminal_header_observation_and_summary or deterministic_header_rejection or terminal_failure_is_visible or header_disposition_counter_mismatch or validator_accepts_fresh'
+/home/willis/projects/finance_wsj/.venv/bin/ruff check \
+  src/wsj_embeddings/catalog.py src/wsj_embeddings/pipeline.py \
+  tests/test_embeddings_pipeline.py
+PYTHONPATH=src /home/willis/projects/finance_wsj/.venv/bin/python \
+  -m wsj_embeddings smoke
+PYTHONPATH=src /home/willis/projects/finance_wsj/.venv/bin/python \
+  -m wsj_embeddings run --help
+git diff --check
+git ls-files | rg '^(data|artifacts|outputs)/'
+```
+
+Observed:
+
+- affected lifecycle/validation tests:
+  `6 passed, 92 deselected in 10.64s`;
+- changed Python Ruff: `All checks passed!`;
+- generated smoke:
+  `{"articles": 1, "embeddings": 1, "validation_ok": true}`;
+- live help retained the bounded, explicitly authorized run interface;
+- `git diff --check` and current-doc stale-schema search produced no output;
+  and
+- tracked generated-artifact audit produced no matches (expected `rg` exit 1).
+
+No broad/full suite, licensed archive, live credential, network request, real
+embedding output, or full-corpus operation was used.
+
+### Fix-round self-review
+
+- The failpoint fires only after the terminal registration transaction commits,
+  exactly where the prior split transaction exposed inconsistent durable state.
+- Unchanged terminal replay updates observation identity and both summary
+  counters in one transaction. If it rolls back, neither observation nor counts
+  move; if it commits, validation sees a consistent run.
+- The change applies equally to text terminal replay for counter consistency,
+  while `header_failed` remains header-only.
+- Generation identity, attempt count, failure metadata, terminal state, active
+  vectors, and supersession history are not modified by replay observation.
+- Initial terminal transitions still use the existing bounded failure
+  transaction and are not double-counted by the processing loop.
+
+Fix-round-2 concerns: none.
