@@ -168,3 +168,101 @@ adapter and generated smoke.
 None. The shared virtual environment still has no linked-worktree console-script
 installation, so generated smoke and live help were verified directly against
 the worktree source with `PYTHONPATH=src`; no machine configuration changed.
+
+## Fix round 1/5: stale-vector invalidation and bounded registration
+
+### Findings addressed
+
+Changed-input invalidation now deletes only a vector with the same article,
+modality, and active configuration whose `input_sha256` differs from the newly
+selected canonical input. The delete and work-item reset share the same
+registration transaction, before `in_progress` or any adapter request. An
+interruption, retryable failure, or terminal failure therefore cannot leave the
+old active-configuration vector queryable. Vectors for prior configurations are
+not removed and remain auditable.
+
+Run/configuration setup no longer registers the entire arbitrary positive
+`--limit` inside one transaction. Setup commits once, then each selected work
+item registers or recovers in its own bounded transaction. A failure during a
+later registration preserves earlier queued work and the content-free run row;
+replay safely completes both earlier and later items.
+
+### Red-green evidence
+
+Public coordinator RED:
+
+```bash
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_pipeline.py \
+  -k 'changed_input_removes or registration_checkpoint_survives'
+```
+
+Observed `4 failed, 47 deselected in 11.27s`:
+
+- interruption, retryable failure, and terminal failure each left one stale
+  same-configuration vector after the selected input hash changed; and
+- interruption at the second registration rolled back the first registration,
+  leaving zero work items.
+
+After same-key/input-scoped vector deletion and per-item registration
+transactions, the same command reported
+`4 passed, 47 deselected in 13.20s`.
+
+### Fixture coverage
+
+The generated changed-input fixture first publishes the same article under a
+prior configuration and the active configuration. It then changes both the
+generated Markdown and canonical preprocessing hash before injecting:
+
+- an interruption after the generated fake response;
+- an explicit retryable 429 failure; or
+- an explicit terminal 413 failure.
+
+Each case requires zero active-configuration vectors while work is
+non-successful, exactly one untouched prior-configuration vector, and exactly
+one current active-configuration vector after recovery. The terminal case also
+proves an unchanged replay performs no adapter call, then changes input again to
+make later successful work eligible.
+
+The registration fixture selects two generated articles and interrupts through
+the public coordinator at the second `_register_work` failpoint. It requires the
+first queued work item and run row to survive, then replays the same limit and
+publishes exactly two vectors.
+
+### Final verification and exact output
+
+```bash
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_pipeline.py
+/home/willis/projects/finance_wsj/.venv/bin/ruff check .
+git diff --check
+git ls-files | rg '^(data|artifacts|outputs)/'
+```
+
+Observed:
+
+- coordinator/schema/validation: `51 passed in 57.09s`;
+- Ruff: `All checks passed!`;
+- diff check clean; no tracked generated data/artifacts/output paths.
+
+No command used a live adapter, credential, network, licensed archive, real
+embedding output, or full-corpus scope.
+
+### Fix-round self-review
+
+- Vector deletion is narrower than the work primary key: it additionally
+  requires a mismatched input hash. It cannot remove another configuration's
+  vector or an already-current same-configuration vector.
+- Deletion and checkpoint invalidation roll back or commit together. Adapter
+  failure happens only after that bounded transaction commits.
+- Setup and every registration transaction perform constant work per selected
+  item; no transaction grows with an arbitrary positive CLI limit.
+- Interrupted registration leaves queued rather than `in_progress` state,
+  correctly reflecting that no request began. Existing retry/interruption and
+  terminal semantics remain unchanged.
+- The deferred lifecycle vocabulary/transition encapsulation refactor remains
+  scoped to ticket 06/final review as directed.
+
+### Fix-round concern
+
+None.

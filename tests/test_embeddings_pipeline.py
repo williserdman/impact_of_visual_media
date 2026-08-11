@@ -16,6 +16,7 @@ import wsj_embeddings.pipeline as embedding_pipeline_module
 from wsj_embeddings import (
     EmbeddingCatalogError,
     EmbeddingPipelineConfig,
+    EmbeddingProfile,
     EmbeddingRunResult,
     EmbeddingValidationIssue,
     EmbeddingValidationResult,
@@ -24,7 +25,7 @@ from wsj_embeddings import (
     validate_embedding_outputs,
 )
 from wsj_embeddings.adapters import JinaHostedAdapterError
-from wsj_embeddings.catalog import EmbeddingCatalog
+from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingConfigError
 from wsj_embeddings.pipeline import (
     EmbeddingPipelineError,
@@ -168,6 +169,35 @@ def add_generated_embedding_article(
         )
 
 
+def replace_generated_embedding_markdown(
+    config: EmbeddingPipelineConfig,
+    markdown: str,
+) -> str:
+    markdown_path = (
+        config.preprocessing_output_root
+        / "text"
+        / "2024"
+        / "01"
+        / "02"
+        / "article.md"
+    )
+    markdown_path.write_text(markdown, encoding="utf-8")
+    input_sha256 = hashlib.sha256(markdown.encode()).hexdigest()
+    with (
+        Catalog.open(config.preprocessing_catalog) as catalog,
+        catalog.transaction(),
+    ):
+        catalog.connection.execute(
+            """
+            UPDATE articles
+            SET cleaned_markdown_sha256 = ?
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+            """,
+            [input_sha256],
+        )
+    return input_sha256
+
+
 class SyntheticInterruption(BaseException):
     """Simulate abrupt process loss without entering operational error handling."""
 
@@ -196,6 +226,14 @@ class RecordingAdapter(FakeEmbeddingAdapter):
         vector = super().embed_text(text)
         self.responded = True
         return vector
+
+
+class PriorConfigurationAdapter(FakeEmbeddingAdapter):
+    profile = EmbeddingProfile(
+        model="synthetic-prior-model",
+        task="retrieval.passage",
+        dimensions=2048,
+    )
 
 
 def test_config_rejects_truthy_non_boolean_hosted_processing_authorization(
@@ -551,6 +589,159 @@ def test_terminal_failure_is_visible_and_not_retried_implicitly(tmp_path):
             FROM embedding_work_items
             """
         ).fetchone() == ("terminal", 1, "deterministic_request", 413, None)
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_state"),
+    (
+        ("interrupted", "in_progress"),
+        ("retryable", "retryable"),
+        ("terminal", "terminal"),
+    ),
+)
+def test_changed_input_removes_stale_active_vector_until_recovery(
+    tmp_path,
+    failure_kind,
+    expected_state,
+):
+    """Break caught: changed-input failure leaves the old active vector queryable."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), limit=1)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    active_configuration_id = configuration_id(FakeEmbeddingAdapter.profile)
+    prior_configuration_id = configuration_id(PriorConfigurationAdapter.profile)
+    changed_hash = replace_generated_embedding_markdown(
+        config,
+        "# Changed generated article\n",
+    )
+
+    if failure_kind == "interrupted":
+        failing_adapter = InterruptingAdapter(after_response=True)
+        expected_error = SyntheticInterruption
+    else:
+        retryable = failure_kind == "retryable"
+
+        class ChangedInputFailureAdapter(FakeEmbeddingAdapter):
+            def embed_text(self, text: str) -> tuple[float, ...]:
+                raise JinaHostedAdapterError(
+                    "rate_limit" if retryable else "deterministic_request",
+                    retryable=retryable,
+                    status_code=429 if retryable else 413,
+                )
+
+        failing_adapter = ChangedInputFailureAdapter()
+        expected_error = JinaHostedAdapterError
+
+    with pytest.raises(expected_error):
+        run_embedding_pipeline(config, failing_adapter, limit=1)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT count(*)
+            FROM embeddings
+            WHERE configuration_id = ?
+            """,
+            [active_configuration_id],
+        ).fetchone() == (0,)
+        assert db.execute(
+            """
+            SELECT configuration_id, input_sha256
+            FROM embeddings
+            """
+        ).fetchall() == [
+            (
+                prior_configuration_id,
+                hashlib.sha256(b"#\n").hexdigest(),
+            )
+        ]
+        assert db.execute(
+            """
+            SELECT state
+            FROM embedding_work_items
+            WHERE configuration_id = ?
+            """,
+            [active_configuration_id],
+        ).fetchone() == (expected_state,)
+
+    if failure_kind == "terminal":
+        unchanged_replay = RecordingAdapter()
+        run_embedding_pipeline(config, unchanged_replay, limit=1)
+        assert unchanged_replay.calls == 0
+        changed_hash = replace_generated_embedding_markdown(
+            config,
+            "# Changed generated article again\n",
+        )
+
+    recovered = run_embedding_pipeline(config, RecordingAdapter(), limit=1)
+
+    assert recovered.succeeded == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT input_sha256
+            FROM embeddings
+            WHERE configuration_id = ?
+            """,
+            [active_configuration_id],
+        ).fetchall() == [(changed_hash,)]
+        assert db.execute(
+            """
+            SELECT count(*)
+            FROM embeddings
+            WHERE configuration_id = ?
+            """,
+            [active_configuration_id],
+        ).fetchone() == (1,)
+
+
+def test_registration_checkpoint_survives_later_registration_interruption(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: one large registration transaction loses earlier work."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+    real_register_work = embedding_pipeline_module._register_work
+    registrations = 0
+
+    def interrupt_second_registration(*args, **kwargs):
+        nonlocal registrations
+        registrations += 1
+        if registrations == 2:
+            raise SyntheticInterruption
+        return real_register_work(*args, **kwargs)
+
+    monkeypatch.setattr(
+        embedding_pipeline_module,
+        "_register_work",
+        interrupt_second_registration,
+    )
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(config, RecordingAdapter(), limit=2)
+    monkeypatch.setattr(
+        embedding_pipeline_module,
+        "_register_work",
+        real_register_work,
+    )
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT article_id, state FROM embedding_work_items"
+        ).fetchall() == [("wsj:SYNTHETIC-EMBEDDING", "queued")]
+        assert db.execute("SELECT articles FROM runs").fetchall() == [(2,)]
+
+    resumed = run_embedding_pipeline(config, RecordingAdapter(), limit=2)
+
+    assert resumed.succeeded == 2
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (2,)
 
 
 def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_path):

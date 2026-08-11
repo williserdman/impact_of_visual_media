@@ -208,8 +208,16 @@ def run_embedding_pipeline(
                 run_id,
                 configuration_identifier,
                 profile,
-                articles,
+                len(articles),
             )
+        for article in articles:
+            with catalog.transaction():
+                _register_work(
+                    catalog,
+                    run_id,
+                    configuration_identifier,
+                    article,
+                )
         for article in articles:
             state = _work_state(catalog, article, configuration_identifier)
             if state == _SUCCEEDED:
@@ -343,7 +351,7 @@ def _begin_run(
     run_id: str,
     configuration_identifier: str,
     profile: EmbeddingProfile,
-    articles: tuple[CanonicalArticle, ...],
+    article_count: int,
 ) -> None:
     catalog.connection.execute(
         """
@@ -368,10 +376,8 @@ def _begin_run(
         )
         VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, current_timestamp)
         """,
-        [run_id, configuration_identifier, len(articles)],
+        [run_id, configuration_identifier, article_count],
     )
-    for article in articles:
-        _register_work(catalog, run_id, configuration_identifier, article)
 
 
 def _register_work(
@@ -408,6 +414,19 @@ def _register_work(
     if state not in _WORK_STATES:
         raise EmbeddingPipelineError("invalid_work_state", article.article_id)
     if input_sha256 != article.cleaned_markdown_sha256:
+        catalog.connection.execute(
+            """
+            DELETE FROM embeddings
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+              AND input_sha256 <> ?
+            """,
+            [
+                article.article_id,
+                _ARTICLE_TEXT_MODALITY,
+                configuration_identifier,
+                article.cleaned_markdown_sha256,
+            ],
+        )
         catalog.connection.execute(
             """
             UPDATE embedding_work_items

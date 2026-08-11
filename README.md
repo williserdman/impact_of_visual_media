@@ -157,13 +157,17 @@ limit and the separate `--authorize-hosted-processing` assertion. A configured
 ```
 
 The run sends each selected canonical Markdown artifact in full with hosted
-truncation disabled. Each validated vector and its successful work checkpoint
-commit before the next article is attempted. Replaying the same limit reuses
-unchanged successes without another hosted request; retryable failures and
-interrupted in-progress work are attempted again, while terminal failures stay
-visible and are not retried implicitly. Limited runs never infer removal
-outside the selected scope. Success JSON includes content-free `reused`,
-`attempted`, `succeeded`, `retryable`, `terminal`, and `interrupted` counts.
+truncation disabled. Run/configuration setup and each selected item's
+queue/recovery registration use separate bounded transactions. Each validated
+vector and its successful work checkpoint commit before the next article is
+attempted. Replaying the same limit reuses unchanged successes without another
+hosted request; when input changes, the mismatched vector is removed atomically
+with checkpoint invalidation before replacement is attempted. Retryable
+failures and interrupted in-progress work are attempted again, while terminal
+failures stay visible and are not retried implicitly. Limited runs never infer
+removal outside the selected scope. Success JSON includes content-free
+`reused`, `attempted`, `succeeded`, `retryable`, `terminal`, and `interrupted`
+counts.
 
 Then inventory the configured archive without changing either source or
 generated state:

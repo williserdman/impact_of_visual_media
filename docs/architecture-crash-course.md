@@ -268,13 +268,17 @@ representation. Work state is one of `queued`, `in_progress`, `succeeded`,
 `retryable`, `terminal`, or `interrupted`. Only the exact modality
 `article_text` and dimension 2,048 are supported.
 
-The coordinator first commits content-free run and queued/recovered work state,
-then commits `in_progress` before each request. A validated vector insert,
-successful work transition, and run-count update share one bounded transaction.
-An interruption before that commit leaves requeueable work; an interruption
-after it reuses the proven success. Earlier article checkpoints therefore
-survive a later retryable, terminal, or interrupted attempt. Failure rows retain
-only stable adapter codes, numeric status/retry metadata, and attempt counts.
+The coordinator commits content-free run/configuration setup separately, then
+registers or recovers each selected item in its own bounded transaction. When
+the selected input identity changes, that registration transaction removes the
+same-configuration mismatched vector before replacement work begins. It then
+commits `in_progress` before each request. A validated vector insert, successful
+work transition, and run-count update share one bounded transaction. An
+interruption before that commit leaves requeueable work; an interruption after
+it reuses the proven success. Earlier registration and article checkpoints
+therefore survive a later retryable, terminal, or interrupted operation.
+Failure rows retain only stable adapter codes, numeric status/retry metadata,
+and attempt counts.
 
 The research query seam is:
 
