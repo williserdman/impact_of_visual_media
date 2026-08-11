@@ -20,7 +20,9 @@ DuckDB catalog, validates it, and removes the fixture. It never reads the
 configured archive or calls a network service. `wsj-embeddings pilot` is a
 separate, explicit hosted Jina v4 measurement command: it sends only fixed
 internally generated text and PNG bytes, never reads the archive or creates
-catalog/output state. There is still no `wsj-embeddings run` command.
+catalog/output state. `wsj-embeddings inventory` reads only canonical catalog
+metadata, while `wsj-embeddings run` exposes an explicitly authorized,
+strictly limited production Jina article-text scope.
 
 For the data model and maintenance guide, read the
 [architecture crash course](docs/architecture-crash-course.md).
@@ -73,11 +75,13 @@ smoke                     run the complete workflow on generated temporary fixtu
 Argument parsing, configuration, lock, schema, or unexpected pipeline errors
 can exit before a JSON summary is produced.
 
-The separate `wsj-embeddings` CLI has these two subcommands:
+The separate `wsj-embeddings` CLI has these four subcommands:
 
 ```text
-smoke  publish and validate one generated article text embedding
-pilot  send fixed generated text/image probes to hosted Jina v4
+smoke      publish and validate one generated article text embedding
+pilot      send fixed generated text/image probes to hosted Jina v4
+inventory  count canonical/text/header eligibility without credentials
+run        embed a positive lexical article-id limit after explicit authorization
 ```
 
 It prints this deterministic, content-free result on success:
@@ -96,12 +100,14 @@ boundaries. It may report a boundary as rejected; that is a measurement, not a
 silent truncation. Missing or rejected credentials return only a classified
 content-free error and create no catalog, output, or log artifact.
 
-Run a successful credentialed pilot before authorizing any future real-corpus
-embedding run. Automated tests never call the hosted API: they inject simulated
-HTTP responses into the same pilot/adapter seam.
+Run a successful credentialed pilot before authorizing a real-corpus embedding
+run. Automated tests never call the hosted API: they inject simulated HTTP
+responses or a fake adapter at the same public seams.
 
 `wsj-embeddings` does not accept the preprocessing TOML configuration and has
-no configured-output or real-corpus command yet.
+no implicit root defaults. `inventory` and `run` require explicit source,
+preprocessing-output, and embedding-output roots; resolving them must produce
+three pairwise-disjoint paths.
 
 ## Safe smoke-to-full workflow
 
@@ -125,7 +131,34 @@ contract without transmitting licensed content:
 
 Keep `JINA_API_KEY` out of shell history, configuration files, command output,
 and committed artifacts. Review the pilot's JSON result before allowing any
-future corpus scope; this repository does not yet expose such a scope.
+corpus scope.
+
+Inventory canonical embedding eligibility without a credential, adapter, or
+embedding-output mutation:
+
+```bash
+.venv/bin/wsj-embeddings inventory \
+  --source-root data/wsj_archive \
+  --preprocessing-output-root data/processed/wsj \
+  --embedding-output-root data/embeddings/wsj
+```
+
+An article-text run requires both a strictly positive lexical `article_id`
+limit and the separate `--authorize-hosted-processing` assertion. A configured
+`JINA_API_KEY` alone is insufficient:
+
+```bash
+.venv/bin/wsj-embeddings run \
+  --source-root data/wsj_archive \
+  --preprocessing-output-root data/processed/wsj \
+  --embedding-output-root data/embeddings/wsj \
+  --limit 5 \
+  --authorize-hosted-processing
+```
+
+The run sends each selected canonical Markdown artifact in full with hosted
+truncation disabled. Limited runs upsert only selected article-text embeddings
+and never infer removal outside the selected scope.
 
 Then inventory the configured archive without changing either source or
 generated state:
@@ -219,9 +252,8 @@ references only; the pipeline never downloads them.
 
 The downstream catalog is a separate schema-version-1 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
-output root. Ticket 01 exposes that catalog only through the generated smoke
-workflow and the injected-adapter Python coordinator; the CLI does not yet
-retain a configured embedding output for operators.
+output root. The generated smoke and injected-adapter coordinator exercise the
+same catalog contract as the explicitly rooted, limit-only production CLI.
 
 The catalog has exactly four base tables and no indexes:
 

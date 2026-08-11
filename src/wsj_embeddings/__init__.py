@@ -3,8 +3,16 @@
 from wsj_embeddings.adapters import EmbeddingAdapter, FakeEmbeddingAdapter
 from wsj_embeddings.catalog import EmbeddingCatalogError
 from wsj_embeddings.config import EmbeddingPipelineConfig
-from wsj_embeddings.models import EmbeddingProfile, EmbeddingRunResult
-from wsj_embeddings.pipeline import run_embedding_pipeline
+from wsj_embeddings.models import (
+    EmbeddingInventoryResult,
+    EmbeddingProfile,
+    EmbeddingRunResult,
+)
+from wsj_embeddings.pipeline import (
+    HostedProcessingAuthorizationError,
+    inventory_embedding_articles,
+    run_embedding_pipeline,
+)
 from wsj_embeddings.smoke import EmbeddingSmokeResult, run_embedding_smoke
 from wsj_embeddings.validate import (
     EmbeddingValidationIssue,
@@ -15,6 +23,7 @@ from wsj_embeddings.validate import (
 __all__ = [
     "EmbeddingAdapter",
     "EmbeddingCatalogError",
+    "EmbeddingInventoryResult",
     "EmbeddingPipelineConfig",
     "EmbeddingProfile",
     "EmbeddingRunResult",
@@ -22,6 +31,8 @@ __all__ = [
     "EmbeddingValidationIssue",
     "EmbeddingValidationResult",
     "FakeEmbeddingAdapter",
+    "HostedProcessingAuthorizationError",
+    "inventory_embedding_articles",
     "run_embedding_pipeline",
     "run_embedding_smoke",
     "validate_embedding_outputs",

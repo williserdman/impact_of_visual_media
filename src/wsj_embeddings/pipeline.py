@@ -21,7 +21,11 @@ from wsj_embeddings.canonical_markdown import (
 )
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingPipelineConfig
-from wsj_embeddings.models import CanonicalArticle, EmbeddingRunResult
+from wsj_embeddings.models import (
+    CanonicalArticle,
+    EmbeddingInventoryResult,
+    EmbeddingRunResult,
+)
 from wsj_pipeline.catalog import Catalog, CatalogError
 
 _ARTICLE_TEXT_MODALITY = "article_text"
@@ -43,6 +47,15 @@ class EmbeddingPipelineLockedError(RuntimeError):
 
 class EmbeddingOutputRootError(RuntimeError):
     """Raised before mutation when the embedding output root is unsafe."""
+
+
+class HostedProcessingAuthorizationError(RuntimeError):
+    """Raised before licensed Markdown can reach a hosted adapter."""
+
+    code = "hosted_processing_not_authorized"
+
+    def __init__(self) -> None:
+        super().__init__("hosted processing is not authorized")
 
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
@@ -151,6 +164,8 @@ def run_embedding_pipeline(
 ) -> EmbeddingRunResult:
     """Publish normalized article-text vectors for a bounded canonical slice."""
 
+    if not config.hosted_processing_authorized:
+        raise HostedProcessingAuthorizationError
     if limit < 1:
         raise ValueError("limit must be positive")
     config.validate()
@@ -222,6 +237,30 @@ def run_embedding_pipeline(
             ],
         )
     return EmbeddingRunResult(articles=len(prepared), embeddings=len(prepared))
+
+
+def inventory_embedding_articles(
+    config: EmbeddingPipelineConfig,
+) -> EmbeddingInventoryResult:
+    """Count canonical text/header eligibility without constructing an adapter."""
+
+    config.validate()
+    try:
+        with Catalog.read_only(config.preprocessing_catalog) as db:
+            Catalog.validate_schema(db)
+            row = db.execute(
+                """
+                SELECT count(*) AS canonical_articles,
+                       count(cleaned_markdown_path) AS eligible_text,
+                       count(header_image_path) AS header_present,
+                       count(*) - count(header_image_path) AS header_absent
+                FROM articles
+                """
+            ).fetchone()
+    except (CatalogError, duckdb.Error, OSError) as error:
+        raise EmbeddingPipelineError("preprocessing_catalog", "unknown") from error
+    assert row is not None
+    return EmbeddingInventoryResult(*(int(value) for value in row))
 
 
 def _read_articles(

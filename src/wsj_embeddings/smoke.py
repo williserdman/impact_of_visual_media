@@ -34,6 +34,7 @@ def run_embedding_smoke() -> EmbeddingSmokeResult:
             source_root=root / "source",
             preprocessing_output_root=root / "preprocessed",
             embedding_output_root=root / "embeddings",
+            hosted_processing_authorized=True,
         )
         config.source_root.mkdir()
         _write_canonical_preprocessing_fixture(config)

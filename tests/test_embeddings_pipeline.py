@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 
 import wsj_embeddings.canonical_markdown as canonical_markdown_module
 import wsj_embeddings.catalog as embedding_catalog_module
+import wsj_embeddings.pipeline as embedding_pipeline_module
 from wsj_embeddings import (
     EmbeddingCatalogError,
     EmbeddingPipelineConfig,
@@ -21,9 +23,11 @@ from wsj_embeddings import (
     validate_embedding_outputs,
 )
 from wsj_embeddings.catalog import EmbeddingCatalog
+from wsj_embeddings.config import EmbeddingConfigError
 from wsj_embeddings.pipeline import (
     EmbeddingPipelineError,
     EmbeddingPipelineLockedError,
+    HostedProcessingAuthorizationError,
     embedding_pipeline_lock,
 )
 from wsj_pipeline.catalog import ArticleRecord, Catalog
@@ -100,6 +104,7 @@ def write_generated_preprocessing_fixture(tmp_path: Path) -> EmbeddingPipelineCo
         source_root=source_root,
         preprocessing_output_root=preprocessing_output_root,
         embedding_output_root=embedding_output_root,
+        hosted_processing_authorized=True,
     )
 
 
@@ -111,6 +116,46 @@ def snapshot_fixture_inputs(config: EmbeddingPipelineConfig) -> dict[str, str]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def test_config_rejects_truthy_non_boolean_hosted_processing_authorization(
+    tmp_path,
+):
+    """Break caught: an arbitrary truthy value is treated as affirmative consent."""
+
+    with pytest.raises(EmbeddingConfigError, match="authorization must be boolean"):
+        EmbeddingPipelineConfig(
+            source_root=tmp_path / "source",
+            preprocessing_output_root=tmp_path / "preprocessed",
+            embedding_output_root=tmp_path / "embeddings",
+            hosted_processing_authorized="yes",  # type: ignore[arg-type]
+        )
+
+
+def test_coordinator_refuses_unauthorized_run_before_markdown_or_output(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: direct coordinator callers can bypass the CLI consent gate."""
+
+    config = replace(
+        write_generated_preprocessing_fixture(tmp_path),
+        hosted_processing_authorized=False,
+    )
+
+    def fail_if_markdown_read(*_args, **_kwargs):
+        raise AssertionError("unauthorized coordinator read canonical Markdown")
+
+    monkeypatch.setattr(
+        embedding_pipeline_module,
+        "read_canonical_markdown",
+        fail_if_markdown_read,
+    )
+
+    with pytest.raises(HostedProcessingAuthorizationError):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert not config.embedding_output_root.exists()
 
 
 def replace_markdown_with_unsafe_leaf(
@@ -159,6 +204,49 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
     assert vector_type == "FLOAT[2048]"
     assert row[7] == (1.0,) + (0.0,) * 2047
     assert snapshot_fixture_inputs(config) == before
+
+
+def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_path):
+    """Break caught: a later limited slice reconciles embeddings outside its scope."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    second_markdown = "# Second generated article\n"
+    second_path = config.preprocessing_output_root / "text" / "second.md"
+    second_path.write_text(second_markdown, encoding="utf-8")
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.replace_article(
+            ArticleRecord(
+                article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+                source_html_path="synthetic/second.html",
+                cleaned_markdown_path="text/second.md",
+                header_image_path=None,
+                inline_image_urls=(),
+                published_at_utc=datetime(2024, 1, 3, 15, 30, tzinfo=UTC),
+                publication_date_new_york=date(2024, 1, 3),
+                cleaned_markdown_sha256=hashlib.sha256(
+                    second_markdown.encode()
+                ).hexdigest(),
+            )
+        )
+
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=2)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            "DELETE FROM articles WHERE article_id = ?",
+            ["wsj:ZZZ-SYNTHETIC-EMBEDDING"],
+        )
+
+    result = run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert result == EmbeddingRunResult(articles=1, embeddings=1)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        article_ids = db.execute(
+            "SELECT article_id FROM embeddings ORDER BY article_id"
+        ).fetchall()
+    assert article_ids == [
+        ("wsj:SYNTHETIC-EMBEDDING",),
+        ("wsj:ZZZ-SYNTHETIC-EMBEDDING",),
+    ]
 
 
 def test_embedding_catalog_has_exact_version_one_schema(tmp_path):
@@ -461,6 +549,7 @@ def test_pipeline_refuses_malformed_preprocessing_catalog(tmp_path):
         source_root=source_root,
         preprocessing_output_root=preprocessing_output_root,
         embedding_output_root=tmp_path / "embeddings",
+        hosted_processing_authorized=True,
     )
 
     with pytest.raises(EmbeddingPipelineError, match="preprocessing_catalog"):

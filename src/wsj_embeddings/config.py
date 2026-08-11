@@ -1,4 +1,4 @@
-"""Path-safe configuration for the downstream embedding output."""
+"""Path-safe, explicitly authorized downstream embedding configuration."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ class EmbeddingPipelineConfig:
     source_root: Path
     preprocessing_output_root: Path
     embedding_output_root: Path
+    hosted_processing_authorized: bool = False
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -46,6 +47,10 @@ class EmbeddingPipelineConfig:
     def validate(self) -> None:
         """Reject equal or nested roots before any coordinator access."""
 
+        if not isinstance(self.hosted_processing_authorized, bool):
+            raise EmbeddingConfigError(
+                "hosted processing authorization must be boolean"
+            )
         roots = (
             self.source_root,
             self.preprocessing_output_root,

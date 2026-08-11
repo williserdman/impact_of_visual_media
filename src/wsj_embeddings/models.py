@@ -33,3 +33,13 @@ class EmbeddingRunResult:
 
     articles: int
     embeddings: int
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingInventoryResult:
+    """Content-free eligibility counts from the canonical article catalog."""
+
+    canonical_articles: int
+    eligible_text: int
+    header_present: int
+    header_absent: int
