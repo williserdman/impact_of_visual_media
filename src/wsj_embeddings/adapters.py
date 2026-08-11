@@ -23,6 +23,18 @@ _JINA_DIMENSIONS = 2048
 _SAFE_USAGE_FIELDS = frozenset(
     {"input_tokens", "output_tokens", "prompt_tokens", "total_tokens"}
 )
+_SAFE_RATE_LIMIT_HEADERS = frozenset(
+    {
+        "retry-after",
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+    }
+)
+_MAX_SAFE_RATE_LIMIT_VALUE = 1_000_000_000_000_000.0
 
 
 class EmbeddingAdapter(Protocol):
@@ -59,10 +71,10 @@ class JinaEmbeddingInput:
                 raise JinaHostedAdapterError("deterministic_request", retryable=False)
             try:
                 base64.b64decode(self.value, validate=True)
-            except (ValueError, TypeError) as error:
+            except (ValueError, TypeError):
                 raise JinaHostedAdapterError(
                     "deterministic_request", retryable=False
-                ) from error
+                ) from None
             return {"image": self.value}
         raise JinaHostedAdapterError("deterministic_request", retryable=False)
 
@@ -127,7 +139,7 @@ class JinaResponseMetadata:
 
     status_code: int
     model: str
-    rate_limit_headers: Mapping[str, str]
+    rate_limit_headers: Mapping[str, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +236,7 @@ class JinaEmbeddingAdapter:
         payload = self._decode_success(response)
         vectors = _validated_vectors(payload, expected_count=len(request_items))
         model = payload.get("model")
-        if not isinstance(model, str) or not model:
+        if model != _JINA_MODEL:
             raise JinaHostedAdapterError("invalid_response", retryable=False)
         return JinaEmbeddingResponse(
             vectors=vectors,
@@ -247,17 +259,17 @@ class JinaEmbeddingAdapter:
                 body=body,
                 timeout_seconds=self._timeout_seconds,
             )
-        except TimeoutError as error:
-            raise JinaHostedAdapterError("timeout", retryable=True) from error
-        except OSError as error:
-            raise JinaHostedAdapterError("connection", retryable=True) from error
+        except TimeoutError:
+            raise JinaHostedAdapterError("timeout", retryable=True) from None
+        except OSError:
+            raise JinaHostedAdapterError("connection", retryable=True) from None
 
     @staticmethod
     def _decode_success(response: JinaHttpResponse) -> Mapping[str, object]:
         try:
             payload = json.loads(response.body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise JinaHostedAdapterError("invalid_response", retryable=False) from error
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise JinaHostedAdapterError("invalid_response", retryable=False) from None
         if not isinstance(payload, dict):
             raise JinaHostedAdapterError("invalid_response", retryable=False)
         return payload
@@ -306,23 +318,33 @@ def _validated_vectors(
             or len(raw_embedding) != _JINA_DIMENSIONS
         ):
             raise JinaHostedAdapterError("invalid_response", retryable=False)
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in raw_embedding
+        ):
+            raise JinaHostedAdapterError("invalid_response", retryable=False)
         try:
             raw_vector = tuple(float(value) for value in raw_embedding)
-        except (TypeError, ValueError) as error:
-            raise JinaHostedAdapterError("invalid_response", retryable=False) from error
+        except (OverflowError, TypeError, ValueError):
+            raise JinaHostedAdapterError("invalid_response", retryable=False) from None
         if not all(math.isfinite(value) for value in raw_vector):
             raise JinaHostedAdapterError("invalid_response", retryable=False)
         norm = math.sqrt(sum(value * value for value in raw_vector))
         if not math.isfinite(norm) or norm == 0:
             raise JinaHostedAdapterError("invalid_response", retryable=False)
-        stored_vector = tuple(
-            struct.unpack("<f", struct.pack("<f", value / norm))[0]
-            for value in raw_vector
-        )
-        packed_stored = b"".join(struct.pack("<f", value) for value in stored_vector)
-        raw_representation = json.dumps(
-            raw_embedding, separators=(",", ":"), allow_nan=False
-        ).encode("utf-8")
+        try:
+            stored_vector = tuple(
+                struct.unpack("<f", struct.pack("<f", value / norm))[0]
+                for value in raw_vector
+            )
+            packed_stored = b"".join(
+                struct.pack("<f", value) for value in stored_vector
+            )
+            raw_representation = json.dumps(
+                raw_embedding, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+        except (OverflowError, TypeError, ValueError, struct.error):
+            raise JinaHostedAdapterError("invalid_response", retryable=False) from None
         by_index[index] = JinaEmbeddedVector(
             index=index,
             raw_vector=raw_vector,
@@ -341,31 +363,54 @@ def _safe_usage(value: object) -> dict[str, int | float]:
     usage: dict[str, int | float] = {}
     for key in _SAFE_USAGE_FIELDS:
         count = value.get(key)
-        if isinstance(count, bool) or not isinstance(count, (int, float)):
-            continue
-        if math.isfinite(float(count)):
+        number = _safe_numeric_value(count, maximum=None)
+        if number is not None:
             usage[key] = count
     return usage
 
 
-def _safe_rate_limit_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    return {
-        name.lower(): value
-        for name, value in headers.items()
-        if name.lower().startswith("x-ratelimit-") or name.lower() == "retry-after"
-    }
+def _safe_rate_limit_headers(headers: Mapping[str, str]) -> dict[str, float]:
+    safe_headers: dict[str, float] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        normalized_name = name.lower()
+        if normalized_name not in _SAFE_RATE_LIMIT_HEADERS:
+            continue
+        number = _safe_numeric_value(value, maximum=_MAX_SAFE_RATE_LIMIT_VALUE)
+        if number is not None:
+            safe_headers[normalized_name] = number
+    return safe_headers
 
 
 def _retry_after_seconds(headers: Mapping[str, str]) -> float | None:
     for name, value in headers.items():
-        if name.lower() != "retry-after":
+        if not isinstance(name, str) or name.lower() != "retry-after":
             continue
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            return None
-        return seconds if seconds >= 0 and math.isfinite(seconds) else None
+        return _safe_numeric_value(value, maximum=_MAX_SAFE_RATE_LIMIT_VALUE)
     return None
+
+
+def _safe_numeric_value(value: object, *, maximum: float | None) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            number = float(value)
+        except (OverflowError, TypeError, ValueError):
+            return None
+    elif isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    if maximum is not None and number > maximum:
+        return None
+    return number
 
 
 class FakeEmbeddingAdapter:

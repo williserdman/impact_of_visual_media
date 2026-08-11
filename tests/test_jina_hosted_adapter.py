@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import struct
+import traceback
 from collections.abc import Mapping
 
 import pytest
@@ -48,13 +49,19 @@ def _response(
     data: list[dict[str, object]],
     *,
     status: int = 200,
+    model: str = "jina-embeddings-v4",
+    headers: Mapping[str, str] | None = None,
 ) -> JinaHttpResponse:
     return JinaHttpResponse(
         status_code=status,
-        headers={"x-ratelimit-remaining-requests": "499"},
+        headers=(
+            {"x-ratelimit-remaining-requests": "499"}
+            if headers is None
+            else headers
+        ),
         body=json.dumps(
             {
-                "model": "jina-embeddings-v4",
+                "model": model,
                 "data": data,
                 "usage": {"prompt_tokens": 11, "total_tokens": 11},
             }
@@ -115,7 +122,7 @@ def test_hosted_adapter_serializes_fixed_contract_and_maps_indexed_vectors():
     assert result.usage == {"prompt_tokens": 11, "total_tokens": 11}
     assert result.response_metadata.status_code == 200
     assert result.response_metadata.rate_limit_headers == {
-        "x-ratelimit-remaining-requests": "499"
+        "x-ratelimit-remaining-requests": 499.0
     }
     expected_raw_hash = hashlib.sha256(
         json.dumps(_embedding(3.0, 0.0), separators=(",", ":")).encode()
@@ -228,3 +235,106 @@ def test_hosted_adapter_requires_only_named_environment_credential():
     assert raised.value.code == "missing_credential"
     assert raised.value.retryable is False
     assert "UNRELATED_SECRET" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("transport", "input_item", "secret"),
+    [
+        (
+            RecordingTransport(OSError("transport-secret-123")),
+            JinaEmbeddingInput.text("generated test text"),
+            "transport-secret-123",
+        ),
+        (
+            RecordingTransport(
+                JinaHttpResponse(
+                    200,
+                    {},
+                    b'{"response-secret-456":',
+                )
+            ),
+            JinaEmbeddingInput.text("generated test text"),
+            "response-secret-456",
+        ),
+        (
+            RecordingTransport(
+                _response([{"index": 0, "embedding": _embedding(1, 0)}])
+            ),
+            JinaEmbeddingInput.image_base64("image-secret-789!"),
+            "image-secret-789",
+        ),
+    ],
+)
+def test_hosted_adapter_suppresses_unsafe_exception_causes(
+    transport: RecordingTransport,
+    input_item: JinaEmbeddingInput,
+    secret: str,
+):
+    """Break caught: exception chaining exposes request or response content."""
+
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        _adapter(transport).embed((input_item,))
+
+    assert raised.value.__cause__ is None
+    assert secret not in "".join(traceback.format_exception(raised.value))
+
+
+def test_hosted_adapter_rejects_untrusted_model_metadata():
+    """Break caught: an arbitrary server model label reaches durable metadata."""
+
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        _adapter(
+            RecordingTransport(
+                _response(
+                    [{"index": 0, "embedding": _embedding(1, 0)}],
+                    model="model-secret-123",
+                )
+            )
+        ).embed((JinaEmbeddingInput.text("generated test text"),))
+
+    assert raised.value.code == "invalid_response"
+    assert "model-secret-123" not in "".join(traceback.format_exception(raised.value))
+
+
+def test_hosted_adapter_retains_only_numeric_named_rate_limit_metadata():
+    """Break caught: arbitrary rate-limit header strings become metadata."""
+
+    result = _adapter(
+        RecordingTransport(
+            _response(
+                [{"index": 0, "embedding": _embedding(1, 0)}],
+                headers={
+                    "X-RateLimit-Remaining-Requests": "499",
+                    "Retry-After": "3.5",
+                    "X-RateLimit-Remaining-Tokens": "header-secret-123",
+                    "X-Unrelated": "header-secret-456",
+                },
+            )
+        )
+    ).embed((JinaEmbeddingInput.text("generated test text"),))
+
+    assert result.response_metadata.rate_limit_headers == {
+        "x-ratelimit-remaining-requests": 499.0,
+        "retry-after": 3.5,
+    }
+
+
+@pytest.mark.parametrize("invalid_value", [True, "1.0"])
+def test_hosted_adapter_rejects_non_json_numeric_vector_values(invalid_value: object):
+    """Break caught: booleans or numeric strings are accepted as embeddings."""
+
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        _adapter(
+            RecordingTransport(
+                _response(
+                    [
+                        {
+                            "index": 0,
+                            "embedding": [invalid_value, *([0.0] * 2047)],
+                        }
+                    ]
+                )
+            )
+        ).embed((JinaEmbeddingInput.text("generated test text"),))
+
+    assert raised.value.code == "invalid_response"
