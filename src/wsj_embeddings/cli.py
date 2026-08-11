@@ -16,9 +16,13 @@ from wsj_embeddings.adapters import (
     JinaHostedAdapterError,
     JinaTransport,
 )
-from wsj_embeddings.config import EmbeddingPipelineConfig
+from wsj_embeddings.catalog import EmbeddingCatalogError
+from wsj_embeddings.config import EmbeddingConfigError, EmbeddingPipelineConfig
 from wsj_embeddings.pilot import run_jina_pilot
 from wsj_embeddings.pipeline import (
+    EmbeddingOutputRootError,
+    EmbeddingPipelineError,
+    EmbeddingPipelineLockedError,
     HostedProcessingAuthorizationError,
     inventory_embedding_articles,
     run_embedding_pipeline,
@@ -26,6 +30,21 @@ from wsj_embeddings.pipeline import (
 from wsj_embeddings.smoke import run_embedding_smoke
 
 _OPTION_NAME = re.compile(r"(?<!\w)(--?[A-Za-z][A-Za-z0-9-]*)")
+_OPERATIONAL_ERROR_CODES = {
+    EmbeddingConfigError: "invalid_configuration",
+    EmbeddingCatalogError: "embedding_catalog",
+    EmbeddingOutputRootError: "embedding_output_root",
+    EmbeddingPipelineLockedError: "embedding_pipeline_locked",
+}
+_OPERATIONAL_ERRORS = (
+    EmbeddingConfigError,
+    EmbeddingCatalogError,
+    EmbeddingOutputRootError,
+    EmbeddingPipelineLockedError,
+    EmbeddingPipelineError,
+    HostedProcessingAuthorizationError,
+    JinaHostedAdapterError,
+)
 
 
 class _ContentFreeArgumentParser(argparse.ArgumentParser):
@@ -84,6 +103,18 @@ def _config_from_args(
     )
 
 
+def _report_operational_error(error: Exception) -> int:
+    code = getattr(error, "code", None)
+    if code is None:
+        code = next(
+            value
+            for error_type, value in _OPERATIONAL_ERROR_CODES.items()
+            if isinstance(error, error_type)
+        )
+    print(json.dumps({"error": code}, sort_keys=True))
+    return 1
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -109,28 +140,28 @@ def main(
         print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "inventory":
-        result = inventory_embedding_articles(_config_from_args(args))
+        try:
+            result = inventory_embedding_articles(_config_from_args(args))
+        except _OPERATIONAL_ERRORS as error:
+            return _report_operational_error(error)
         print(json.dumps(asdict(result), sort_keys=True))
         return 0
     if args.command == "run":
-        config = _config_from_args(
-            args,
-            hosted_processing_authorized=args.authorize_hosted_processing,
-        )
-        if not config.hosted_processing_authorized:
-            error = HostedProcessingAuthorizationError()
-            print(json.dumps({"error": error.code}, sort_keys=True))
-            return 1
         try:
+            config = _config_from_args(
+                args,
+                hosted_processing_authorized=args.authorize_hosted_processing,
+            )
+            if not config.hosted_processing_authorized:
+                raise HostedProcessingAuthorizationError
             adapter = (
                 JinaEmbeddingAdapter(environment=environment, transport=transport)
                 if adapter_factory is None
                 else adapter_factory()
             )
-        except JinaHostedAdapterError as error:
-            print(json.dumps({"error": error.code}, sort_keys=True))
-            return 1
-        result = run_embedding_pipeline(config, adapter, limit=args.limit)
+            result = run_embedding_pipeline(config, adapter, limit=args.limit)
+        except _OPERATIONAL_ERRORS as error:
+            return _report_operational_error(error)
         print(json.dumps(asdict(result), sort_keys=True))
         return 0
     raise AssertionError(f"unhandled command {args.command}")

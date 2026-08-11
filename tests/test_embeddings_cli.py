@@ -6,9 +6,11 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
+import pytest
 
 import wsj_embeddings.pipeline as embedding_pipeline_module
 from wsj_embeddings import FakeEmbeddingAdapter
+from wsj_embeddings.adapters import JinaHttpResponse
 from wsj_embeddings.cli import main
 from wsj_pipeline.catalog import ArticleRecord, Catalog
 
@@ -234,3 +236,250 @@ def test_authorized_run_reports_missing_credential_without_output_state(
     assert json.loads(line) == {"error": "missing_credential"}
     assert line == f"{json.dumps(json.loads(line), sort_keys=True)}\n"
     assert not roots[2].exists()
+
+
+@pytest.mark.parametrize("catalog_state", ("missing", "malformed"))
+def test_inventory_reports_catalog_failure_as_one_content_free_json_result(
+    tmp_path: Path,
+    capsys,
+    catalog_state: str,
+) -> None:
+    """Break caught: expected inventory catalog failures escape as tracebacks."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+    catalog_path = roots[1] / "catalog.duckdb"
+    catalog_path.unlink()
+    if catalog_state == "malformed":
+        with duckdb.connect(str(catalog_path)) as db:
+            db.execute("CREATE TABLE unsafe_secret_table(value VARCHAR)")
+
+    exit_code = main(["inventory", *root_arguments(*roots)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == '{"error": "preprocessing_catalog"}\n'
+    assert captured.err == ""
+    assert str(tmp_path) not in captured.out
+    assert "unsafe_secret_table" not in captured.out
+    assert not roots[2].exists()
+
+
+def test_inventory_reports_invalid_root_configuration_without_path_disclosure(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Break caught: disjoint-root validation escapes with configured paths."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+
+    exit_code = main(
+        ["inventory", *root_arguments(roots[0], roots[1], roots[1])]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == '{"error": "invalid_configuration"}\n'
+    assert captured.err == ""
+    assert str(tmp_path) not in captured.out
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    (
+        ("timeout", "timeout"),
+        ("rate", "rate_limit"),
+        ("rejection", "deterministic_request"),
+    ),
+)
+def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
+    tmp_path: Path,
+    capsys,
+    failure: str,
+    expected_code: str,
+) -> None:
+    """Break caught: hosted request failures leak their cause or request content."""
+
+    class FailingTransport:
+        def post(self, url, *, headers, body, timeout_seconds):
+            del url, headers, body, timeout_seconds
+            if failure == "timeout":
+                raise TimeoutError("transport-secret")
+            return JinaHttpResponse(
+                status_code=429 if failure == "rate" else 413,
+                headers={"Retry-After": "2"},
+                body=b"response-body-secret",
+            )
+
+    roots = write_generated_cli_fixture(tmp_path)
+
+    exit_code = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--limit",
+            "1",
+            "--authorize-hosted-processing",
+        ],
+        environment={"JINA_API_KEY": "credential-secret"},
+        transport=FailingTransport(),
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == f'{json.dumps({"error": expected_code}, sort_keys=True)}\n'
+    assert captured.err == ""
+    for forbidden in (
+        str(tmp_path),
+        "credential-secret",
+        "transport-secret",
+        "response-body-secret",
+        "Complete A",
+    ):
+        assert forbidden not in captured.out
+    assert not roots[2].exists()
+
+
+def test_run_reports_existing_lock_without_removing_or_disclosing_it(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Break caught: a normal lock conflict raises a path-bearing traceback."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+    roots[2].mkdir()
+    lock_path = roots[2] / "pipeline.lock"
+    lock_path.write_text("existing-lock-secret\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--limit",
+            "1",
+            "--authorize-hosted-processing",
+        ],
+        adapter_factory=FakeEmbeddingAdapter,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == '{"error": "embedding_pipeline_locked"}\n'
+    assert captured.err == ""
+    assert str(tmp_path) not in captured.out
+    assert "existing-lock-secret" not in captured.out
+    assert lock_path.read_text(encoding="utf-8") == "existing-lock-secret\n"
+    assert not (roots[2] / "catalog.duckdb").exists()
+
+
+def test_run_reports_unsafe_output_root_without_writing_through_it(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Break caught: unsafe output rejection escapes or writes through a symlink."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+    outside = tmp_path / "outside-secret"
+    outside.mkdir()
+
+    def replace_output_before_coordinator():
+        roots[2].symlink_to(outside, target_is_directory=True)
+        return FakeEmbeddingAdapter()
+
+    exit_code = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--limit",
+            "1",
+            "--authorize-hosted-processing",
+        ],
+        adapter_factory=replace_output_before_coordinator,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == '{"error": "embedding_output_root"}\n'
+    assert captured.err == ""
+    assert str(tmp_path) not in captured.out
+    assert list(outside.iterdir()) == []
+
+
+def test_run_reports_malformed_embedding_catalog_and_cleans_owned_lock(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Break caught: incompatible embedding output raises schema exception text."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+    roots[2].mkdir()
+    with duckdb.connect(str(roots[2] / "catalog.duckdb")) as db:
+        db.execute("CREATE TABLE legacy_secret_table(value INTEGER)")
+
+    exit_code = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--limit",
+            "1",
+            "--authorize-hosted-processing",
+        ],
+        adapter_factory=FakeEmbeddingAdapter,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == '{"error": "embedding_catalog"}\n'
+    assert captured.err == ""
+    assert str(tmp_path) not in captured.out
+    assert "legacy_secret_table" not in captured.out
+    assert not (roots[2] / "pipeline.lock").exists()
+
+
+def test_run_reports_pipeline_failure_without_article_identity_or_path(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Break caught: classified pipeline errors expose article or filesystem data."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+    (roots[1] / "text" / "article-1.md").unlink()
+
+    exit_code = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--limit",
+            "1",
+            "--authorize-hosted-processing",
+        ],
+        adapter_factory=FakeEmbeddingAdapter,
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == '{"error": "read_markdown"}\n'
+    assert captured.err == ""
+    for forbidden in (str(tmp_path), "wsj:A", "article-1.md", "Complete A"):
+        assert forbidden not in captured.out
+    assert not roots[2].exists()
+
+
+def test_run_does_not_swallow_programmer_errors(tmp_path: Path) -> None:
+    """Break caught: the operational mapping catches arbitrary programming bugs."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+
+    def broken_factory():
+        raise AssertionError("programmer error remains visible")
+
+    with pytest.raises(AssertionError, match="programmer error remains visible"):
+        main(
+            [
+                "run",
+                *root_arguments(*roots),
+                "--limit",
+                "1",
+                "--authorize-hosted-processing",
+            ],
+            adapter_factory=broken_factory,
+        )

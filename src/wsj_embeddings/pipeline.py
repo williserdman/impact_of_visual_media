@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import duckdb
 
-from wsj_embeddings.adapters import EmbeddingAdapter
+from wsj_embeddings.adapters import EmbeddingAdapter, JinaHostedAdapterError
 from wsj_embeddings.canonical_markdown import (
     CanonicalMarkdownError,
     read_canonical_markdown,
@@ -304,6 +304,8 @@ def _prepare_embedding(
         raise EmbeddingPipelineError("invalid_utf8", article.article_id) from error
     try:
         embedded = adapter.embed_text(markdown)
+    except JinaHostedAdapterError:
+        raise
     except Exception as error:
         raise EmbeddingPipelineError("embed_text", article.article_id) from error
     vector = _normalized_vector(embedded, article.article_id)
