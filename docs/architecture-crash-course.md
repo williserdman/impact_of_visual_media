@@ -122,9 +122,9 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/adapters.py` | injected adapter protocol, deterministic fake adapter, and fixed hosted Jina adapter | corpus selection or output mutation |
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
-| `wsj_embeddings/catalog.py` | separate schema version 6, exact read-only inspection, bounded lifecycle/generation transactions | preprocessing catalog mutation |
-| `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection, text/image encoding, hashes, and publication | hosted credential loading |
-| `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, hash, metadata, and vector checks | repair |
+| `wsj_embeddings/catalog.py` | separate schema version 7, exact read-only inspection, bounded lifecycle/generation transactions | preprocessing catalog mutation |
+| `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection, text/image encoding, composite derivation, hashes, and publication | hosted credential loading |
+| `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
 | `wsj_embeddings/pilot.py` | fixed generated hosted text/image/boundary probes and content-free observations | corpus or filesystem input/output |
 | `wsj_embeddings/cli.py` | `smoke`, `pilot`, credential-free `inventory`, and authorized limit-only production `run` with bounded reprocess | preprocessing mutation or full embedding reconciliation |
@@ -248,12 +248,12 @@ WHERE publication_date_new_york
 ORDER BY published_at_utc, article_id;
 ```
 
-### Separate text and header-image embedding catalog
+### Separate text, header-image, and multimodal embedding catalog
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 6 has exactly six base tables, no views, and
-no indexes. Versions 1 through 5 and malformed output are refused without
+catalog. Embedding schema version 7 has exactly seven base tables, no views,
+and no indexes. Versions 1 through 6 and malformed output are refused without
 migration.
 
 | Table | Ordered columns and DuckDB types | Primary key |
@@ -264,6 +264,7 @@ migration.
 | `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
+| `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
 
 `configuration_id` is the SHA-256 of compact, key-sorted JSON for every
 `EmbeddingProfile` field: model alias and observed hosted model/API metadata,
@@ -272,12 +273,15 @@ long-text aggregation, image rules/transform, multimodal formula, and client
 configuration version. The current long-text identity is
 `single-input-provider-pooling-v1`, describing the single provider-pooled
 vector returned for the complete input. `input_sha256` covers the exact UTF-8
-canonical Markdown or exact local header-image bytes. After finite/nonzero checks and L2 normalization,
+canonical Markdown or exact local header-image bytes; for a composite it covers
+only the two source-generation identities/vector hashes and formula. After
+finite/nonzero checks and L2 normalization,
 values are rounded to
 float32; `stored_vector_sha256` covers their concatenated little-endian float32
 representation. Work state is one of `queued`, `in_progress`, `succeeded`,
 `retryable`, `terminal`, `interrupted`, or `not_applicable`. The supported
-vector modalities are `article_text` and `header_image`, both dimension 2,048.
+vector modalities are `article_text`, `header_image`, and `multimodal_article`,
+all dimension 2,048.
 `source_relative_path` records the archive-relative path only for image work;
 no-header work keeps both path and input hash null and never publishes a vector.
 The only other null input hash is the narrow missing-header retryable
@@ -291,6 +295,17 @@ missing-leaf disposition.
 `last_run_id` tracks the latest observation/attempt. `generation_run_id` is
 nullable except on successful active work, is immutable across reuse, and is
 the provenance copied into history when that vector is superseded.
+
+After both normalized source vectors succeed for the same article and immutable
+configuration, the coordinator computes their equal-weight midpoint, L2
+normalizes and float32-quantizes it, and publishes the composite without a
+hosted request. `multimodal_embedding_provenance` append-only rows name the two
+source generation IDs, their stored-vector hashes, and
+`l2-normalize-0.5-text-0.5-image-v1`. Missing, failed, stale, or
+different-configuration sources cannot publish a composite. Recovery with two
+unchanged successful sources creates only the missing composite; changing one
+source archives/removes its dependent composite while preserving the other
+source, sibling articles, and other configurations.
 
 The coordinator commits content-free run/configuration setup separately, then
 registers or recovers each selected item in its own bounded transaction. When
@@ -316,7 +331,9 @@ both the header generation and its multimodal dependent before persisting
 `not_applicable`. Validation derives required header keys from canonical
 articles with article-text work and reconciles the latest run's absent/failed
 claims against durable header states, so deleting a checkpoint cannot erase a
-coverage gap.
+coverage gap. It also resolves active and historical multimodal source links and
+recomputes every active composite, so a self-consistent altered vector or wrong
+source reference is still reported without mutation.
 
 The research query seam is:
 
@@ -333,7 +350,7 @@ SELECT
     c.normalization
 FROM embeddings AS e
 JOIN embedding_configurations AS c USING (configuration_id)
-WHERE e.modality = 'article_text'
+WHERE e.modality IN ('article_text', 'header_image', 'multimodal_article')
   AND e.configuration_id = '<configuration_id>'
 ORDER BY e.published_at_utc, e.article_id;
 ```
@@ -593,7 +610,8 @@ orphan cleanup, and full-only missing-source reconciliation.
 ## 13. Downstream boundaries
 
 - The fixture tracer queries `articles`, opens `cleaned_markdown_path` and any
-  source-relative `header_image_path`, and writes both vector modalities outside the preprocessing output root. It
+  source-relative `header_image_path`, and writes all three vector modalities
+  outside the preprocessing output root. It
   proves this seam only for generated inputs and an injected fake adapter.
 - The embedding coordinator anchors its disjoint output directory with
   no-follow descriptors. Catalog and lock mutations remain relative to that
@@ -610,8 +628,8 @@ orphan cleanup, and full-only missing-source reconciliation.
   boundary.
 - Local header images are opened read-only without following symlinks, hashed,
   and base64-encoded from the same bytes for Jina. Remote `inline_image_urls`
-  are never fetched, decoded, queued, or embedded. A later multimodal job may
-  combine independently published text and header-image vectors.
+  are never fetched, decoded, queued, or embedded. The bounded coordinator
+  combines independently published text and header-image vectors locally.
 - A temporal graph uses `published_at_utc` as the event instant and
   `publication_date_new_york` for trading-day/calendar joins.
 - Market data, labels, models, summaries, graphs, and backtests get their own

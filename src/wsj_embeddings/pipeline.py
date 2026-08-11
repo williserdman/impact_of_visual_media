@@ -1,14 +1,15 @@
-"""Read-only preprocessing consumption and text/image embedding publication."""
+"""Read-only preprocessing consumption and multimodal embedding publication."""
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import math
 import os
 import stat
 import struct
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ from wsj_embeddings.models import (
     CanonicalArticle,
     EmbeddingInventoryResult,
     EmbeddingModality,
+    EmbeddingProfile,
     EmbeddingRunResult,
     WorkState,
 )
@@ -35,8 +37,10 @@ from wsj_pipeline.catalog import Catalog, CatalogError
 
 _ARTICLE_TEXT_MODALITY = EmbeddingModality.ARTICLE_TEXT.value
 _HEADER_IMAGE_MODALITY = EmbeddingModality.HEADER_IMAGE.value
+_MULTIMODAL_ARTICLE_MODALITY = EmbeddingModality.MULTIMODAL_ARTICLE.value
 _VECTOR_DIMENSIONS = 2048
 _DETERMINISTIC_IMAGE_ATTEMPT_LIMIT = 3
+_MULTIMODAL_FORMULA = "l2-normalize-0.5-text-0.5-image-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +197,7 @@ def run_embedding_pipeline(
     limit: int,
     reprocess: bool = False,
 ) -> EmbeddingRunResult:
-    """Publish independent text/header vectors for a bounded canonical slice."""
+    """Publish source and derived vectors for a bounded canonical slice."""
 
     if not config.hosted_processing_authorized:
         raise HostedProcessingAuthorizationError
@@ -325,6 +329,15 @@ def run_embedding_pipeline(
                         stored_vector_sha256=vector_hash,
                         vector=vector,
                     )
+        for article in articles:
+            with catalog.transaction():
+                _publish_multimodal_article(
+                    catalog,
+                    run_id,
+                    configuration_identifier,
+                    profile,
+                    article,
+                )
         result = catalog.run_result(run_id)
     return result
 
@@ -509,6 +522,163 @@ def _prepare_header_image(
         input_sha256=hashlib.sha256(image_bytes).hexdigest(),
         data=image_bytes,
     )
+
+
+def _publish_multimodal_article(
+    catalog: EmbeddingCatalog,
+    run_id: str,
+    configuration_identifier: str,
+    profile: EmbeddingProfile,
+    article: CanonicalArticle,
+) -> None:
+    """Publish the derived vector only from two current successful sources."""
+
+    sources = catalog.multimodal_sources(
+        article_id=article.article_id,
+        configuration_identifier=configuration_identifier,
+    )
+    if sources is None:
+        return
+    formula_version = str(profile.multimodal_formula)
+    if formula_version != _MULTIMODAL_FORMULA:
+        raise EmbeddingPipelineError(
+            "unsupported_multimodal_formula",
+            article.article_id,
+        )
+    (
+        text_generation_run_id,
+        text_vector_sha256,
+        text_values,
+        image_generation_run_id,
+        image_vector_sha256,
+        image_values,
+    ) = sources
+    text_vector = _verified_source_vector(
+        text_values,
+        str(text_vector_sha256),
+        article.article_id,
+    )
+    image_vector = _verified_source_vector(
+        image_values,
+        str(image_vector_sha256),
+        article.article_id,
+    )
+    vector = _multimodal_vector(text_vector, image_vector, article.article_id)
+    provenance_payload = json.dumps(
+        {
+            "formula_version": formula_version,
+            "header_image_generation_run_id": str(image_generation_run_id),
+            "header_image_stored_vector_sha256": str(image_vector_sha256),
+            "text_generation_run_id": str(text_generation_run_id),
+            "text_stored_vector_sha256": str(text_vector_sha256),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    input_sha256 = hashlib.sha256(provenance_payload).hexdigest()
+    try:
+        state = catalog.register_work(
+            run_id=run_id,
+            article_id=article.article_id,
+            modality=_MULTIMODAL_ARTICLE_MODALITY,
+            configuration_identifier=configuration_identifier,
+            source_relative_path=None,
+            input_sha256=input_sha256,
+            published_at_utc=article.published_at_utc,
+            publication_date_new_york=article.publication_date_new_york,
+            reprocess=False,
+        )
+    except ValueError as error:
+        raise EmbeddingPipelineError(
+            "invalid_work_state", article.article_id
+        ) from error
+    if state.is_reusable_success:
+        generation_row = catalog.connection.execute(
+            """
+            SELECT generation_run_id
+            FROM embedding_work_items
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                article.article_id,
+                _MULTIMODAL_ARTICLE_MODALITY,
+                configuration_identifier,
+            ],
+        ).fetchone()
+        if generation_row is None or not catalog.multimodal_provenance_matches(
+            article_id=article.article_id,
+            configuration_identifier=configuration_identifier,
+            generation_run_id=str(generation_row[0]),
+            text_generation_run_id=str(text_generation_run_id),
+            text_stored_vector_sha256=str(text_vector_sha256),
+            header_image_generation_run_id=str(image_generation_run_id),
+            header_image_stored_vector_sha256=str(image_vector_sha256),
+            formula_version=formula_version,
+        ):
+            raise EmbeddingPipelineError(
+                "invalid_multimodal_provenance", article.article_id
+            )
+        catalog.increment_run(run_id, "reused")
+        return
+    catalog.publish_multimodal_success(
+        run_id=run_id,
+        article_id=article.article_id,
+        configuration_identifier=configuration_identifier,
+        published_at_utc=article.published_at_utc,
+        publication_date_new_york=article.publication_date_new_york,
+        dimensions=_VECTOR_DIMENSIONS,
+        input_sha256=input_sha256,
+        stored_vector_sha256=_vector_hash(vector),
+        vector=vector,
+        text_generation_run_id=str(text_generation_run_id),
+        text_stored_vector_sha256=str(text_vector_sha256),
+        header_image_generation_run_id=str(image_generation_run_id),
+        header_image_stored_vector_sha256=str(image_vector_sha256),
+        formula_version=formula_version,
+    )
+
+
+def _verified_source_vector(
+    values: Sequence[float],
+    expected_hash: str,
+    article_id: str,
+) -> tuple[float, ...]:
+    """Reject a persisted source that is not the exact normalized generation."""
+
+    try:
+        vector = tuple(float(value) for value in values)
+    except (TypeError, ValueError) as error:
+        raise EmbeddingPipelineError("invalid_source_vector", article_id) from error
+    if (
+        len(vector) != _VECTOR_DIMENSIONS
+        or not all(math.isfinite(value) for value in vector)
+        or _vector_hash(vector) != expected_hash
+    ):
+        raise EmbeddingPipelineError("invalid_source_vector", article_id)
+    norm = math.sqrt(sum(value * value for value in vector))
+    if not math.isclose(norm, 1.0, rel_tol=0.0, abs_tol=1e-5):
+        raise EmbeddingPipelineError("invalid_source_vector", article_id)
+    return vector
+
+
+def _multimodal_vector(
+    text_vector: tuple[float, ...],
+    image_vector: tuple[float, ...],
+    article_id: str,
+) -> tuple[float, ...]:
+    """Return the float32 L2-normalized equal midpoint of normalized sources."""
+
+    normalized_text = _normalized_vector(text_vector, article_id)
+    normalized_image = _normalized_vector(image_vector, article_id)
+    midpoint = tuple(
+        0.5 * text_value + 0.5 * image_value
+        for text_value, image_value in zip(
+            normalized_text,
+            normalized_image,
+            strict=True,
+        )
+    )
+    return _normalized_vector(midpoint, article_id)
 
 
 def _vector_hash(vector: tuple[float, ...]) -> str:

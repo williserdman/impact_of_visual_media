@@ -115,6 +115,17 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("superseded_reason", "VARCHAR", True, None, False),
         ("superseded_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
+    "multimodal_embedding_provenance": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("text_generation_run_id", "VARCHAR", True, None, False),
+        ("text_stored_vector_sha256", "VARCHAR", True, None, False),
+        ("header_image_generation_run_id", "VARCHAR", True, None, False),
+        ("header_image_stored_vector_sha256", "VARCHAR", True, None, False),
+        ("formula_version", "VARCHAR", True, None, False),
+        ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
 }
 EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     ("metadata", ("key",)),
@@ -128,6 +139,10 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     (
         "embedding_generation_history",
         ("article_id", "modality", "configuration_id", "generation_run_id"),
+    ),
+    (
+        "multimodal_embedding_provenance",
+        ("article_id", "configuration_id", "generation_run_id"),
     ),
 }
 
@@ -272,92 +287,6 @@ def declare_missing_generated_header_image(
             [relative_path],
         )
     return relative_path
-
-
-def seed_generated_modality_success(
-    config: EmbeddingPipelineConfig,
-    *,
-    article_id: str,
-    modality: str,
-    profile: EmbeddingProfile,
-) -> None:
-    """Seed one content-free modality generation through generated fixture SQL."""
-
-    configuration_identifier = configuration_id(profile)
-    vector = [1.0, *(0.0 for _ in range(2047))]
-    vector_sha256 = hashlib.sha256(
-        b"".join(struct.pack("<f", value) for value in vector)
-    ).hexdigest()
-    input_sha256 = hashlib.sha256(
-        f"{article_id}:{modality}:{configuration_identifier}".encode()
-    ).hexdigest()
-    source_relative_path = (
-        "synthetic/seed-header.png" if modality == "header_image" else None
-    )
-    with duckdb.connect(str(config.embedding_catalog)) as db:
-        generation_run_id = db.execute(
-            """
-            SELECT run_id FROM runs
-            WHERE configuration_id = ?
-            ORDER BY started_at
-            LIMIT 1
-            """,
-            [configuration_identifier],
-        ).fetchone()[0]
-        published_at_utc, publication_date_new_york = db.execute(
-            """
-            SELECT published_at_utc, publication_date_new_york
-            FROM embeddings
-            WHERE article_id = ? AND modality = 'article_text'
-              AND configuration_id = ?
-            """,
-            [article_id, configuration_identifier],
-        ).fetchone()
-        db.execute(
-            """
-            INSERT INTO embedding_work_items
-            VALUES (?, ?, ?, ?, ?, 'succeeded', 1, NULL, NULL, NULL, ?, ?,
-                    current_timestamp)
-            ON CONFLICT (article_id, modality, configuration_id)
-            DO UPDATE SET
-                source_relative_path = excluded.source_relative_path,
-                input_sha256 = excluded.input_sha256,
-                state = excluded.state,
-                attempt_count = excluded.attempt_count,
-                error_code = NULL,
-                status_code = NULL,
-                retry_after_seconds = NULL,
-                last_run_id = excluded.last_run_id,
-                generation_run_id = excluded.generation_run_id,
-                updated_at = now()
-            """,
-            [
-                article_id,
-                modality,
-                configuration_identifier,
-                source_relative_path,
-                input_sha256,
-                generation_run_id,
-                generation_run_id,
-            ],
-        )
-        db.execute(
-            """
-            INSERT INTO embeddings
-            VALUES (?, ?, ?, ?, ?, ?, 2048, ?, ?, ?)
-            """,
-            [
-                article_id,
-                modality,
-                configuration_identifier,
-                source_relative_path,
-                published_at_utc,
-                publication_date_new_york,
-                input_sha256,
-                vector_sha256,
-                vector,
-            ],
-        )
 
 
 class SyntheticInterruption(BaseException):
@@ -588,8 +517,8 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
     assert snapshot_fixture_inputs(config) == before
 
 
-def test_pipeline_publishes_text_and_exact_local_header_image_independently(tmp_path):
-    """Break caught: local image bytes/path are omitted or remote URLs are queued."""
+def test_pipeline_publishes_all_three_modalities_with_source_provenance(tmp_path):
+    """Break caught: eligible source vectors do not produce the exact composite."""
 
     config = write_generated_preprocessing_fixture(tmp_path)
     image_bytes = b"\x89PNG\r\n\x1a\nsynthetic-header-image"
@@ -600,9 +529,9 @@ def test_pipeline_publishes_text_and_exact_local_header_image_independently(tmp_
 
     assert result == EmbeddingRunResult(
         articles=1,
-        embeddings=2,
+        embeddings=3,
         attempted=2,
-        succeeded=2,
+        succeeded=3,
     )
     assert adapter.calls == 1
     assert adapter.image_calls == 1
@@ -626,6 +555,38 @@ def test_pipeline_publishes_text_and_exact_local_header_image_independently(tmp_
             ORDER BY modality
             """
         ).fetchall()
+        provenance = db.execute(
+            """
+            SELECT p.article_id, p.configuration_id, p.generation_run_id,
+                   p.text_generation_run_id, p.text_stored_vector_sha256,
+                   p.header_image_generation_run_id,
+                   p.header_image_stored_vector_sha256, p.formula_version,
+                   text_work.generation_run_id, text_vector.stored_vector_sha256,
+                   image_work.generation_run_id, image_vector.stored_vector_sha256,
+                   composite_work.generation_run_id
+            FROM multimodal_embedding_provenance AS p
+            JOIN embedding_work_items AS text_work
+              ON text_work.article_id = p.article_id
+             AND text_work.configuration_id = p.configuration_id
+             AND text_work.modality = 'article_text'
+            JOIN embeddings AS text_vector
+              ON text_vector.article_id = p.article_id
+             AND text_vector.configuration_id = p.configuration_id
+             AND text_vector.modality = 'article_text'
+            JOIN embedding_work_items AS image_work
+              ON image_work.article_id = p.article_id
+             AND image_work.configuration_id = p.configuration_id
+             AND image_work.modality = 'header_image'
+            JOIN embeddings AS image_vector
+              ON image_vector.article_id = p.article_id
+             AND image_vector.configuration_id = p.configuration_id
+             AND image_vector.modality = 'header_image'
+            JOIN embedding_work_items AS composite_work
+              ON composite_work.article_id = p.article_id
+             AND composite_work.configuration_id = p.configuration_id
+             AND composite_work.modality = 'multimodal_article'
+            """
+        ).fetchone()
     assert rows[0][:4] == (
         "wsj:SYNTHETIC-EMBEDDING",
         "article_text",
@@ -641,11 +602,140 @@ def test_pipeline_publishes_text_and_exact_local_header_image_independently(tmp_
     )
     assert len(rows[1][5]) == 64
     assert rows[1][6] == (0.0, 1.0) + (0.0,) * 2046
+    assert rows[2][:5] == (
+        "wsj:SYNTHETIC-EMBEDDING",
+        "multimodal_article",
+        configuration_identifier,
+        None,
+        rows[2][4],
+    )
+    assert len(rows[2][4]) == 64
+    assert rows[2][6] == (
+        0.7071067690849304,
+        0.7071067690849304,
+    ) + (0.0,) * 2046
     assert work == [
         ("article_text", None, hashlib.sha256(b"#\n").hexdigest(), "succeeded", 1),
         ("header_image", relative_path, image_sha256, "succeeded", 1),
+        ("multimodal_article", None, rows[2][4], "succeeded", 0),
     ]
+    assert provenance is not None
+    assert provenance[:2] == (
+        "wsj:SYNTHETIC-EMBEDDING",
+        configuration_identifier,
+    )
+    assert provenance[2] == provenance[12]
+    assert provenance[3:7] == provenance[8:12]
+    assert provenance[7] == "l2-normalize-0.5-text-0.5-image-v1"
     assert validate_embedding_outputs(config) == EmbeddingValidationResult(issues=())
+
+
+def test_composite_only_recovery_reuses_both_source_generations(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: composite recovery calls the adapter or rewrites a source."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated recovery image")
+
+    def interrupt_composite(*args, **kwargs):
+        raise SyntheticInterruption
+
+    monkeypatch.setattr(
+        embedding_pipeline_module,
+        "_publish_multimodal_article",
+        interrupt_composite,
+        raising=False,
+    )
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        source_generations = db.execute(
+            """
+            SELECT modality, generation_run_id
+            FROM embedding_work_items
+            WHERE modality IN ('article_text', 'header_image')
+            ORDER BY modality
+            """
+        ).fetchall()
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [("article_text",), ("header_image",)]
+
+    monkeypatch.undo()
+    adapter = RecordingMultimodalAdapter()
+    recovered = run_embedding_pipeline(config, adapter, limit=1)
+
+    assert recovered == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        reused=2,
+        succeeded=1,
+    )
+    assert adapter.calls == 0
+    assert adapter.image_calls == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, generation_run_id
+            FROM embedding_work_items
+            WHERE modality IN ('article_text', 'header_image')
+            ORDER BY modality
+            """
+        ).fetchall() == source_generations
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [
+            ("article_text",),
+            ("header_image",),
+            ("multimodal_article",),
+        ]
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_code"),
+    (
+        ("vector", "multimodal_vector_mismatch"),
+        ("source_link", "invalid_multimodal_source_linkage"),
+    ),
+)
+def test_validator_recomputes_composite_and_checks_immutable_linkage(
+    tmp_path,
+    damage,
+    expected_code,
+):
+    """Break caught: self-consistent composite corruption passes validation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated validation image")
+    run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        if damage == "vector":
+            replacement = [0.0, 0.0, 1.0, *([0.0] * 2045)]
+            replacement_hash = hashlib.sha256(
+                b"".join(struct.pack("<f", value) for value in replacement)
+            ).hexdigest()
+            db.execute(
+                """
+                UPDATE embeddings
+                SET vector = ?, stored_vector_sha256 = ?
+                WHERE modality = 'multimodal_article'
+                """,
+                [replacement, replacement_hash],
+            )
+        else:
+            db.execute(
+                """
+                UPDATE multimodal_embedding_provenance
+                SET text_stored_vector_sha256 = ?
+                """,
+                [hashlib.sha256(b"wrong source link").hexdigest()],
+            )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert expected_code in codes
 
 
 def test_absent_then_added_header_image_does_not_regenerate_successful_text(tmp_path):
@@ -692,10 +782,10 @@ def test_absent_then_added_header_image_does_not_regenerate_successful_text(tmp_
 
     assert second == EmbeddingRunResult(
         articles=1,
-        embeddings=1,
+        embeddings=2,
         reused=1,
         attempted=1,
-        succeeded=1,
+        succeeded=2,
     )
     assert second_adapter.calls == 0
     assert second_adapter.image_calls == 1
@@ -769,10 +859,10 @@ def test_missing_header_is_retryable_and_recovers_without_regenerating_text(tmp_
 
     assert recovered == EmbeddingRunResult(
         articles=1,
-        embeddings=1,
+        embeddings=2,
         reused=1,
         attempted=1,
-        succeeded=1,
+        succeeded=2,
     )
     assert recovered_adapter.calls == 0
     assert recovered_adapter.image_calls == 1
@@ -818,10 +908,10 @@ def test_retryable_header_failure_recovers_without_regenerating_text(tmp_path):
 
     assert recovered == EmbeddingRunResult(
         articles=1,
-        embeddings=1,
+        embeddings=2,
         reused=1,
         attempted=1,
-        succeeded=1,
+        succeeded=2,
     )
     assert recovered_adapter.calls == 0
     assert recovered_adapter.image_calls == 1
@@ -830,7 +920,7 @@ def test_retryable_header_failure_recovers_without_regenerating_text(tmp_path):
     unchanged_adapter = RecordingMultimodalAdapter()
     unchanged = run_embedding_pipeline(config, unchanged_adapter, limit=1)
 
-    assert unchanged.reused == 2
+    assert unchanged.reused == 3
     assert unchanged_adapter.calls == 0
     assert unchanged_adapter.image_calls == 0
 
@@ -973,18 +1063,19 @@ def test_changed_header_bytes_invalidate_only_image_and_same_config_multimodal(
     run_embedding_pipeline(config, PriorConfigurationAdapter(), limit=1)
     current_profile = FakeEmbeddingAdapter.profile
     prior_profile = PriorConfigurationAdapter.profile
-    seed_generated_modality_success(
-        config,
-        article_id="wsj:SYNTHETIC-EMBEDDING",
-        modality="multimodal_article",
-        profile=current_profile,
-    )
-    seed_generated_modality_success(
-        config,
-        article_id="wsj:SYNTHETIC-EMBEDDING",
-        modality="multimodal_article",
-        profile=prior_profile,
-    )
+    current_id = configuration_id(current_profile)
+    prior_id = configuration_id(prior_profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        original_generations = dict(
+            db.execute(
+                """
+                SELECT modality, generation_run_id
+                FROM embedding_work_items
+                WHERE configuration_id = ?
+                """,
+                [current_id],
+            ).fetchall()
+        )
     replacement = b"generated image two"
     (config.source_root / relative_path).write_bytes(replacement)
     adapter = RecordingMultimodalAdapter()
@@ -993,15 +1084,13 @@ def test_changed_header_bytes_invalidate_only_image_and_same_config_multimodal(
 
     assert result == EmbeddingRunResult(
         articles=1,
-        embeddings=1,
+        embeddings=2,
         reused=1,
         attempted=1,
-        succeeded=1,
+        succeeded=2,
     )
     assert adapter.calls == 0
     assert adapter.image_calls == 1
-    current_id = configuration_id(current_profile)
-    prior_id = configuration_id(prior_profile)
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
             """
@@ -1013,10 +1102,33 @@ def test_changed_header_bytes_invalidate_only_image_and_same_config_multimodal(
             [
                 (current_id, "article_text"),
                 (current_id, "header_image"),
+                (current_id, "multimodal_article"),
                 (prior_id, "article_text"),
                 (prior_id, "header_image"),
                 (prior_id, "multimodal_article"),
             ]
+        )
+        current_generations = dict(
+            db.execute(
+                """
+                SELECT modality, generation_run_id
+                FROM embedding_work_items
+                WHERE configuration_id = ?
+                """,
+                [current_id],
+            ).fetchall()
+        )
+        assert (
+            current_generations["article_text"]
+            == original_generations["article_text"]
+        )
+        assert (
+            current_generations["header_image"]
+            != original_generations["header_image"]
+        )
+        assert (
+            current_generations["multimodal_article"]
+            != original_generations["multimodal_article"]
         )
         assert db.execute(
             """
@@ -1030,6 +1142,10 @@ def test_changed_header_bytes_invalidate_only_image_and_same_config_multimodal(
             ("header_image", "input_changed"),
             ("multimodal_article", "input_changed"),
         ]
+    assert validate_embedding_outputs(
+        config,
+        configuration_id=current_id,
+    ) == EmbeddingValidationResult(issues=())
 
 
 def test_removed_canonical_header_invalidates_image_and_same_config_multimodal(
@@ -1043,13 +1159,6 @@ def test_removed_canonical_header_invalidates_image_and_same_config_multimodal(
     run_embedding_pipeline(config, PriorConfigurationAdapter(), limit=1)
     current_profile = FakeEmbeddingAdapter.profile
     prior_profile = PriorConfigurationAdapter.profile
-    for profile in (current_profile, prior_profile):
-        seed_generated_modality_success(
-            config,
-            article_id="wsj:SYNTHETIC-EMBEDDING",
-            modality="multimodal_article",
-            profile=profile,
-        )
     with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
         catalog.connection.execute(
             """
@@ -1113,6 +1222,10 @@ def test_removed_canonical_header_invalidates_image_and_same_config_multimodal(
             ("header_image", "input_changed"),
             ("multimodal_article", "input_changed"),
         ]
+    assert validate_embedding_outputs(
+        config,
+        configuration_id=current_id,
+    ) == EmbeddingValidationResult(issues=())
 
 
 def test_interrupted_header_attempt_recovers_without_rebuying_successful_text(
@@ -1149,10 +1262,10 @@ def test_interrupted_header_attempt_recovers_without_rebuying_successful_text(
 
     assert recovered == EmbeddingRunResult(
         articles=1,
-        embeddings=1,
+        embeddings=2,
         reused=1,
         attempted=1,
-        succeeded=1,
+        succeeded=2,
         interrupted=1,
     )
     assert recovered_adapter.calls == 0
@@ -1278,7 +1391,7 @@ def test_image_supersession_after_reuse_retains_true_generation_run(tmp_path):
         ).fetchone()[0]
 
     replay = run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
-    assert replay.reused == 2
+    assert replay.reused == 3
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         generation_run_id, replay_observation_run = db.execute(
             """
@@ -1471,30 +1584,30 @@ def test_text_supersession_invalidates_only_its_multimodal_dependent(
         article_id=sibling_id,
         markdown="# Unchanged sibling\n",
     )
+    attach_generated_header_image(config, b"generated target header")
+    sibling_header = "synthetic/sibling_main_image.png"
+    (config.source_root / sibling_header).write_bytes(b"generated sibling header")
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            "UPDATE articles SET header_image_path = ? WHERE article_id = ?",
+            [sibling_header, sibling_id],
+        )
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=2)
     run_embedding_pipeline(config, PriorConfigurationAdapter(), limit=2)
     current_profile = FakeEmbeddingAdapter.profile
     prior_profile = PriorConfigurationAdapter.profile
-    attach_generated_header_image(config, b"generated independent header")
-    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
-    seed_generated_modality_success(
-        config,
-        article_id=target_id,
-        modality="multimodal_article",
-        profile=current_profile,
-    )
-    seed_generated_modality_success(
-        config,
-        article_id=sibling_id,
-        modality="multimodal_article",
-        profile=current_profile,
-    )
-    seed_generated_modality_success(
-        config,
-        article_id=target_id,
-        modality="multimodal_article",
-        profile=prior_profile,
-    )
+    current_id = configuration_id(current_profile)
+    prior_id = configuration_id(prior_profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        before = {
+            (article_id, config_id, modality): generation_run_id
+            for article_id, config_id, modality, generation_run_id in db.execute(
+                """
+                SELECT article_id, configuration_id, modality, generation_run_id
+                FROM embedding_work_items
+                """
+            ).fetchall()
+        }
     if not reprocess:
         replace_generated_embedding_markdown(config, "# Changed generated article\n")
 
@@ -1505,33 +1618,39 @@ def test_text_supersession_invalidates_only_its_multimodal_dependent(
         reprocess=reprocess,
     )
 
-    current_id = configuration_id(current_profile)
-    prior_id = configuration_id(prior_profile)
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
-        assert db.execute(
-            """
-            SELECT article_id, modality, configuration_id
-            FROM embeddings
-            WHERE modality != 'article_text'
-            ORDER BY article_id, modality, configuration_id
-            """
-        ).fetchall() == sorted(
-            [
-                (target_id, "header_image", current_id),
-                (target_id, "multimodal_article", prior_id),
-                (sibling_id, "multimodal_article", current_id),
-            ]
+        after = {
+            (article_id, config_id, modality): generation_run_id
+            for article_id, config_id, modality, generation_run_id in db.execute(
+                """
+                SELECT article_id, configuration_id, modality, generation_run_id
+                FROM embedding_work_items
+                """
+            ).fetchall()
+        }
+        assert after[(target_id, current_id, "article_text")] != before[
+            (target_id, current_id, "article_text")
+        ]
+        assert after[(target_id, current_id, "multimodal_article")] != before[
+            (target_id, current_id, "multimodal_article")
+        ]
+        assert after[(target_id, current_id, "header_image")] == before[
+            (target_id, current_id, "header_image")
+        ]
+        assert all(
+            after[key] == generation_run_id
+            for key, generation_run_id in before.items()
+            if key[0] == sibling_id or key[1] == prior_id
         )
         assert db.execute(
             """
-            SELECT state, attempt_count, error_code, status_code,
-                   retry_after_seconds
+            SELECT state
             FROM embedding_work_items
-            WHERE article_id = ? AND modality = 'multimodal_article'
-              AND configuration_id = ?
+            WHERE article_id = ? AND configuration_id = ?
+              AND modality = 'multimodal_article'
             """,
             [target_id, current_id],
-        ).fetchone() == ("queued", 0, None, None, None)
+        ).fetchone() == ("succeeded",)
         assert db.execute(
             """
             SELECT modality, superseded_reason
@@ -2077,7 +2196,9 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_six_header_disposition_schema(tmp_path):
+def test_embedding_catalog_has_exact_version_seven_multimodal_provenance_schema(
+    tmp_path,
+):
     database_path = tmp_path / "catalog.duckdb"
 
     with EmbeddingCatalog.open(database_path):
@@ -2149,12 +2270,13 @@ def test_embedding_catalog_has_exact_version_six_header_disposition_schema(tmp_p
         "embedding_work_items": "BASE TABLE",
         "embeddings": "BASE TABLE",
         "metadata": "BASE TABLE",
+        "multimodal_embedding_provenance": "BASE TABLE",
         "runs": "BASE TABLE",
     }
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "6")]
+    assert metadata == [("schema_version", "7")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -2278,6 +2400,34 @@ def test_pipeline_refuses_version_five_embedding_catalog_without_migration(tmp_p
         assert {
             row[1] for row in db.execute("PRAGMA table_info('runs')").fetchall()
         }.isdisjoint({"header_absent", "header_failed"})
+
+
+def test_pipeline_refuses_version_six_embedding_catalog_without_migration(tmp_path):
+    """Break caught: multimodal provenance is silently added to derived output."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        if "multimodal_embedding_provenance" in {
+            row[0] for row in db.execute("SHOW TABLES").fetchall()
+        }:
+            db.execute("DROP TABLE multimodal_embedding_provenance")
+        db.execute("UPDATE metadata SET value = '6' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("6",)
+        assert "multimodal_embedding_provenance" not in {
+            row[0] for row in db.execute("SHOW TABLES").fetchall()
+        }
 
 
 def test_validator_accepts_fresh_synthetic_embedding_output(tmp_path):
@@ -2560,8 +2710,17 @@ def test_validator_rejects_malformed_generation_modality_and_path(
             """
             UPDATE embedding_generation_history
             SET modality = ?, source_relative_path = ?
+            WHERE modality = ?
             """,
-            [history_modality, history_path],
+            [
+                history_modality,
+                history_path,
+                (
+                    "article_text"
+                    if history_modality == "article_text"
+                    else "header_image"
+                ),
+            ],
         )
 
     codes = {issue.code for issue in validate_embedding_outputs(config).issues}

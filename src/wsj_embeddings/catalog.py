@@ -1,4 +1,4 @@
-"""Minimal versioned DuckDB catalog for text and local-image embeddings."""
+"""Versioned DuckDB catalog for source and derived article embeddings."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from wsj_embeddings.models import (
     WorkState,
 )
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "6"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "7"
 
 _EMBEDDING_CATALOG_TABLES = {
     "embedding_configurations",
@@ -31,6 +31,7 @@ _EMBEDDING_CATALOG_TABLES = {
     "embedding_work_items",
     "embeddings",
     "metadata",
+    "multimodal_embedding_provenance",
     "runs",
 }
 _TABLE_COLUMNS = {
@@ -110,6 +111,17 @@ _TABLE_COLUMNS = {
         ("superseded_reason", "VARCHAR", True, None, False),
         ("superseded_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
+    "multimodal_embedding_provenance": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("text_generation_run_id", "VARCHAR", True, None, False),
+        ("text_stored_vector_sha256", "VARCHAR", True, None, False),
+        ("header_image_generation_run_id", "VARCHAR", True, None, False),
+        ("header_image_stored_vector_sha256", "VARCHAR", True, None, False),
+        ("formula_version", "VARCHAR", True, None, False),
+        ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
 }
 _KEY_CONSTRAINTS = {
     ("metadata", "PRIMARY KEY", ("key",)),
@@ -129,6 +141,11 @@ _KEY_CONSTRAINTS = {
         "embedding_generation_history",
         "PRIMARY KEY",
         ("article_id", "modality", "configuration_id", "generation_run_id"),
+    ),
+    (
+        "multimodal_embedding_provenance",
+        "PRIMARY KEY",
+        ("article_id", "configuration_id", "generation_run_id"),
     ),
 }
 _EXPECTED_CONSTRAINTS = Counter(
@@ -605,6 +622,24 @@ class EmbeddingCatalog:
                     superseded_at TIMESTAMP WITH TIME ZONE NOT NULL,
                     PRIMARY KEY (
                         article_id, modality, configuration_id, generation_run_id
+                    )
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS multimodal_embedding_provenance (
+                    article_id VARCHAR NOT NULL,
+                    configuration_id VARCHAR NOT NULL,
+                    generation_run_id VARCHAR NOT NULL,
+                    text_generation_run_id VARCHAR NOT NULL,
+                    text_stored_vector_sha256 VARCHAR NOT NULL,
+                    header_image_generation_run_id VARCHAR NOT NULL,
+                    header_image_stored_vector_sha256 VARCHAR NOT NULL,
+                    formula_version VARCHAR NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    PRIMARY KEY (
+                        article_id, configuration_id, generation_run_id
                     )
                 )
                 """
@@ -1314,6 +1349,140 @@ class EmbeddingCatalog:
             WHERE run_id = ?
             """,
             [run_id],
+        )
+
+    def multimodal_sources(
+        self,
+        *,
+        article_id: str,
+        configuration_identifier: str,
+    ) -> tuple[object, ...] | None:
+        """Return two current successful source generations under one config."""
+
+        row = self.connection.execute(
+            """
+            SELECT text_work.generation_run_id,
+                   text_vector.stored_vector_sha256, text_vector.vector,
+                   image_work.generation_run_id,
+                   image_vector.stored_vector_sha256, image_vector.vector
+            FROM embedding_work_items AS text_work
+            JOIN embeddings AS text_vector
+              ON text_vector.article_id = text_work.article_id
+             AND text_vector.modality = text_work.modality
+             AND text_vector.configuration_id = text_work.configuration_id
+             AND text_vector.input_sha256 = text_work.input_sha256
+            JOIN embedding_work_items AS image_work
+              ON image_work.article_id = text_work.article_id
+             AND image_work.configuration_id = text_work.configuration_id
+             AND image_work.modality = ?
+             AND image_work.state = ?
+             AND image_work.generation_run_id IS NOT NULL
+            JOIN embeddings AS image_vector
+              ON image_vector.article_id = image_work.article_id
+             AND image_vector.modality = image_work.modality
+             AND image_vector.configuration_id = image_work.configuration_id
+             AND image_vector.input_sha256 = image_work.input_sha256
+            WHERE text_work.article_id = ? AND text_work.modality = ?
+              AND text_work.configuration_id = ? AND text_work.state = ?
+              AND text_work.generation_run_id IS NOT NULL
+            """,
+            [
+                EmbeddingModality.HEADER_IMAGE.value,
+                WorkState.SUCCEEDED.value,
+                article_id,
+                EmbeddingModality.ARTICLE_TEXT.value,
+                configuration_identifier,
+                WorkState.SUCCEEDED.value,
+            ],
+        ).fetchone()
+        return None if row is None else tuple(row)
+
+    def multimodal_provenance_matches(
+        self,
+        *,
+        article_id: str,
+        configuration_identifier: str,
+        generation_run_id: str,
+        text_generation_run_id: str,
+        text_stored_vector_sha256: str,
+        header_image_generation_run_id: str,
+        header_image_stored_vector_sha256: str,
+        formula_version: str,
+    ) -> bool:
+        """Check the immutable provenance for one reusable composite."""
+
+        row = self.connection.execute(
+            """
+            SELECT count(*)
+            FROM multimodal_embedding_provenance
+            WHERE article_id = ? AND configuration_id = ?
+              AND generation_run_id = ? AND text_generation_run_id = ?
+              AND text_stored_vector_sha256 = ?
+              AND header_image_generation_run_id = ?
+              AND header_image_stored_vector_sha256 = ?
+              AND formula_version = ?
+            """,
+            [
+                article_id,
+                configuration_identifier,
+                generation_run_id,
+                text_generation_run_id,
+                text_stored_vector_sha256,
+                header_image_generation_run_id,
+                header_image_stored_vector_sha256,
+                formula_version,
+            ],
+        ).fetchone()
+        return bool(row[0])
+
+    def publish_multimodal_success(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        published_at_utc: object,
+        publication_date_new_york: object,
+        dimensions: int,
+        input_sha256: str,
+        stored_vector_sha256: str,
+        vector: Sequence[float],
+        text_generation_run_id: str,
+        text_stored_vector_sha256: str,
+        header_image_generation_run_id: str,
+        header_image_stored_vector_sha256: str,
+        formula_version: str,
+    ) -> None:
+        """Atomically publish a derived vector and immutable source linkage."""
+
+        self.publish_success(
+            run_id=run_id,
+            article_id=article_id,
+            modality=EmbeddingModality.MULTIMODAL_ARTICLE.value,
+            configuration_identifier=configuration_identifier,
+            source_relative_path=None,
+            published_at_utc=published_at_utc,
+            publication_date_new_york=publication_date_new_york,
+            dimensions=dimensions,
+            input_sha256=input_sha256,
+            stored_vector_sha256=stored_vector_sha256,
+            vector=vector,
+        )
+        self.connection.execute(
+            """
+            INSERT INTO multimodal_embedding_provenance
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            """,
+            [
+                article_id,
+                configuration_identifier,
+                run_id,
+                text_generation_run_id,
+                text_stored_vector_sha256,
+                header_image_generation_run_id,
+                header_image_stored_vector_sha256,
+                formula_version,
+            ],
         )
 
     def increment_run(self, run_id: str, column: str) -> None:

@@ -1,4 +1,4 @@
-"""Credential-free integrity validation for published text/image embeddings."""
+"""Credential-free integrity validation for published article embeddings."""
 
 from __future__ import annotations
 
@@ -23,7 +23,14 @@ from wsj_embeddings.models import (
     SupersessionReason,
     WorkState,
 )
-from wsj_embeddings.pipeline import _VECTOR_DIMENSIONS
+from wsj_embeddings.pipeline import (
+    _MULTIMODAL_FORMULA,
+    _VECTOR_DIMENSIONS,
+    EmbeddingPipelineError,
+    _multimodal_vector,
+    _vector_hash,
+    _verified_source_vector,
+)
 from wsj_embeddings.source_image import (
     SourceImageError,
     is_safe_source_relative_path,
@@ -90,6 +97,11 @@ def validate_embedding_outputs(
                         catalog.connection,
                         config,
                         articles,
+                        selected_configuration_id,
+                        issues,
+                    )
+                    _validate_multimodal_provenance(
+                        catalog.connection,
                         selected_configuration_id,
                         issues,
                     )
@@ -241,10 +253,19 @@ def _validate_run_coverage(
             JOIN embedding_configurations USING (configuration_id)
             WHERE runs.configuration_id = ?
             GROUP BY runs.configuration_id
+        ), all_generations AS (
+            SELECT e.configuration_id, w.generation_run_id
+            FROM embeddings AS e
+            JOIN embedding_work_items AS w
+              USING (article_id, modality, configuration_id)
+            WHERE e.configuration_id = ?
+            UNION ALL
+            SELECT configuration_id, generation_run_id
+            FROM embedding_generation_history
+            WHERE configuration_id = ?
         ), vector_counts AS (
             SELECT configuration_id, count(*) AS published_embeddings
-            FROM embeddings
-            WHERE configuration_id = ?
+            FROM all_generations
             GROUP BY configuration_id
         )
         SELECT count(*)
@@ -252,7 +273,7 @@ def _validate_run_coverage(
         LEFT JOIN vector_counts USING (configuration_id)
         WHERE coalesce(published_embeddings, 0) < expected_embeddings
         """,
-        [configuration_id, configuration_id],
+        [configuration_id, configuration_id, configuration_id],
     ).fetchone()[0]
     if missing:
         _append(
@@ -604,6 +625,7 @@ def _validate_embeddings(
         if modality not in {
             EmbeddingModality.ARTICLE_TEXT.value,
             EmbeddingModality.HEADER_IMAGE.value,
+            EmbeddingModality.MULTIMODAL_ARTICLE.value,
         }:
             _append(
                 issues,
@@ -656,6 +678,237 @@ def _validate_embeddings(
                 input_sha256,
                 issues,
             )
+
+
+def _validate_multimodal_provenance(
+    connection: duckdb.DuckDBPyConnection,
+    configuration_id: str,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Recompute active composites and verify immutable generation linkage."""
+
+    formula_row = connection.execute(
+        """
+        SELECT multimodal_formula
+        FROM embedding_configurations
+        WHERE configuration_id = ?
+        """,
+        [configuration_id],
+    ).fetchone()
+    if formula_row is None:
+        return
+    configuration_formula = str(formula_row[0])
+    provenance_rows = connection.execute(
+        """
+        SELECT article_id, generation_run_id, text_generation_run_id,
+               text_stored_vector_sha256, header_image_generation_run_id,
+               header_image_stored_vector_sha256, formula_version
+        FROM multimodal_embedding_provenance
+        WHERE configuration_id = ?
+        """,
+        [configuration_id],
+    ).fetchall()
+    provenance_by_generation = {
+        (str(row[0]), str(row[1])): tuple(row[2:]) for row in provenance_rows
+    }
+    for row in provenance_rows:
+        (
+            article_id,
+            composite_generation_run_id,
+            text_generation_run_id,
+            text_vector_sha256,
+            image_generation_run_id,
+            image_vector_sha256,
+            formula_version,
+        ) = row
+        provenance_valid = (
+            formula_version == configuration_formula == _MULTIMODAL_FORMULA
+            and _is_sha256(text_vector_sha256)
+            and _is_sha256(image_vector_sha256)
+            and _generation_reference_exists(
+                connection,
+                article_id=str(article_id),
+                modality=EmbeddingModality.MULTIMODAL_ARTICLE.value,
+                configuration_id=configuration_id,
+                generation_run_id=str(composite_generation_run_id),
+                stored_vector_sha256=None,
+            )
+        )
+        if not provenance_valid:
+            _append(
+                issues,
+                "invalid_multimodal_provenance",
+                "multimodal provenance is incomplete or inconsistent",
+            )
+        if not all(
+            (
+                _generation_reference_exists(
+                    connection,
+                    article_id=str(article_id),
+                    modality=modality,
+                    configuration_id=configuration_id,
+                    generation_run_id=str(generation_run_id),
+                    stored_vector_sha256=str(vector_sha256),
+                )
+                for modality, generation_run_id, vector_sha256 in (
+                    (
+                        EmbeddingModality.ARTICLE_TEXT.value,
+                        text_generation_run_id,
+                        text_vector_sha256,
+                    ),
+                    (
+                        EmbeddingModality.HEADER_IMAGE.value,
+                        image_generation_run_id,
+                        image_vector_sha256,
+                    ),
+                )
+            )
+        ):
+            _append(
+                issues,
+                "invalid_multimodal_source_linkage",
+                "multimodal provenance does not identify its source generations",
+            )
+
+    active_rows = connection.execute(
+        """
+        SELECT composite.article_id, composite.vector,
+               composite.stored_vector_sha256, composite_work.generation_run_id,
+               text_work.generation_run_id, text.stored_vector_sha256, text.vector,
+               image_work.generation_run_id, image.stored_vector_sha256, image.vector
+        FROM embeddings AS composite
+        JOIN embedding_work_items AS composite_work
+          USING (article_id, modality, configuration_id)
+        LEFT JOIN embedding_work_items AS text_work
+          ON text_work.article_id = composite.article_id
+         AND text_work.configuration_id = composite.configuration_id
+         AND text_work.modality = 'article_text'
+         AND text_work.state = 'succeeded'
+        LEFT JOIN embeddings AS text
+          ON text.article_id = text_work.article_id
+         AND text.configuration_id = text_work.configuration_id
+         AND text.modality = text_work.modality
+         AND text.input_sha256 = text_work.input_sha256
+        LEFT JOIN embedding_work_items AS image_work
+          ON image_work.article_id = composite.article_id
+         AND image_work.configuration_id = composite.configuration_id
+         AND image_work.modality = 'header_image'
+         AND image_work.state = 'succeeded'
+        LEFT JOIN embeddings AS image
+          ON image.article_id = image_work.article_id
+         AND image.configuration_id = image_work.configuration_id
+         AND image.modality = image_work.modality
+         AND image.input_sha256 = image_work.input_sha256
+        WHERE composite.configuration_id = ?
+          AND composite.modality = 'multimodal_article'
+        """,
+        [configuration_id],
+    ).fetchall()
+    for row in active_rows:
+        (
+            article_id,
+            composite_values,
+            composite_vector_sha256,
+            composite_generation_run_id,
+            text_generation_run_id,
+            text_vector_sha256,
+            text_values,
+            image_generation_run_id,
+            image_vector_sha256,
+            image_values,
+        ) = row
+        provenance = provenance_by_generation.get(
+            (str(article_id), str(composite_generation_run_id))
+        )
+        expected_linkage = (
+            str(text_generation_run_id),
+            str(text_vector_sha256),
+            str(image_generation_run_id),
+            str(image_vector_sha256),
+            configuration_formula,
+        )
+        if (
+            provenance is None
+            or None
+            in (
+                text_generation_run_id,
+                text_vector_sha256,
+                text_values,
+                image_generation_run_id,
+                image_vector_sha256,
+                image_values,
+            )
+            or provenance != expected_linkage
+        ):
+            _append(
+                issues,
+                "invalid_multimodal_source_linkage",
+                "multimodal provenance does not identify its source generations",
+            )
+            continue
+        try:
+            text_vector = _verified_source_vector(
+                text_values,
+                str(text_vector_sha256),
+                str(article_id),
+            )
+            image_vector = _verified_source_vector(
+                image_values,
+                str(image_vector_sha256),
+                str(article_id),
+            )
+            expected_vector = _multimodal_vector(
+                text_vector,
+                image_vector,
+                str(article_id),
+            )
+        except EmbeddingPipelineError:
+            continue
+        if (
+            tuple(composite_values) != expected_vector
+            or composite_vector_sha256 != _vector_hash(expected_vector)
+        ):
+            _append(
+                issues,
+                "multimodal_vector_mismatch",
+                "multimodal vector differs from its normalized source midpoint",
+            )
+
+
+def _generation_reference_exists(
+    connection: duckdb.DuckDBPyConnection,
+    *,
+    article_id: str,
+    modality: str,
+    configuration_id: str,
+    generation_run_id: str,
+    stored_vector_sha256: str | None,
+) -> bool:
+    """Resolve one generation against active or superseded content-free state."""
+
+    active = connection.execute(
+        """
+        SELECT e.stored_vector_sha256
+        FROM embedding_work_items AS w
+        JOIN embeddings AS e USING (article_id, modality, configuration_id)
+        WHERE w.article_id = ? AND w.modality = ? AND w.configuration_id = ?
+          AND w.generation_run_id = ?
+        """,
+        [article_id, modality, configuration_id, generation_run_id],
+    ).fetchone()
+    history = connection.execute(
+        """
+        SELECT stored_vector_sha256
+        FROM embedding_generation_history
+        WHERE article_id = ? AND modality = ? AND configuration_id = ?
+          AND generation_run_id = ?
+        """,
+        [article_id, modality, configuration_id, generation_run_id],
+    ).fetchone()
+    references = tuple(row for row in (active, history) if row is not None)
+    if stored_vector_sha256 is None:
+        return bool(references)
+    return any(row[0] == stored_vector_sha256 for row in references)
 
 
 def _validate_generation_history(

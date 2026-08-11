@@ -201,13 +201,13 @@ def test_authorized_limited_run_embeds_complete_lexical_winner_with_fake(
         "articles": 1,
         "attempted": 2,
         "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
-        "embeddings": 2,
+        "embeddings": 3,
         "header_absent": 0,
         "header_failed": 0,
         "interrupted": 0,
         "retryable": 0,
         "reused": 0,
-        "succeeded": 2,
+        "succeeded": 3,
         "terminal": 0,
     }
     assert line == f"{json.dumps(json.loads(line), sort_keys=True)}\n"
@@ -231,6 +231,12 @@ def test_authorized_limited_run_embeds_complete_lexical_winner_with_fake(
         (
             "wsj:A",
             "header_image",
+            datetime(2024, 1, 3, 15, 30, tzinfo=UTC),
+            date(2024, 1, 3),
+        ),
+        (
+            "wsj:A",
+            "multimodal_article",
             datetime(2024, 1, 3, 15, 30, tzinfo=UTC),
             date(2024, 1, 3),
         ),
@@ -278,21 +284,28 @@ def test_authorized_reprocess_flag_regenerates_only_the_limited_cli_scope(
         "articles": 1,
         "attempted": 1,
         "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
-        "embeddings": 1,
+        "embeddings": 2,
         "header_absent": 0,
         "header_failed": 0,
         "interrupted": 0,
         "retryable": 0,
         "reused": 1,
-        "succeeded": 1,
+        "succeeded": 2,
         "terminal": 0,
     }
     assert adapter.texts == ["# Complete A\n\nFirst paragraph.\n"]
     with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
-        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (3,)
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (4,)
         assert db.execute(
-            "SELECT article_id FROM embedding_generation_history"
-        ).fetchall() == [("wsj:A",)]
+            """
+            SELECT article_id, modality
+            FROM embedding_generation_history
+            ORDER BY modality
+            """
+        ).fetchall() == [
+            ("wsj:A", "article_text"),
+            ("wsj:A", "multimodal_article"),
+        ]
 
 
 @pytest.mark.parametrize(

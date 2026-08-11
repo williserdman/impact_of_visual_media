@@ -144,7 +144,7 @@ embedding-output mutation:
   --embedding-output-root data/embeddings/wsj
 ```
 
-An article-text run requires both a strictly positive lexical `article_id`
+An embedding run requires both a strictly positive lexical `article_id`
 limit and the separate `--authorize-hosted-processing` assertion. A configured
 `JINA_API_KEY` alone is insufficient:
 
@@ -166,8 +166,11 @@ The run sends each selected canonical Markdown artifact in full and each
 eligible local header image as base64 of its exact source bytes, with hosted
 truncation disabled. It never uses remote inline-image URLs. Run/configuration setup and each selected item's
 queue/recovery registration use separate bounded transactions. Each validated
-vector and its successful work checkpoint commit before the next modality is
-attempted. Replaying the same limit reuses unchanged successes without another
+source vector and its successful work checkpoint commit before the next
+modality is attempted. Once both sources succeed under the same configuration,
+their float32 normalized vectors produce a 2,048-dimensional, L2-normalized
+equal-weight midpoint in a separate bounded transaction. Replaying the same
+limit reuses unchanged successes without another
 hosted request; when input changes, the mismatched vector is removed atomically
 with checkpoint invalidation before replacement is attempted. Any existing
 same-article/configuration multimodal dependent is archived, removed, and
@@ -271,16 +274,16 @@ Resolve `cleaned_markdown_path` against the output root and
 `header_image_path` against the source root. Remote `inline_image_urls` are
 references only; the pipeline never downloads them.
 
-## Text and header-image embedding catalog contract
+## Text, header-image, and multimodal embedding catalog contract
 
-The downstream catalog is a separate schema-version-6 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-7 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted, limit-only production CLI.
-Versions 1 through 5 are refused without migration; move reproducible derived
+Versions 1 through 6 are refused without migration; move reproducible derived
 output aside or choose a fresh embedding output root.
 
-The catalog has exactly six base tables and no indexes:
+The catalog has exactly seven base tables and no indexes:
 
 | Table | Ordered columns | Key |
 |---|---|---|
@@ -290,6 +293,7 @@ The catalog has exactly six base tables and no indexes:
 | `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
+| `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
 
 The source path is nullable for article text and absent images. The input hash
 is nullable for `not_applicable` image work and only one applicable case: a
@@ -317,11 +321,16 @@ aggregation, image input/transform rules, multimodal formula, and client
 configuration version. The current long-text rule is
 `single-input-provider-pooling-v1`: the complete input receives one
 provider-pooled vector. `input_sha256` hashes the exact canonical Markdown or
-local header-image bytes. `stored_vector_sha256` hashes the normalized vector
-encoded as little-endian float32 values. Current modalities are `article_text`
-and `header_image`; vectors must be finite, nonzero, L2-normalized, and exactly
-2,048-dimensional. Superseded history stores only identities, hashes, run IDs,
-reason, and time; it never stores Markdown, image bytes, or historical vectors.
+local header-image bytes. For `multimodal_article`, it hashes the content-free
+source-generation identity and formula. `stored_vector_sha256` hashes the
+normalized vector encoded as little-endian float32 values. Current modalities
+are `article_text`, `header_image`, and `multimodal_article`; vectors must be
+finite, nonzero, L2-normalized, and exactly 2,048-dimensional. A composite is
+published only while both successful sources belong to its exact configuration.
+Its append-only provenance records both source generation IDs/vector hashes and
+`l2-normalize-0.5-text-0.5-image-v1`; it stores no editorial content. Superseded
+history stores only identities, hashes, run IDs, reason, and time; it never
+stores Markdown, image bytes, or historical vectors.
 `last_run_id` records the latest observation or attempt, while nullable
 `generation_run_id` is set only for a successful active vector and remains
 unchanged across reuse. Supersession history therefore names the run that
@@ -340,7 +349,7 @@ SELECT
     e.vector
 FROM embeddings AS e
 JOIN embedding_configurations AS c USING (configuration_id)
-WHERE e.modality IN ('article_text', 'header_image')
+WHERE e.modality IN ('article_text', 'header_image', 'multimodal_article')
   AND e.configuration_id = '<configuration_id>'
   AND e.publication_date_new_york
       BETWEEN DATE '2024-01-01' AND DATE '2024-01-31'
@@ -351,7 +360,8 @@ Embedding validation opens both catalogs read-only, checks exact schemas before
 data, links each vector to a canonical `articles` row, rehashes canonical
 Markdown and local header images through no-follow descriptors, checks
 publication metadata and both hashes, and verifies that successful run counts
-still have published vectors.
+still have active or superseded generations. It resolves immutable composite
+source linkage and recomputes each active equal-weight normalized midpoint.
 It emits stable issues without article text or vector values, including
 distinct missing, queued, in-progress, interrupted, retryable, and terminal
 header-image dispositions; a true no-header `not_applicable` row is valid and
