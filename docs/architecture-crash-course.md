@@ -535,6 +535,10 @@ orphan cleanup, and full-only missing-source reconciliation.
 - The fixture tracer queries `articles`, opens `cleaned_markdown_path`, and
   writes article text embeddings outside the preprocessing output root. It
   proves this seam only for generated inputs and an injected fake adapter.
+- The embedding coordinator anchors its disjoint output directory with
+  no-follow descriptors. Catalog and lock mutations remain relative to that
+  anchor even if the pathname changes, and lock cleanup removes only the inode
+  created by the current coordinator.
 - Real Jina calls, credentials, configured `wsj-embeddings run` scopes,
   licensed-corpus access, retries, resume, invalidation, and full reconciliation
   are not implemented in ticket 01.

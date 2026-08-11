@@ -6,7 +6,6 @@ import hashlib
 import math
 import struct
 from dataclasses import dataclass
-from datetime import date, datetime
 
 import duckdb
 
@@ -20,7 +19,7 @@ from wsj_embeddings.catalog import (
     configuration_id,
 )
 from wsj_embeddings.config import EmbeddingPipelineConfig
-from wsj_embeddings.models import EmbeddingProfile
+from wsj_embeddings.models import CanonicalArticle, EmbeddingProfile
 from wsj_embeddings.pipeline import _ARTICLE_TEXT_MODALITY, _VECTOR_DIMENSIONS
 from wsj_pipeline.catalog import Catalog, CatalogError
 
@@ -42,14 +41,6 @@ class EmbeddingValidationResult:
     @property
     def ok(self) -> bool:
         return not self.issues
-
-
-@dataclass(frozen=True, slots=True)
-class _CanonicalArticle:
-    article_id: str
-    cleaned_markdown_path: str
-    published_at_utc: datetime
-    publication_date_new_york: date
 
 
 def validate_embedding_outputs(
@@ -88,7 +79,7 @@ def validate_embedding_outputs(
 def _canonical_articles(
     config: EmbeddingPipelineConfig,
     issues: list[EmbeddingValidationIssue],
-) -> dict[str, _CanonicalArticle] | None:
+) -> dict[str, CanonicalArticle] | None:
     try:
         with Catalog.read_only(config.preprocessing_catalog) as db:
             Catalog.validate_schema(db)
@@ -107,7 +98,7 @@ def _canonical_articles(
             )
         )
         return None
-    return {row[0]: _CanonicalArticle(*row) for row in rows}
+    return {row[0]: CanonicalArticle(*row) for row in rows}
 
 
 def _validate_configurations(
@@ -179,7 +170,7 @@ def _validate_run_coverage(
 def _validate_embeddings(
     connection: duckdb.DuckDBPyConnection,
     config: EmbeddingPipelineConfig,
-    articles: dict[str, _CanonicalArticle],
+    articles: dict[str, CanonicalArticle],
     issues: list[EmbeddingValidationIssue],
 ) -> None:
     rows = connection.execute(
@@ -201,7 +192,7 @@ def _validate_embeddings(
         (
             article_id,
             modality,
-            profile_id,
+            configuration_identifier,
             published_at_utc,
             publication_date,
             dimensions,
@@ -210,7 +201,7 @@ def _validate_embeddings(
             vector,
         ) = row
         article = articles.get(article_id)
-        if profile_id not in configuration_ids:
+        if configuration_identifier not in configuration_ids:
             _append(
                 issues,
                 "missing_configuration_reference",
@@ -250,7 +241,7 @@ def _validate_embeddings(
 
 def _validate_markdown_hash(
     config: EmbeddingPipelineConfig,
-    article: _CanonicalArticle,
+    article: CanonicalArticle,
     input_sha256: str,
     issues: list[EmbeddingValidationIssue],
 ) -> None:

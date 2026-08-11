@@ -482,6 +482,73 @@ def test_embedding_pipeline_lock_is_exclusive_and_owned_lock_is_cleaned(tmp_path
     assert not lock_path.exists()
 
 
+def test_embedding_pipeline_refuses_replaced_output_root_without_writing_through_it(
+    tmp_path,
+):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    config.embedding_output_root.symlink_to(outside_root, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="unsafe embedding output root"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert not (outside_root / "pipeline.lock").exists()
+    assert not (outside_root / "catalog.duckdb").exists()
+
+
+def test_embedding_pipeline_lock_does_not_remove_replacement(tmp_path):
+    lock_path = tmp_path / "embeddings" / "pipeline.lock"
+
+    with embedding_pipeline_lock(lock_path):
+        lock_path.unlink()
+        lock_path.write_text("replacement\n", encoding="utf-8")
+
+    assert lock_path.read_text(encoding="utf-8") == "replacement\n"
+
+
+def test_embedding_pipeline_lock_removes_owned_path_without_removing_hardlink(tmp_path):
+    lock_path = tmp_path / "embeddings" / "pipeline.lock"
+    linked_path = tmp_path / "embeddings" / "linked.lock"
+
+    with embedding_pipeline_lock(lock_path):
+        linked_path.hardlink_to(lock_path)
+
+    assert not lock_path.exists()
+    assert linked_path.is_file()
+
+
+def test_embedding_catalog_stays_with_anchored_output_after_path_replacement(tmp_path):
+    output_root = tmp_path / "embeddings"
+    original_root = tmp_path / "original-embeddings"
+    outside_root = tmp_path / "outside"
+    lock_path = output_root / "pipeline.lock"
+
+    with embedding_pipeline_lock(lock_path) as output_descriptor:
+        output_root.rename(original_root)
+        outside_root.mkdir()
+        output_root.symlink_to(outside_root, target_is_directory=True)
+        with EmbeddingCatalog.open_in(output_descriptor):
+            pass
+
+    assert (original_root / "catalog.duckdb").is_file()
+    assert not (original_root / "pipeline.lock").exists()
+    assert not (outside_root / "catalog.duckdb").exists()
+    assert not (outside_root / "pipeline.lock").exists()
+
+
+def test_embedding_pipeline_lock_cleans_owned_lock_after_exception(tmp_path):
+    lock_path = tmp_path / "embeddings" / "pipeline.lock"
+
+    with (
+        pytest.raises(RuntimeError, match="synthetic failure"),
+        embedding_pipeline_lock(lock_path),
+    ):
+        raise RuntimeError("synthetic failure")
+
+    assert not lock_path.exists()
+
+
 def test_validator_refuses_malformed_preprocessing_catalog(tmp_path):
     config = write_generated_preprocessing_fixture(tmp_path)
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)

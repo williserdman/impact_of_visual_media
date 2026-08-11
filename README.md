@@ -293,7 +293,10 @@ writable connection is opened, and a replacement between those phases is
 refused. Canonical Markdown is reopened below the preprocessing output root
 through no-follow directory descriptors; symlinked, non-regular, multiply
 linked, or replaced leaves are rejected. Embedding mutation is confined below
-its disjoint output root and uses its own exclusive `pipeline.lock`.
+its disjoint output root. The coordinator opens every output-root component
+without following links, then creates its catalog and exclusive `pipeline.lock`
+relative to that anchored directory. Lock cleanup compares file identity and
+will not remove a pathname replaced by another process.
 
 ## Development checks
 

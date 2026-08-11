@@ -110,12 +110,6 @@ def _prepare_catalog_path(
     """Anchor one safe embedding-catalog leaf below its parent descriptor."""
 
     absolute_path = Path(os.path.abspath(path))
-    if (
-        not absolute_path.name
-        or absolute_path.name in {".", ".."}
-        or Path(absolute_path.name).name != absolute_path.name
-    ):
-        _raise_unsafe_catalog_path()
     if create:
         absolute_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -123,22 +117,45 @@ def _prepare_catalog_path(
     except OSError:
         _raise_unsafe_catalog_path()
     try:
-        try:
-            leaf_stat = os.stat(
-                absolute_path.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            if not create:
-                _raise_unsafe_catalog_path()
-            return parent_descriptor, None
-        if not stat.S_ISREG(leaf_stat.st_mode) or leaf_stat.st_nlink != 1:
-            _raise_unsafe_catalog_path()
-        return parent_descriptor, (leaf_stat.st_dev, leaf_stat.st_ino)
+        identity = _prepare_catalog_leaf(
+            parent_descriptor,
+            absolute_path.name,
+            create=create,
+        )
+        return parent_descriptor, identity
     except BaseException:
         os.close(parent_descriptor)
         raise
+
+
+def _prepare_catalog_leaf(
+    parent_descriptor: int,
+    leaf_name: str,
+    *,
+    create: bool,
+) -> tuple[int, int] | None:
+    """Inspect one catalog leaf below an already anchored output directory."""
+
+    if (
+        not leaf_name
+        or leaf_name in {".", ".."}
+        or Path(leaf_name).name != leaf_name
+        or not stat.S_ISDIR(os.fstat(parent_descriptor).st_mode)
+    ):
+        _raise_unsafe_catalog_path()
+    try:
+        leaf_stat = os.stat(
+            leaf_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        if not create:
+            _raise_unsafe_catalog_path()
+        return None
+    if not stat.S_ISREG(leaf_stat.st_mode) or leaf_stat.st_nlink != 1:
+        _raise_unsafe_catalog_path()
+    return leaf_stat.st_dev, leaf_stat.st_ino
 
 
 def _verify_catalog_leaf(
@@ -258,28 +275,71 @@ class EmbeddingCatalog:
         """Open a new catalog or reject every incompatible existing file."""
 
         parent_descriptor, identity = _prepare_catalog_path(path, create=True)
+        with cls._open_anchored_parent(
+            parent_descriptor,
+            path.name,
+            identity,
+        ) as catalog:
+            yield catalog
+
+    @classmethod
+    @contextmanager
+    def open_in(
+        cls,
+        output_directory_descriptor: int,
+        leaf_name: str = "catalog.duckdb",
+    ) -> Iterator[EmbeddingCatalog]:
+        """Open a catalog below an already anchored embedding output root."""
+
+        parent_descriptor = os.dup(output_directory_descriptor)
+        try:
+            identity = _prepare_catalog_leaf(
+                parent_descriptor,
+                leaf_name,
+                create=True,
+            )
+        except BaseException:
+            os.close(parent_descriptor)
+            raise
+        with cls._open_anchored_parent(
+            parent_descriptor,
+            leaf_name,
+            identity,
+        ) as catalog:
+            yield catalog
+
+    @classmethod
+    @contextmanager
+    def _open_anchored_parent(
+        cls,
+        parent_descriptor: int,
+        leaf_name: str,
+        identity: tuple[int, int] | None,
+    ) -> Iterator[EmbeddingCatalog]:
+        """Open one writable catalog while owning its parent descriptor."""
+
         is_fresh = identity is None
         connection: duckdb.DuckDBPyConnection | None = None
         leaf_descriptor: int | None = None
         try:
             if identity is None:
-                identity = _create_fresh_catalog_leaf(parent_descriptor, path.name)
+                identity = _create_fresh_catalog_leaf(parent_descriptor, leaf_name)
             else:
                 with cls._read_only_anchored(
                     parent_descriptor,
-                    path.name,
+                    leaf_name,
                     identity,
                 ):
                     pass
-                _verify_catalog_leaf(parent_descriptor, path.name, identity)
+                _verify_catalog_leaf(parent_descriptor, leaf_name, identity)
             leaf_descriptor = _open_catalog_leaf_descriptor(
                 parent_descriptor,
-                path.name,
+                leaf_name,
                 identity,
                 read_only=False,
             )
             connection = duckdb.connect(f"/proc/self/fd/{leaf_descriptor}")
-            _verify_catalog_leaf(parent_descriptor, path.name, identity)
+            _verify_catalog_leaf(parent_descriptor, leaf_name, identity)
         except BaseException:
             if connection is not None:
                 connection.close()

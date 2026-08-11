@@ -3,6 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalArticle:
+    """Canonical metadata consumed by embedding publication and validation."""
+
+    article_id: str
+    cleaned_markdown_path: str
+    published_at_utc: datetime
+    publication_date_new_york: date
 
 
 @dataclass(frozen=True, slots=True)

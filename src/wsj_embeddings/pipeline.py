@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import stat
 import struct
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
-from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -21,7 +21,7 @@ from wsj_embeddings.canonical_markdown import (
 )
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingPipelineConfig
-from wsj_embeddings.models import EmbeddingRunResult
+from wsj_embeddings.models import CanonicalArticle, EmbeddingRunResult
 from wsj_pipeline.catalog import Catalog, CatalogError
 
 _ARTICLE_TEXT_MODALITY = "article_text"
@@ -41,30 +41,106 @@ class EmbeddingPipelineLockedError(RuntimeError):
     """Raised when another embedding coordinator owns the output lock."""
 
 
+class EmbeddingOutputRootError(RuntimeError):
+    """Raised before mutation when the embedding output root is unsafe."""
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+_LOCK_CREATE_FLAGS = (
+    os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+)
+
+
+def _open_embedding_output_root(output_root: Path) -> int:
+    """Create and anchor the output root without following path components."""
+
+    absolute_root = Path(os.path.abspath(output_root))
+    if absolute_root == Path(absolute_root.anchor) or not absolute_root.name:
+        raise EmbeddingOutputRootError("unsafe embedding output root")
+    try:
+        descriptor = os.open(absolute_root.anchor, _DIRECTORY_FLAGS)
+    except OSError as error:
+        raise EmbeddingOutputRootError("unsafe embedding output root") from error
+    try:
+        for component in absolute_root.parts[1:-1]:
+            next_descriptor = os.open(
+                component,
+                _DIRECTORY_FLAGS,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        with suppress(FileExistsError):
+            os.mkdir(absolute_root.name, mode=0o700, dir_fd=descriptor)
+        output_descriptor = os.open(
+            absolute_root.name,
+            _DIRECTORY_FLAGS,
+            dir_fd=descriptor,
+        )
+        output_stat = os.fstat(output_descriptor)
+        path_stat = os.stat(
+            absolute_root.name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(path_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino)
+            != (output_stat.st_dev, output_stat.st_ino)
+        ):
+            os.close(output_descriptor)
+            raise EmbeddingOutputRootError("unsafe embedding output root")
+        return output_descriptor
+    except EmbeddingOutputRootError:
+        raise
+    except OSError as error:
+        raise EmbeddingOutputRootError("unsafe embedding output root") from error
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
-def embedding_pipeline_lock(lock_path: Path) -> Iterator[None]:
+def embedding_pipeline_lock(lock_path: Path) -> Iterator[int]:
     """Own one exclusive lock before mutating an embedding output root."""
 
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        descriptor = os.open(
-            lock_path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            0o600,
-        )
-    except FileExistsError as error:
-        raise EmbeddingPipelineLockedError(
-            f"embedding pipeline is already running; lock exists at {lock_path}"
-        ) from error
+    output_descriptor = _open_embedding_output_root(lock_path.parent)
     try:
         try:
-            os.write(descriptor, f"{os.getpid()}\n".encode())
+            lock_descriptor = os.open(
+                lock_path.name,
+                _LOCK_CREATE_FLAGS,
+                0o600,
+                dir_fd=output_descriptor,
+            )
+        except FileExistsError as error:
+            raise EmbeddingPipelineLockedError(
+                f"embedding pipeline is already running; lock exists at {lock_path}"
+            ) from error
+        lock_stat = os.fstat(lock_descriptor)
+        try:
+            if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+                raise EmbeddingOutputRootError("unsafe embedding pipeline lock")
+            os.write(lock_descriptor, f"{os.getpid()}\n".encode())
+            yield output_descriptor
         finally:
-            os.close(descriptor)
-        yield
+            try:
+                current_stat = os.stat(
+                    lock_path.name,
+                    dir_fd=output_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                if (
+                    stat.S_ISREG(current_stat.st_mode)
+                    and (current_stat.st_dev, current_stat.st_ino)
+                    == (lock_stat.st_dev, lock_stat.st_ino)
+                ):
+                    os.unlink(lock_path.name, dir_fd=output_descriptor)
+            os.close(lock_descriptor)
     finally:
-        with suppress(FileNotFoundError):
-            lock_path.unlink()
+        os.close(output_descriptor)
 
 
 def run_embedding_pipeline(
@@ -85,10 +161,12 @@ def run_embedding_pipeline(
     prepared = tuple(
         _prepare_embedding(config, adapter, article) for article in articles
     )
-    profile_id = configuration_id(profile)
-    with embedding_pipeline_lock(config.embedding_lock_path), EmbeddingCatalog.open(
-        config.embedding_catalog
-    ) as catalog, catalog.transaction():
+    configuration_identifier = configuration_id(profile)
+    with (
+        embedding_pipeline_lock(config.embedding_lock_path) as output_descriptor,
+        EmbeddingCatalog.open_in(output_descriptor) as catalog,
+        catalog.transaction(),
+    ):
         if not prepared:
             return EmbeddingRunResult(articles=0, embeddings=0)
         catalog.connection.execute(
@@ -98,7 +176,7 @@ def run_embedding_pipeline(
             ON CONFLICT (configuration_id) DO NOTHING
             """,
             [
-                profile_id,
+                configuration_identifier,
                 profile.model,
                 profile.task,
                 profile.dimensions,
@@ -121,11 +199,11 @@ def run_embedding_pipeline(
                     vector = excluded.vector
                 """,
                 [
-                    article[0],
+                    article.article_id,
                     _ARTICLE_TEXT_MODALITY,
-                    profile_id,
-                    article[2],
-                    article[3],
+                    configuration_identifier,
+                    article.published_at_utc,
+                    article.publication_date_new_york,
                     profile.dimensions,
                     input_sha256,
                     vector_hash,
@@ -136,7 +214,12 @@ def run_embedding_pipeline(
             """
             INSERT INTO runs VALUES (?, ?, ?, ?, current_timestamp)
             """,
-            [str(uuid4()), profile_id, len(prepared), len(prepared)],
+            [
+                str(uuid4()),
+                configuration_identifier,
+                len(prepared),
+                len(prepared),
+            ],
         )
     return EmbeddingRunResult(articles=len(prepared), embeddings=len(prepared))
 
@@ -144,7 +227,7 @@ def run_embedding_pipeline(
 def _read_articles(
     config: EmbeddingPipelineConfig,
     limit: int,
-) -> tuple[tuple[str, str, datetime, date], ...]:
+) -> tuple[CanonicalArticle, ...]:
     try:
         with Catalog.read_only(config.preprocessing_catalog) as db:
             Catalog.validate_schema(db)
@@ -160,32 +243,31 @@ def _read_articles(
             ).fetchall()
     except (CatalogError, duckdb.Error, OSError) as error:
         raise EmbeddingPipelineError("preprocessing_catalog", "unknown") from error
-    return tuple(rows)
+    return tuple(CanonicalArticle(*row) for row in rows)
 
 
 def _prepare_embedding(
     config: EmbeddingPipelineConfig,
     adapter: EmbeddingAdapter,
-    article: tuple[str, str, datetime, date],
-) -> tuple[tuple[str, str, datetime, date], str, str, tuple[float, ...]]:
-    article_id, relative_markdown_path, _published_at, _publication_date = article
+    article: CanonicalArticle,
+) -> tuple[CanonicalArticle, str, str, tuple[float, ...]]:
     try:
         markdown_bytes = read_canonical_markdown(
             config.preprocessing_output_root,
-            relative_markdown_path,
+            article.cleaned_markdown_path,
         )
     except CanonicalMarkdownError as error:
         code = "read_markdown" if error.status == "missing" else "unsafe_markdown_path"
-        raise EmbeddingPipelineError(code, article_id) from error
+        raise EmbeddingPipelineError(code, article.article_id) from error
     try:
         markdown = markdown_bytes.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
-        raise EmbeddingPipelineError("invalid_utf8", article_id) from error
+        raise EmbeddingPipelineError("invalid_utf8", article.article_id) from error
     try:
         embedded = adapter.embed_text(markdown)
     except Exception as error:
-        raise EmbeddingPipelineError("embed_text", article_id) from error
-    vector = _normalized_vector(embedded, article_id)
+        raise EmbeddingPipelineError("embed_text", article.article_id) from error
+    vector = _normalized_vector(embedded, article.article_id)
     packed = b"".join(struct.pack("<f", value) for value in vector)
     return article, hashlib.sha256(markdown_bytes).hexdigest(), hashlib.sha256(
         packed

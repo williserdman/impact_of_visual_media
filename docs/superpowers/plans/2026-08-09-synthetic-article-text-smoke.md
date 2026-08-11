@@ -337,5 +337,5 @@ Expected: only intentional source, test, plan, and package metadata changes are 
 
 ```bash
 git add pyproject.toml src/wsj_embeddings tests/test_embeddings_pipeline.py tests/test_embeddings_cli.py docs/superpowers/plans/2026-08-09-synthetic-article-text-smoke.md
-git commit -m "feat: add synthetic article embedding smoke path"
+git commit -m "feat: add synthetic article text embedding smoke path"
 ```
