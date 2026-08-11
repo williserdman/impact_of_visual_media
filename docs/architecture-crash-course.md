@@ -266,8 +266,11 @@ no indexes. Only classified failure-detail columns are nullable. Versions 1 and
 `EmbeddingProfile` field: model alias and observed hosted model/API metadata,
 task, dimensions, output type, normalization, tokenizer/context rules,
 long-text aggregation, image rules/transform, multimodal formula, and client
-configuration version. `input_sha256` covers the exact UTF-8 canonical Markdown
-bytes. After finite/nonzero checks and L2 normalization, values are rounded to
+configuration version. The current long-text identity is
+`single-input-provider-pooling-v1`, describing the single provider-pooled
+vector returned for the complete input. `input_sha256` covers the exact UTF-8
+canonical Markdown bytes. After finite/nonzero checks and L2 normalization,
+values are rounded to
 float32; `stored_vector_sha256` covers their concatenated little-endian float32
 representation. Work state is one of `queued`, `in_progress`, `succeeded`,
 `retryable`, `terminal`, or `interrupted`. Only the exact modality
@@ -276,7 +279,10 @@ representation. Work state is one of `queued`, `in_progress`, `succeeded`,
 The coordinator commits content-free run/configuration setup separately, then
 registers or recovers each selected item in its own bounded transaction. When
 the selected input identity changes, that registration transaction removes the
-same-configuration mismatched vector before replacement work begins. It then
+same-configuration mismatched vector before replacement work begins. It also
+archives, removes, and requeues an existing same-article/configuration
+multimodal dependent while preserving header-image work, other articles, and
+other configurations. It then
 commits `in_progress` before each request. A validated vector insert, successful
 work transition, and run-count update share one bounded transaction. An
 interruption before that commit leaves requeueable work; an interruption after

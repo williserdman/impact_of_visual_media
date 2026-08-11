@@ -66,7 +66,7 @@ class EmbeddingProfile:
     tokenizer_revision: str = "jinaai/jina-embeddings-v4-hosted-2026-08-11"
     context_token_limit: int = 32_768
     context_rules: str = "complete-input-truncate-false-late-chunking-false-v1"
-    long_text_aggregation: str = "l2-token-count-weighted-mean-v1"
+    long_text_aggregation: str = "single-input-provider-pooling-v1"
     image_input_rules: str = "base64-source-bytes-no-remote-v1"
     image_transform: str = "not-implemented-v1"
     multimodal_formula: str = "l2-normalize-0.5-text-0.5-image-v1"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import struct
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict, replace
@@ -24,7 +25,7 @@ from wsj_embeddings import (
     run_embedding_pipeline,
     validate_embedding_outputs,
 )
-from wsj_embeddings.adapters import JinaHostedAdapterError
+from wsj_embeddings.adapters import JinaEmbeddingAdapter, JinaHostedAdapterError
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingConfigError
 from wsj_embeddings.pipeline import (
@@ -223,6 +224,73 @@ def replace_generated_embedding_markdown(
     return input_sha256
 
 
+def seed_generated_modality_success(
+    config: EmbeddingPipelineConfig,
+    *,
+    article_id: str,
+    modality: str,
+    profile: EmbeddingProfile,
+) -> None:
+    """Seed one content-free modality generation through generated fixture SQL."""
+
+    configuration_identifier = configuration_id(profile)
+    vector = [1.0, *(0.0 for _ in range(2047))]
+    vector_sha256 = hashlib.sha256(
+        b"".join(struct.pack("<f", value) for value in vector)
+    ).hexdigest()
+    input_sha256 = hashlib.sha256(
+        f"{article_id}:{modality}:{configuration_identifier}".encode()
+    ).hexdigest()
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        generation_run_id = db.execute(
+            """
+            SELECT run_id FROM runs
+            WHERE configuration_id = ?
+            ORDER BY started_at
+            LIMIT 1
+            """,
+            [configuration_identifier],
+        ).fetchone()[0]
+        published_at_utc, publication_date_new_york = db.execute(
+            """
+            SELECT published_at_utc, publication_date_new_york
+            FROM embeddings
+            WHERE article_id = ? AND modality = 'article_text'
+              AND configuration_id = ?
+            """,
+            [article_id, configuration_identifier],
+        ).fetchone()
+        db.execute(
+            """
+            INSERT INTO embedding_work_items
+            VALUES (?, ?, ?, ?, 'succeeded', 1, NULL, NULL, NULL, ?, current_timestamp)
+            """,
+            [
+                article_id,
+                modality,
+                configuration_identifier,
+                input_sha256,
+                generation_run_id,
+            ],
+        )
+        db.execute(
+            """
+            INSERT INTO embeddings
+            VALUES (?, ?, ?, ?, ?, 2048, ?, ?, ?)
+            """,
+            [
+                article_id,
+                modality,
+                configuration_identifier,
+                published_at_utc,
+                publication_date_new_york,
+                input_sha256,
+                vector_sha256,
+                vector,
+            ],
+        )
+
+
 class SyntheticInterruption(BaseException):
     """Simulate abrupt process loss without entering operational error handling."""
 
@@ -265,6 +333,11 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
     """Break caught: a public embedding rule changes without new eligibility."""
 
     profile = FakeEmbeddingAdapter.profile
+    assert profile.long_text_aggregation == "single-input-provider-pooling-v1"
+    assert (
+        JinaEmbeddingAdapter.profile.long_text_aggregation
+        == "single-input-provider-pooling-v1"
+    )
     alternatives = {
         "model": "changed-model-alias",
         "observed_model": "changed-observed-model",
@@ -512,6 +585,104 @@ def test_changed_markdown_regenerates_only_affected_text_and_audits_prior_genera
     assert history[4] == hashlib.sha256(b"#\n").hexdigest()
     assert len(history[5]) == 64
     assert history[7] == "input_changed"
+
+
+@pytest.mark.parametrize(
+    ("reprocess", "expected_reason"),
+    [(False, "input_changed"), (True, "explicit_reprocess")],
+)
+def test_text_supersession_invalidates_only_its_multimodal_dependent(
+    tmp_path,
+    reprocess,
+    expected_reason,
+):
+    """Break caught: superseded text leaves a stale multimodal vector queryable."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    sibling_id = "wsj:ZZZ-SYNTHETIC-EMBEDDING"
+    target_id = "wsj:SYNTHETIC-EMBEDDING"
+    add_generated_embedding_article(
+        config,
+        article_id=sibling_id,
+        markdown="# Unchanged sibling\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=2)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), limit=2)
+    current_profile = FakeEmbeddingAdapter.profile
+    prior_profile = PriorConfigurationAdapter.profile
+    seed_generated_modality_success(
+        config,
+        article_id=target_id,
+        modality="header_image",
+        profile=current_profile,
+    )
+    seed_generated_modality_success(
+        config,
+        article_id=target_id,
+        modality="multimodal_article",
+        profile=current_profile,
+    )
+    seed_generated_modality_success(
+        config,
+        article_id=sibling_id,
+        modality="multimodal_article",
+        profile=current_profile,
+    )
+    seed_generated_modality_success(
+        config,
+        article_id=target_id,
+        modality="multimodal_article",
+        profile=prior_profile,
+    )
+    if not reprocess:
+        replace_generated_embedding_markdown(config, "# Changed generated article\n")
+
+    run_embedding_pipeline(
+        config,
+        FakeEmbeddingAdapter(),
+        limit=1,
+        reprocess=reprocess,
+    )
+
+    current_id = configuration_id(current_profile)
+    prior_id = configuration_id(prior_profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT article_id, modality, configuration_id
+            FROM embeddings
+            WHERE modality != 'article_text'
+            ORDER BY article_id, modality, configuration_id
+            """
+        ).fetchall() == sorted(
+            [
+                (target_id, "header_image", current_id),
+                (target_id, "multimodal_article", prior_id),
+                (sibling_id, "multimodal_article", current_id),
+            ]
+        )
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code, status_code,
+                   retry_after_seconds
+            FROM embedding_work_items
+            WHERE article_id = ? AND modality = 'multimodal_article'
+              AND configuration_id = ?
+            """,
+            [target_id, current_id],
+        ).fetchone() == ("queued", 0, None, None, None)
+        assert db.execute(
+            """
+            SELECT modality, superseded_reason
+            FROM embedding_generation_history
+            WHERE article_id = ? AND configuration_id = ?
+            ORDER BY modality
+            """,
+            [target_id, current_id],
+        ).fetchall() == [
+            ("article_text", expected_reason),
+            ("multimodal_article", expected_reason),
+        ]
 
 
 def test_changed_configuration_keeps_both_vectors_and_requires_validation_selector(

@@ -166,7 +166,10 @@ queue/recovery registration use separate bounded transactions. Each validated
 vector and its successful work checkpoint commit before the next article is
 attempted. Replaying the same limit reuses unchanged successes without another
 hosted request; when input changes, the mismatched vector is removed atomically
-with checkpoint invalidation before replacement is attempted. Retryable
+with checkpoint invalidation before replacement is attempted. Any existing
+same-article/configuration multimodal dependent is archived, removed, and
+requeued in that transaction; header-image work and other articles or
+configurations remain unchanged. Retryable
 failures and interrupted in-progress work are attempted again, while terminal
 failures stay visible and are not retried implicitly. Limited runs never infer
 removal outside the selected scope. Success JSON includes content-free
@@ -289,7 +292,9 @@ content. Work states are `queued`, `in_progress`, `succeeded`, `retryable`,
 key-sorted JSON covering model alias, observed hosted model/API metadata, task,
 dimensions, output type, normalization, tokenizer/context rules, long-text
 aggregation, image input/transform rules, multimodal formula, and client
-configuration version. `input_sha256` hashes the exact
+configuration version. The current long-text rule is
+`single-input-provider-pooling-v1`: the complete input receives one
+provider-pooled vector. `input_sha256` hashes the exact
 canonical Markdown bytes. `stored_vector_sha256` hashes the normalized vector
 encoded as little-endian float32 values. The current modality is exactly
 `article_text`; vectors must be finite, nonzero, L2-normalized, and exactly

@@ -16,6 +16,7 @@ from uuid import uuid4
 import duckdb
 
 from wsj_embeddings.models import (
+    EmbeddingModality,
     EmbeddingProfile,
     EmbeddingRunResult,
     SupersessionReason,
@@ -772,38 +773,23 @@ class EmbeddingCatalog:
                 if reprocess
                 else SupersessionReason.INPUT_CHANGED
             )
-            self._archive_active_generation(
+            self._invalidate_work_generation(
                 run_id=run_id,
                 article_id=article_id,
                 modality=modality,
                 configuration_identifier=configuration_identifier,
                 reason=reason,
+                replacement_input_sha256=input_sha256,
             )
-            self.connection.execute(
-                """
-                DELETE FROM embeddings
-                WHERE article_id = ? AND modality = ? AND configuration_id = ?
-                """,
-                [article_id, modality, configuration_identifier],
-            )
-            self.connection.execute(
-                """
-                UPDATE embedding_work_items
-                SET input_sha256 = ?, state = ?, attempt_count = 0,
-                    error_code = NULL, status_code = NULL,
-                    retry_after_seconds = NULL, last_run_id = ?,
-                    updated_at = current_timestamp
-                WHERE article_id = ? AND modality = ? AND configuration_id = ?
-                """,
-                [
-                    input_sha256,
-                    WorkState.QUEUED.value,
-                    run_id,
-                    article_id,
-                    modality,
-                    configuration_identifier,
-                ],
-            )
+            if modality == EmbeddingModality.ARTICLE_TEXT.value:
+                self._invalidate_work_generation(
+                    run_id=run_id,
+                    article_id=article_id,
+                    modality=EmbeddingModality.MULTIMODAL_ARTICLE.value,
+                    configuration_identifier=configuration_identifier,
+                    reason=reason,
+                    replacement_input_sha256=None,
+                )
             return WorkState.QUEUED
         proven_success = state.is_reusable_success and bool(
             self.connection.execute(
@@ -850,6 +836,51 @@ class EmbeddingCatalog:
             self.increment_run(run_id, "interrupted")
             return WorkState.INTERRUPTED
         return state
+
+    def _invalidate_work_generation(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+        reason: SupersessionReason,
+        replacement_input_sha256: str | None,
+    ) -> None:
+        """Archive, remove, and queue one exact existing generation."""
+
+        self._archive_active_generation(
+            run_id=run_id,
+            article_id=article_id,
+            modality=modality,
+            configuration_identifier=configuration_identifier,
+            reason=reason,
+        )
+        self.connection.execute(
+            """
+            DELETE FROM embeddings
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [article_id, modality, configuration_identifier],
+        )
+        self.connection.execute(
+            """
+            UPDATE embedding_work_items
+            SET input_sha256 = COALESCE(?, input_sha256), state = ?,
+                attempt_count = 0, error_code = NULL, status_code = NULL,
+                retry_after_seconds = NULL, last_run_id = ?,
+                updated_at = current_timestamp
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                replacement_input_sha256,
+                WorkState.QUEUED.value,
+                run_id,
+                article_id,
+                modality,
+                configuration_identifier,
+            ],
+        )
 
     def _archive_active_generation(
         self,
