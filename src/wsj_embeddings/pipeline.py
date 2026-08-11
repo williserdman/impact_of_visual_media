@@ -131,6 +131,17 @@ def _open_embedding_output_root(output_root: Path) -> int:
         os.close(descriptor)
 
 
+def _ensure_source_root(source_root: Path) -> None:
+    """Reject an unavailable archive root before any item or output work."""
+
+    try:
+        descriptor = os.open(source_root, _DIRECTORY_FLAGS)
+    except OSError as error:
+        raise EmbeddingPipelineError("source_root", "unknown") from error
+    else:
+        os.close(descriptor)
+
+
 @contextmanager
 def embedding_pipeline_lock(lock_path: Path) -> Iterator[int]:
     """Own one exclusive lock before mutating an embedding output root."""
@@ -191,6 +202,7 @@ def run_embedding_pipeline(
     if not isinstance(reprocess, bool):
         raise ValueError("reprocess must be boolean")
     config.validate()
+    _ensure_source_root(config.source_root)
     profile = adapter.profile
     if profile.dimensions != _VECTOR_DIMENSIONS:
         raise ValueError("adapter profile dimensions must be 2048")

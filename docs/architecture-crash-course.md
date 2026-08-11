@@ -285,6 +285,9 @@ disposition: it retains a safe canonical relative path and
 `missing_header_image`, has zero adapter attempts, and has no active vector or
 generation. Content-free `header_absent` and `header_failed` run counters keep
 that distinction visible in public summaries.
+The archive root itself is opened first as a no-follow accessible directory;
+root or ancestor failure is operational and cannot become an optional
+missing-leaf disposition.
 `last_run_id` tracks the latest observation/attempt. `generation_run_id` is
 nullable except on successful active work, is immutable across reuse, and is
 the provenance copied into history when that vector is superseded.
@@ -308,6 +311,12 @@ never publishes a placeholder vector. A changed input or explicit bounded reproc
 the superseded success's content-free input/vector hashes and run identities in
 `embedding_generation_history`. A changed configuration creates separate work
 and leaves prior-configuration vectors immutable and queryable.
+The applicable-to-absent transition uses that same transaction to invalidate
+both the header generation and its multimodal dependent before persisting
+`not_applicable`. Validation derives required header keys from canonical
+articles with article-text work and reconciles the latest run's absent/failed
+claims against durable header states, so deleting a checkpoint cannot erase a
+coverage gap.
 
 The research query seam is:
 

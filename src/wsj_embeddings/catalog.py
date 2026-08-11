@@ -883,6 +883,15 @@ class EmbeddingCatalog:
             )
             self.increment_run(run_id, "interrupted")
             return WorkState.INTERRUPTED
+        if state is WorkState.TERMINAL:
+            self.connection.execute(
+                """
+                UPDATE embedding_work_items
+                SET last_run_id = ?, updated_at = current_timestamp
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [run_id, article_id, modality, configuration_identifier],
+            )
         return state
 
     def register_not_applicable(
@@ -922,15 +931,19 @@ class EmbeddingCatalog:
             return WorkState.NOT_APPLICABLE
         state = WorkState(str(row[0]))
         if state is not WorkState.NOT_APPLICABLE:
-            self._invalidate_work_generation(
-                run_id=run_id,
-                article_id=article_id,
-                modality=modality,
-                configuration_identifier=configuration_identifier,
-                reason=SupersessionReason.INPUT_CHANGED,
-                replacement_source_relative_path=None,
-                replacement_input_sha256=None,
-            )
+            modalities = [modality]
+            if modality == EmbeddingModality.HEADER_IMAGE.value:
+                modalities.append(EmbeddingModality.MULTIMODAL_ARTICLE.value)
+            for invalidated_modality in modalities:
+                self._invalidate_work_generation(
+                    run_id=run_id,
+                    article_id=article_id,
+                    modality=invalidated_modality,
+                    configuration_identifier=configuration_identifier,
+                    reason=SupersessionReason.INPUT_CHANGED,
+                    replacement_source_relative_path=None,
+                    replacement_input_sha256=None,
+                )
         self.connection.execute(
             """
             UPDATE embedding_work_items

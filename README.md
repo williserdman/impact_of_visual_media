@@ -273,7 +273,7 @@ references only; the pipeline never downloads them.
 
 ## Text and header-image embedding catalog contract
 
-The downstream catalog is a separate schema-version-5 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-6 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted, limit-only production CLI.
@@ -303,6 +303,13 @@ means no canonical header; header failures remain distinct and count in
 as `input_changed` and invalidate only that image plus its same-configuration
 multimodal dependent. A changed configuration uses a separate work key and
 leaves the prior configuration queryable.
+The configured archive root is opened as an accessible, no-follow directory
+before the preprocessing catalog, any item, or embedding output is touched. An
+absent, non-directory, or inaccessible archive root is an operational
+`source_root` failure; only an absent optional leaf below a proven root becomes
+`missing_header_image`. If a formerly applicable canonical header becomes
+absent, one transaction archives/removes both its image vector and its
+same-configuration multimodal dependent before recording `not_applicable`.
 `configuration_id` is the SHA-256 of compact,
 key-sorted JSON covering model alias, observed hosted model/API metadata, task,
 dimensions, output type, normalization, tokenizer/context rules, long-text
@@ -348,8 +355,11 @@ still have published vectors.
 It emits stable issues without article text or vector values, including
 distinct missing, queued, in-progress, interrupted, retryable, and terminal
 header-image dispositions; a true no-header `not_applicable` row is valid and
-silent. When more than one configuration exists, callers must select an
-explicit `configuration_id`; validation never silently mixes generations.
+silent. It also requires a header disposition for every article/configuration
+selected by article-text work and reconciles the latest run's `header_absent`
+and `header_failed` claims against durable header work. When more than one
+configuration exists, callers must select an explicit `configuration_id`;
+validation never silently mixes generations.
 
 ## Incremental runs and reprocessing
 

@@ -80,6 +80,12 @@ def validate_embedding_outputs(
                         selected_configuration_id,
                         issues,
                     )
+                    _validate_header_disposition_coverage(
+                        catalog.connection,
+                        articles,
+                        selected_configuration_id,
+                        issues,
+                    )
                     _validate_embeddings(
                         catalog.connection,
                         config,
@@ -475,6 +481,80 @@ def _validate_work_items(
             issue = issue_by_state.get(work_state)
             if issue is not None:
                 _append(issues, *issue)
+
+
+def _validate_header_disposition_coverage(
+    connection: duckdb.DuckDBPyConnection,
+    articles: dict[str, CanonicalArticle],
+    configuration_id: str,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Require one header disposition per selected article and honest run claims."""
+
+    selected_article_ids = {
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT article_id
+            FROM embedding_work_items
+            WHERE configuration_id = ? AND modality = 'article_text'
+            """,
+            [configuration_id],
+        ).fetchall()
+        if row[0] in articles
+    }
+    header_article_ids = {
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT article_id
+            FROM embedding_work_items
+            WHERE configuration_id = ? AND modality = 'header_image'
+            """,
+            [configuration_id],
+        ).fetchall()
+    }
+    if selected_article_ids - header_article_ids:
+        _append(
+            issues,
+            "missing_header_disposition",
+            "selected articles lack an explicit header-image disposition",
+        )
+
+    run = connection.execute(
+        """
+        SELECT run_id, header_absent, header_failed
+        FROM runs
+        WHERE configuration_id = ?
+        ORDER BY started_at DESC, run_id DESC
+        LIMIT 1
+        """,
+        [configuration_id],
+    ).fetchone()
+    if run is None:
+        return
+    run_id, claimed_absent, claimed_failed = run
+    raw_states = connection.execute(
+        """
+        SELECT state
+        FROM embedding_work_items
+        WHERE configuration_id = ? AND modality = 'header_image'
+          AND last_run_id = ?
+        """,
+        [configuration_id, run_id],
+    ).fetchall()
+    try:
+        states = [WorkState(row[0]) for row in raw_states]
+    except ValueError:
+        return
+    observed_absent = sum(state is WorkState.NOT_APPLICABLE for state in states)
+    observed_failed = sum(state.is_failure for state in states)
+    if (claimed_absent, claimed_failed) != (observed_absent, observed_failed):
+        _append(
+            issues,
+            "invalid_header_disposition_counts",
+            "run header-disposition counts differ from durable work",
+        )
 
 
 def _validate_embeddings(

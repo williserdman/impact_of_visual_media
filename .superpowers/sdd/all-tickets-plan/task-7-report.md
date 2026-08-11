@@ -97,8 +97,9 @@ Observed:
 - live module help retained the three explicit roots, required positive
   `--limit`, article-text-only `--reprocess`, and explicit hosted authorization;
 - `git diff --check` produced no output;
-- current-facing README/crash-course searches found no schema-v5 or v1-v4
-  refusal claims; and
+- the initial current-facing documentation search produced no matches because
+  its pattern missed the hyphenated `schema-version-5` wording later corrected
+  in fix round 1; and
 - the tracked generated-artifact audit produced no matches (expected `rg`
   exit 1).
 
@@ -137,3 +138,108 @@ real embedding output, or full-corpus operation was used.
 None. The shared virtual environment's installed console script is not linked
 to this worktree, so smoke and live help were verified against worktree source
 with `PYTHONPATH=src`. No machine configuration changed.
+
+## Fix round 1: archive-root and disposition integrity
+
+### Review findings addressed
+
+- The coordinator now opens the configured archive root as a no-follow
+  directory before reading the preprocessing catalog, preparing items, calling
+  the adapter, or creating embedding output. Absent, non-directory, and
+  inaccessible roots raise content-free `source_root`; only a missing optional
+  leaf below a proven root becomes `missing_header_image`.
+- When a canonical header becomes absent, one existing registration transaction
+  archives/removes both its same-configuration header generation and multimodal
+  dependent, resets their active checkpoints, then records the header as
+  `not_applicable`. Successful text, other articles, and other configurations
+  remain untouched.
+- Read-only validation derives required header disposition keys from canonical
+  articles selected by article-text work. A deleted header checkpoint is now
+  visible even when it had no vector. The latest configuration run's
+  `header_absent` and `header_failed` claims are reconciled against durable
+  header states; invalid lifecycle states retain their primary diagnosis rather
+  than causing a derivative counter finding.
+- Schema remains version 6 because no table, column, type, constraint, or index
+  changed. The stale README `schema-version-5` label is corrected, and the
+  original report now records why its initial narrow search missed that
+  hyphenated wording.
+
+### RED and GREEN
+
+The invalid-root fixture observed RED:
+`3 failed, 89 deselected in 3.08s`. An absent root completed as a retryable
+missing leaf, while non-directory and inaccessible roots surfaced as unsafe
+item paths. After the root-open gate it observed GREEN:
+`3 passed, 89 deselected in 1.43s`.
+
+The applicable-to-absent fixture observed RED:
+`1 failed, 92 deselected in 7.70s`, because the current-configuration
+multimodal vector remained active. After dependent invalidation it observed
+GREEN: `1 passed, 92 deselected in 10.35s`.
+
+The deleted-checkpoint and run-counter fixtures observed RED:
+`4 failed, 93 deselected in 7.78s`. After explicit required-key coverage and
+latest-run count reconciliation they observed GREEN:
+`4 passed, 93 deselected in 6.42s`.
+
+An affected lifecycle selection then exposed one parameter-list defect in the
+new terminal-observation update. The last-failed rerun observed
+`2 passed, 95 deselected in 4.25s` after correcting that call. No unrelated
+production behavior changed.
+
+### Fix-round focused verification
+
+```bash
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_pipeline.py \
+  -k 'invalid_archive_root or removed_canonical_header or missing_header_disposition_checkpoint or header_disposition_counter_mismatch or absent_then_added_header_image or missing_header_is_retryable or retryable_header_failure or deterministic_header_rejection or changed_header_bytes or interrupted_header_attempt or validator_accepts_fresh or validator_reports_invalid_durable_work_state or terminal_failure_is_visible'
+/home/willis/projects/finance_wsj/.venv/bin/ruff check \
+  src/wsj_embeddings/catalog.py src/wsj_embeddings/pipeline.py \
+  src/wsj_embeddings/validate.py tests/test_embeddings_pipeline.py
+PYTHONPATH=src /home/willis/projects/finance_wsj/.venv/bin/python \
+  -m wsj_embeddings smoke
+PYTHONPATH=src /home/willis/projects/finance_wsj/.venv/bin/python \
+  -m wsj_embeddings run --help
+git diff --check
+git ls-files | rg '^(data|artifacts|outputs)/'
+```
+
+Observed:
+
+- affected coordinator/catalog/validation selection:
+  `17 passed, 80 deselected in 39.36s`;
+- changed Python Ruff: `All checks passed!`;
+- generated smoke:
+  `{"articles": 1, "embeddings": 1, "validation_ok": true}`;
+- live help retained its required bounded/authorized interface;
+- `git diff --check` and the stale current-doc claim search produced no output;
+  and
+- the tracked generated-artifact audit produced no matches (expected `rg`
+  exit 1).
+
+Per review direction, no broad or full suite was run. No licensed archive, live
+credential, network request, real embedding output, or full-corpus operation
+was used.
+
+### Fix-round self-review
+
+- Root validation uses the same no-follow directory-open flags as the output
+  anchor and closes the descriptor immediately. The check precedes both
+  preprocessing reads and all output mutation.
+- Missing-leaf classification remains unchanged after the root is proven;
+  unsafe relative paths, symlinks, hard links, and replacement races retain
+  their fail-closed classifications.
+- Applicable-to-absent invalidation is bounded by the existing registration
+  transaction and configuration key. Both superseded generations keep their
+  immutable provenance before active rows are removed.
+- Required header coverage follows actual bounded selection through
+  article-text work keys rather than incorrectly requiring the whole canonical
+  corpus after a limited run.
+- Counter reconciliation is limited to the latest run for the chosen
+  configuration because older work rows legitimately move their `last_run_id`
+  on replay. Terminal replay now records that observation without changing its
+  immutable generation identity or retry state.
+- Corrupt/unknown work states are diagnosed by the lifecycle validator and are
+  excluded from derivative counter reconciliation.
+
+Fix-round concerns: none.

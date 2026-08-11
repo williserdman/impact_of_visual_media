@@ -500,6 +500,40 @@ def test_coordinator_refuses_unauthorized_run_before_markdown_or_output(
     assert not config.embedding_output_root.exists()
 
 
+@pytest.mark.parametrize(
+    "root_state",
+    ("absent", "not-directory", "inaccessible"),
+)
+def test_coordinator_rejects_invalid_archive_root_before_output_or_text_purchase(
+    tmp_path,
+    root_state,
+):
+    """Break caught: an unavailable archive becomes one retryable image leaf."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    declare_missing_generated_header_image(config)
+    if root_state == "absent":
+        config.source_root.rmdir()
+    elif root_state == "not-directory":
+        config.source_root.rmdir()
+        config.source_root.write_bytes(b"generated non-directory root")
+    else:
+        config.source_root.chmod(0)
+    adapter = RecordingMultimodalAdapter()
+
+    try:
+        with pytest.raises(EmbeddingPipelineError) as raised:
+            run_embedding_pipeline(config, adapter, limit=1)
+    finally:
+        if root_state == "inaccessible":
+            config.source_root.chmod(0o700)
+
+    assert raised.value.code == "source_root"
+    assert adapter.calls == 0
+    assert adapter.image_calls == 0
+    assert not config.embedding_output_root.exists()
+
+
 def replace_markdown_with_unsafe_leaf(
     config: EmbeddingPipelineConfig,
     leaf_kind: str,
@@ -907,6 +941,89 @@ def test_changed_header_bytes_invalidate_only_image_and_same_config_multimodal(
                 (prior_id, "multimodal_article"),
             ]
         )
+        assert db.execute(
+            """
+            SELECT modality, superseded_reason
+            FROM embedding_generation_history
+            WHERE configuration_id = ?
+            ORDER BY modality
+            """,
+            [current_id],
+        ).fetchall() == [
+            ("header_image", "input_changed"),
+            ("multimodal_article", "input_changed"),
+        ]
+
+
+def test_removed_canonical_header_invalidates_image_and_same_config_multimodal(
+    tmp_path,
+):
+    """Break caught: becoming no-header leaves image-dependent vectors active."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated removed image")
+    run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), limit=1)
+    current_profile = FakeEmbeddingAdapter.profile
+    prior_profile = PriorConfigurationAdapter.profile
+    for profile in (current_profile, prior_profile):
+        seed_generated_modality_success(
+            config,
+            article_id="wsj:SYNTHETIC-EMBEDDING",
+            modality="multimodal_article",
+            profile=profile,
+        )
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            """
+            UPDATE articles
+            SET header_image_path = NULL
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+            """
+        )
+    adapter = RecordingMultimodalAdapter()
+
+    result = run_embedding_pipeline(config, adapter, limit=1)
+
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        reused=1,
+        header_absent=1,
+    )
+    assert adapter.calls == 0
+    assert adapter.image_calls == 0
+    current_id = configuration_id(current_profile)
+    prior_id = configuration_id(prior_profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT configuration_id, modality
+            FROM embeddings
+            ORDER BY configuration_id, modality
+            """
+        ).fetchall() == sorted(
+            [
+                (current_id, "article_text"),
+                (prior_id, "article_text"),
+                (prior_id, "header_image"),
+                (prior_id, "multimodal_article"),
+            ]
+        )
+        assert db.execute(
+            """
+            SELECT modality, state, generation_run_id
+            FROM embedding_work_items
+            WHERE configuration_id = ? AND modality IN (
+                'header_image', 'multimodal_article'
+            )
+            ORDER BY modality
+            """,
+            [current_id],
+        ).fetchall() == [
+            ("header_image", "not_applicable", None),
+            ("multimodal_article", "queued", None),
+        ]
         assert db.execute(
             """
             SELECT modality, superseded_reason
@@ -2092,6 +2209,54 @@ def test_validator_accepts_fresh_synthetic_embedding_output(tmp_path):
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
 
     assert validate_embedding_outputs(config) == EmbeddingValidationResult(issues=())
+
+
+@pytest.mark.parametrize("disposition", ("absent", "missing"))
+def test_validator_reports_missing_header_disposition_checkpoint(
+    tmp_path,
+    disposition,
+):
+    """Break caught: deleting no-header/failed-header work escapes validation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    if disposition == "missing":
+        declare_missing_generated_header_image(config)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(
+            "DELETE FROM embedding_work_items WHERE modality = 'header_image'"
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "missing_header_disposition" in codes
+    assert "invalid_header_disposition_counts" in codes
+
+
+@pytest.mark.parametrize(
+    ("disposition", "counter_update"),
+    (
+        ("absent", "header_absent = 0, header_failed = 1"),
+        ("missing", "header_absent = 1, header_failed = 0"),
+    ),
+)
+def test_validator_rejects_header_disposition_counter_mismatch(
+    tmp_path,
+    disposition,
+    counter_update,
+):
+    """Break caught: run claims can swap absent and failed header coverage."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    if disposition == "missing":
+        declare_missing_generated_header_image(config)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(f"UPDATE runs SET {counter_update}")
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_header_disposition_counts" in codes
 
 
 def test_validator_reports_missing_vector_claimed_by_successful_run(tmp_path):
