@@ -9,6 +9,7 @@ import math
 import struct
 import traceback
 from collections.abc import Mapping
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +19,7 @@ from wsj_embeddings.adapters import (
     JinaHostedAdapterError,
     JinaHttpResponse,
 )
+from wsj_embeddings.tokenizer import PinnedJinaV4Tokenizer, PinnedTokenizerError
 
 
 class RecordingTransport:
@@ -39,6 +41,89 @@ class RecordingTransport:
         if isinstance(self.response, BaseException):
             raise self.response
         return self.response
+
+
+class SyntheticEncoding:
+    def __init__(self, offsets: list[tuple[int, int]]) -> None:
+        self.offsets = offsets
+
+
+class SyntheticLoadedTokenizer:
+    def encode(self, text: str, *, add_special_tokens: bool) -> SyntheticEncoding:
+        assert add_special_tokens is False
+        return SyntheticEncoding([(index, index + 1) for index in range(len(text))])
+
+
+def test_pinned_tokenizer_resolves_immutable_official_artifact_and_checks_bytes(
+    tmp_path,
+):
+    """Break caught: runtime tokenization follows mutable main or unchecked bytes."""
+
+    artifact = tmp_path / "tokenizer.json"
+    artifact.write_bytes(b"generated wrong tokenizer bytes")
+    resolution_calls: list[tuple[str, str, str]] = []
+    loader_calls: list[Path] = []
+
+    def resolve(repo_id: str, filename: str, revision: str) -> Path:
+        resolution_calls.append((repo_id, filename, revision))
+        return artifact
+
+    tokenizer = PinnedJinaV4Tokenizer(
+        resolver=resolve,
+        loader=lambda path: loader_calls.append(path),
+    )
+
+    with pytest.raises(PinnedTokenizerError, match="checksum"):
+        tokenizer.token_offsets("generated")
+
+    assert resolution_calls == [
+        (
+            "jinaai/jina-embeddings-v4",
+            "tokenizer.json",
+            "d1e5d70b7b34d927a8cddac458583c4fbe50a914",
+        )
+    ]
+    assert loader_calls == []
+
+
+def test_verified_pinned_tokenizer_exposes_exact_offsets_without_network(tmp_path):
+    """Break caught: verified tokenizer offsets are discarded or add special tokens."""
+
+    artifact = tmp_path / "tokenizer.json"
+    artifact_bytes = b"generated tokenizer fixture"
+    artifact.write_bytes(artifact_bytes)
+    loaded = SyntheticLoadedTokenizer()
+    tokenizer = PinnedJinaV4Tokenizer(
+        resolver=lambda _repo, _filename, _revision: artifact,
+        loader=lambda path: loaded if path == artifact else None,
+        expected_sha256=hashlib.sha256(artifact_bytes).hexdigest(),
+    )
+
+    assert tokenizer.token_offsets("abc") == ((0, 1), (1, 2), (2, 3))
+
+
+def test_hosted_adapter_uses_injected_local_tokenizer_without_transport():
+    """Break caught: context planning sends a hosted request or ignores its pin."""
+
+    class RecordingTokenizer:
+        def __init__(self) -> None:
+            self.inputs: list[str] = []
+
+        def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
+            self.inputs.append(text)
+            return ((0, len(text)),)
+
+    tokenizer = RecordingTokenizer()
+    transport = RecordingTransport(AssertionError("network transport used"))
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=transport,
+        tokenizer=tokenizer,
+    )
+
+    assert adapter.token_offsets("generated") == ((0, 9),)
+    assert tokenizer.inputs == ["generated"]
+    assert transport.calls == []
 
 
 def _embedding(first: float, second: float) -> list[float]:

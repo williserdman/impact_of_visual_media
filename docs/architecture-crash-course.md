@@ -120,9 +120,11 @@ are valid only with that scope. Configuration defaults to four workers.
 |---|---|---|
 | `wsj_embeddings/config.py` | resolved disjoint roots and explicit hosted-processing authorization | CLI configuration loading |
 | `wsj_embeddings/adapters.py` | injected adapter protocol, deterministic fake adapter, and fixed hosted Jina adapter | corpus selection or output mutation |
+| `wsj_embeddings/tokenizer.py` | immutable official v4 tokenizer revision, artifact checksum verification, and lazy local loading | hosted inference or model self-hosting |
+| `wsj_embeddings/long_text.py` | exact token accounting, deterministic Markdown block packing, and reversible oversized-block partitioning | API calls or checkpoint mutation |
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
-| `wsj_embeddings/catalog.py` | separate schema version 7, exact read-only inspection, bounded lifecycle/generation transactions | preprocessing catalog mutation |
+| `wsj_embeddings/catalog.py` | separate schema version 8, exact read-only inspection, bounded lifecycle/generation/part transactions | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection, text/image encoding, composite derivation, hashes, and publication | hosted credential loading |
 | `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
@@ -252,8 +254,8 @@ ORDER BY published_at_utc, article_id;
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 7 has exactly seven base tables, no views,
-and no indexes. Versions 1 through 6 and malformed output are refused without
+catalog. Embedding schema version 8 has exactly nine base tables, no views,
+and no indexes. Versions 1 through 7 and malformed output are refused without
 migration.
 
 | Table | Ordered columns and DuckDB types | Primary key |
@@ -265,14 +267,25 @@ migration.
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 | `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
+| `long_text_parts` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `part_count INTEGER`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `updated_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index)` |
+| `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
 
 `configuration_id` is the SHA-256 of compact, key-sorted JSON for every
 `EmbeddingProfile` field: model alias and observed hosted model/API metadata,
 task, dimensions, output type, normalization, tokenizer/context rules,
 long-text aggregation, image rules/transform, multimodal formula, and client
-configuration version. The current long-text identity is
-`single-input-provider-pooling-v1`, describing the single provider-pooled
-vector returned for the complete input. `input_sha256` covers the exact UTF-8
+configuration version. The official local tokenizer artifact is
+`jinaai/jina-embeddings-v4/tokenizer.json` at immutable revision
+`d1e5d70b7b34d927a8cddac458583c4fbe50a914`, accepted only when its bytes match
+SHA-256 `9c5ae00e602b8860cbd784ba82a8aa14e8feecec692e7076590d014d7b7fdafa`.
+This pins token boundaries without self-hosting the model. The conservative
+context ceiling is 8,192 tokens. Inputs at or below it keep one hosted request
+with `truncate=false`. Longer Markdown is greedily packed at complete
+blank-line block separators, with one oversized block partitioned only on safe
+token offsets. Every part is an exact, ordered, non-overlapping substring.
+The current long-text identity is
+`l2-token-count-weighted-mean-float32-v1`: normalized parts contribute by exact
+token count to one float32 L2-normalized `article_text` vector. `input_sha256` covers the exact UTF-8
 canonical Markdown or exact local header-image bytes; for a composite it covers
 only the two source-generation identities/vector hashes and formula. After
 finite/nonzero checks and L2 normalization,
@@ -282,6 +295,15 @@ representation. Work state is one of `queued`, `in_progress`, `succeeded`,
 `retryable`, `terminal`, `interrupted`, or `not_applicable`. The supported
 vector modalities are `article_text`, `header_image`, and `multimodal_article`,
 all dimension 2,048.
+`long_text_parts` is operational checkpoint/vector state, not a fourth research
+modality. A part success commits before the next hosted call, so a crash or
+retryable failure repurchases only unproven parts. Aggregate provenance links
+the one research vector to each part generation, content hash, token count, and
+stored-vector hash without retaining Markdown. Changed Markdown selects a new
+article input identity; changed tokenizer, ceiling, boundary rule, or formula
+selects a new `configuration_id`. In both cases stale parts cannot satisfy the
+new aggregate, and normal source invalidation also archives/removes the dependent
+same-configuration multimodal generation.
 `source_relative_path` records the archive-relative path only for image work;
 no-header work keeps both path and input hash null and never publishes a vector.
 The only other null input hash is the narrow missing-header retryable
@@ -339,6 +361,10 @@ each content-free input identity and every active composite, so a
 self-consistent altered vector, retargeted source reference, missing provenance,
 or impossible midpoint is reported without mutation. Run coverage is exact per
 immutable generating run; generations from another run cannot mask deletion.
+Long-text validation separately verifies checkpoint domains/hashes/token
+ceilings and provenance completeness, then recomputes every active aggregate
+from all weighted part vectors. It does not acquire the tokenizer or a hosted
+credential.
 
 The research query seam is:
 
@@ -543,14 +569,17 @@ reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
-and local header-image embeddings. It checks the exact six-table embedding schema first, opens the
+and local header-image embeddings. It checks the exact nine-table embedding
+schema first, opens the
 preprocessing catalog through its public exact-schema contract, and reports
 stable sorted issues for configuration identity/reference failures, malformed
 work lifecycle/failure checkpoints, malformed generation provenance, missing
 vectors claimed by successful work,
 unsupported modality/dimension, orphaned canonical identities, publication
-mismatch, unsafe or missing canonical Markdown/header images, input-hash mismatch,
-non-finite/zero/non-unit vectors, and float32 vector-hash mismatch. Messages
+mismatch, unsafe or missing canonical Markdown/header images, input-hash
+mismatch, non-finite/zero/non-unit vectors, and float32 vector-hash mismatch.
+It also checks long-text part lifecycle/vector state, complete aggregate
+provenance, and exact token-weighted recomputation. Messages
 never contain Markdown, vector values, or credentials. When configurations
 coexist, validation requires one explicit configuration identity and never
 mixes generations. Validation detects but does not repair state.
@@ -570,7 +599,7 @@ directories. They must never read the licensed archive.
 | `test_recovery.py` | lock, interruptions, legacy refusal, path moves, orphan and symlink safety |
 | `test_validate.py` | every cross-artifact invariant and streaming behavior |
 | `test_smoke.py` | complete generated-fixture workflow and isolation from configured data |
-| `test_embeddings_pipeline.py` | exact downstream schema, no-follow reads, read-only-before-write opening, publication, run coverage, and validation |
+| `test_embeddings_pipeline.py` | exact downstream schema, no-follow reads, long-text boundaries/resume/aggregation, publication, run coverage, and validation |
 | `test_embeddings_cli.py` | deterministic smoke, inventory, authorization, and bounded-run public CLI seams |
 
 The standard verification set is `pytest -q`, `ruff check .`,

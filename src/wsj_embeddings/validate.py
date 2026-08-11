@@ -101,6 +101,11 @@ def validate_embedding_outputs(
                         selected_configuration_id,
                         issues,
                     )
+                    _validate_long_text_parts(
+                        catalog.connection,
+                        selected_configuration_id,
+                        issues,
+                    )
                     _validate_multimodal_provenance(
                         catalog.connection,
                         selected_configuration_id,
@@ -923,6 +928,275 @@ def _validate_multimodal_provenance(
                 "multimodal_vector_mismatch",
                 "multimodal vector differs from its normalized source midpoint",
             )
+
+
+def _validate_long_text_parts(
+    connection: duckdb.DuckDBPyConnection,
+    configuration_id: str,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Verify operational parts and recompute active token-weighted aggregates."""
+
+    configuration = connection.execute(
+        """
+        SELECT context_token_limit, long_text_aggregation
+        FROM embedding_configurations
+        WHERE configuration_id = ?
+        """,
+        [configuration_id],
+    ).fetchone()
+    if configuration is None:
+        return
+    token_limit, configured_aggregation = configuration
+    run_ids = {
+        row[0]
+        for row in connection.execute(
+            "SELECT run_id FROM runs WHERE configuration_id = ?",
+            [configuration_id],
+        ).fetchall()
+    }
+    part_rows = connection.execute(
+        """
+        SELECT article_id, article_input_sha256, part_index, part_count,
+               part_input_sha256, token_count, state, attempt_count,
+               error_code, status_code, retry_after_seconds, last_run_id,
+               generation_run_id, stored_vector_sha256, vector
+        FROM long_text_parts
+        WHERE configuration_id = ?
+        ORDER BY article_id, article_input_sha256, part_index
+        """,
+        [configuration_id],
+    ).fetchall()
+    parts_by_key: dict[tuple[str, str, int], tuple[object, ...]] = {}
+    for row in part_rows:
+        (
+            article_id,
+            article_input_sha256,
+            part_index,
+            part_count,
+            part_input_sha256,
+            part_token_count,
+            raw_state,
+            attempt_count,
+            error_code,
+            status_code,
+            retry_after_seconds,
+            last_run_id,
+            generation_run_id,
+            vector_sha256,
+            vector,
+        ) = row
+        try:
+            state = WorkState(str(raw_state))
+        except ValueError:
+            state = None
+        failure_metadata = (error_code, status_code, retry_after_seconds)
+        identity_valid = (
+            _is_sha256(article_input_sha256)
+            and _is_sha256(part_input_sha256)
+            and isinstance(part_index, int)
+            and isinstance(part_count, int)
+            and 0 <= part_index < part_count
+            and part_count > 1
+            and isinstance(part_token_count, int)
+            and 0 < part_token_count <= token_limit
+            and last_run_id in run_ids
+            and state is not None
+            and state is not WorkState.NOT_APPLICABLE
+        )
+        if state is WorkState.SUCCEEDED:
+            state_valid = (
+                attempt_count >= 1
+                and not any(value is not None for value in failure_metadata)
+                and generation_run_id in run_ids
+                and _is_sha256(vector_sha256)
+                and vector is not None
+            )
+            if state_valid:
+                issue_count = len(issues)
+                _validate_vector(vector, vector_sha256, issues)
+                state_valid = len(issues) == issue_count
+        else:
+            state_valid = (
+                generation_run_id is None
+                and vector_sha256 is None
+                and vector is None
+                and (
+                    state is None
+                    or not state.is_failure
+                    or (attempt_count >= 1 and error_code is not None)
+                )
+                and (
+                    state is None
+                    or state.is_failure
+                    or not any(value is not None for value in failure_metadata)
+                )
+            )
+        if not identity_valid or not state_valid:
+            _append(
+                issues,
+                "invalid_long_text_part",
+                "long-text part checkpoints are incomplete or inconsistent",
+            )
+        parts_by_key[(str(article_id), str(article_input_sha256), int(part_index))] = (
+            part_count,
+            part_input_sha256,
+            part_token_count,
+            state,
+            generation_run_id,
+            vector_sha256,
+            vector,
+        )
+
+    aggregates = connection.execute(
+        """
+        SELECT e.article_id, e.input_sha256, e.vector,
+               e.stored_vector_sha256, w.generation_run_id
+        FROM embeddings AS e
+        JOIN embedding_work_items AS w
+          USING (article_id, modality, configuration_id)
+        WHERE e.configuration_id = ? AND e.modality = 'article_text'
+          AND w.state = 'succeeded'
+        """,
+        [configuration_id],
+    ).fetchall()
+    for (
+        article_id,
+        article_input_sha256,
+        aggregate_vector,
+        aggregate_vector_sha256,
+        generation_run_id,
+    ) in aggregates:
+        matching_part_count = sum(
+            key[:2] == (str(article_id), str(article_input_sha256))
+            for key in parts_by_key
+        )
+        provenance = connection.execute(
+            """
+            SELECT part_index, article_input_sha256, part_count,
+                   part_generation_run_id, part_input_sha256, token_count,
+                   part_stored_vector_sha256, aggregation_version
+            FROM article_text_aggregation_provenance
+            WHERE article_id = ? AND configuration_id = ?
+              AND generation_run_id = ?
+            ORDER BY part_index
+            """,
+            [article_id, configuration_id, generation_run_id],
+        ).fetchall()
+        if not provenance:
+            if matching_part_count:
+                _append(
+                    issues,
+                    "missing_long_text_provenance",
+                    "long-text aggregates lack complete part provenance",
+                )
+            continue
+        expected_count = provenance[0][2]
+        if (
+            not isinstance(expected_count, int)
+            or matching_part_count != expected_count
+            or len(provenance) != expected_count
+            or [row[0] for row in provenance] != list(range(expected_count))
+        ):
+            _append(
+                issues,
+                "missing_long_text_provenance",
+                "long-text aggregates lack complete part provenance",
+            )
+            continue
+        weighted_parts: list[tuple[int, tuple[float, ...]]] = []
+        linkage_valid = True
+        for row in provenance:
+            (
+                part_index,
+                provenance_article_sha256,
+                part_count,
+                part_generation_run_id,
+                part_input_sha256,
+                part_token_count,
+                part_vector_sha256,
+                aggregation_version,
+            ) = row
+            part = parts_by_key.get(
+                (str(article_id), str(article_input_sha256), int(part_index))
+            )
+            if part is None:
+                linkage_valid = False
+                continue
+            (
+                current_count,
+                current_input_sha256,
+                current_token_count,
+                current_state,
+                current_generation_run_id,
+                current_vector_sha256,
+                current_vector,
+            ) = part
+            current_link_valid = (
+                provenance_article_sha256 == article_input_sha256
+                and part_count == expected_count == current_count
+                and part_generation_run_id == current_generation_run_id
+                and part_input_sha256 == current_input_sha256
+                and part_token_count == current_token_count
+                and part_vector_sha256 == current_vector_sha256
+                and aggregation_version
+                == configured_aggregation
+                == "l2-token-count-weighted-mean-float32-v1"
+                and current_state is WorkState.SUCCEEDED
+                and current_vector is not None
+            )
+            if not current_link_valid:
+                linkage_valid = False
+                continue
+            weighted_parts.append(
+                (
+                    int(part_token_count),
+                    tuple(float(value) for value in current_vector),
+                )
+            )
+        if not linkage_valid or len(weighted_parts) != expected_count:
+            _append(
+                issues,
+                "invalid_long_text_provenance",
+                "long-text provenance does not identify its part generations",
+            )
+            continue
+        try:
+            expected_vector = _weighted_long_text_vector(weighted_parts)
+        except (OverflowError, TypeError, ValueError, struct.error):
+            _append(
+                issues,
+                "invalid_long_text_provenance",
+                "long-text provenance does not identify its part generations",
+            )
+            continue
+        if (
+            tuple(aggregate_vector) != expected_vector
+            or aggregate_vector_sha256 != _vector_hash(expected_vector)
+        ):
+            _append(
+                issues,
+                "long_text_vector_mismatch",
+                "long-text vector differs from its token-weighted parts",
+            )
+
+
+def _weighted_long_text_vector(
+    parts: list[tuple[int, tuple[float, ...]]],
+) -> tuple[float, ...]:
+    total_tokens = sum(part_token_count for part_token_count, _vector in parts)
+    values = tuple(
+        sum(part_token_count * vector[index] for part_token_count, vector in parts)
+        / total_tokens
+        for index in range(_VECTOR_DIMENSIONS)
+    )
+    norm = math.sqrt(sum(value * value for value in values))
+    if not math.isfinite(norm) or norm == 0:
+        raise ValueError("invalid weighted long-text vector")
+    return tuple(
+        struct.unpack("<f", struct.pack("<f", value / norm))[0]
+        for value in values
+    )
 
 
 def _generation_reference_exists(

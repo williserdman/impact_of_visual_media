@@ -14,12 +14,23 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from wsj_embeddings.long_text import TextOffsetTokenizer
 from wsj_embeddings.models import EmbeddingProfile
+from wsj_embeddings.tokenizer import (
+    JINA_V4_TOKENIZER_REVISION,
+    JINA_V4_TOKENIZER_SHA256,
+    PinnedJinaV4Tokenizer,
+)
 
 _JINA_EMBEDDINGS_URL = "https://api.jina.ai/v1/embeddings"
 _JINA_MODEL = "jina-embeddings-v4"
 _JINA_TASK = "retrieval.passage"
 _JINA_DIMENSIONS = 2048
+_CONSERVATIVE_CONTEXT_TOKEN_LIMIT = 8_192
+_TOKENIZER_IDENTITY = (
+    "jinaai/jina-embeddings-v4@"
+    f"{JINA_V4_TOKENIZER_REVISION}:tokenizer.json#sha256={JINA_V4_TOKENIZER_SHA256}"
+)
 _SAFE_USAGE_FIELDS = frozenset(
     {"input_tokens", "output_tokens", "prompt_tokens", "total_tokens"}
 )
@@ -44,6 +55,8 @@ class EmbeddingAdapter(Protocol):
     def profile(self) -> EmbeddingProfile: ...
 
     def embed_text(self, text: str) -> tuple[float, ...]: ...
+
+    def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]: ...
 
     def embed_image(self, image_base64: str) -> tuple[float, ...]: ...
 
@@ -194,14 +207,14 @@ class JinaEmbeddingAdapter:
         normalization="l2-client-float32-v1",
         observed_model=_JINA_MODEL,
         observed_api_version="2026.07.27.1603",
-        tokenizer_revision="jinaai/jina-embeddings-v4-hosted-2026-08-11",
-        context_token_limit=32_768,
-        context_rules="complete-input-truncate-false-late-chunking-false-v1",
-        long_text_aggregation="single-input-provider-pooling-v1",
+        tokenizer_revision=_TOKENIZER_IDENTITY,
+        context_token_limit=_CONSERVATIVE_CONTEXT_TOKEN_LIMIT,
+        context_rules="markdown-block-greedy-no-overlap-truncate-false-v1",
+        long_text_aggregation="l2-token-count-weighted-mean-float32-v1",
         image_input_rules="base64-source-bytes-no-remote-v1",
         image_transform="source-bytes-no-transform-v1",
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
-        client_configuration_version="wsj-embeddings-config-v1",
+        client_configuration_version="wsj-embeddings-config-v2",
     )
 
     def __init__(
@@ -209,6 +222,7 @@ class JinaEmbeddingAdapter:
         *,
         environment: Mapping[str, str] | None = None,
         transport: JinaTransport | None = None,
+        tokenizer: TextOffsetTokenizer | None = None,
         timeout_seconds: float = 30.0,
     ) -> None:
         if timeout_seconds <= 0:
@@ -219,7 +233,13 @@ class JinaEmbeddingAdapter:
             raise JinaHostedAdapterError("missing_credential", retryable=False)
         self._authorization = f"Bearer {api_key}"
         self._transport = UrllibJinaTransport() if transport is None else transport
+        self._tokenizer = PinnedJinaV4Tokenizer() if tokenizer is None else tokenizer
         self._timeout_seconds = timeout_seconds
+
+    def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
+        """Tokenize locally with the immutable checksum-verified v4 artifact."""
+
+        return self._tokenizer.token_offsets(text)
 
     def embed_text(self, text: str) -> tuple[float, ...]:
         """Maintain the existing coordinator adapter seam for text-only callers."""
@@ -446,19 +466,24 @@ class FakeEmbeddingAdapter:
         observed_model="fake-jina-embeddings-v4",
         observed_api_version="synthetic-v1",
         tokenizer_revision="synthetic-jina-v4-tokenizer-v1",
-        context_token_limit=32_768,
-        context_rules="complete-input-truncate-false-late-chunking-false-v1",
-        long_text_aggregation="single-input-provider-pooling-v1",
+        context_token_limit=8_192,
+        context_rules="markdown-block-greedy-no-overlap-truncate-false-v1",
+        long_text_aggregation="l2-token-count-weighted-mean-float32-v1",
         image_input_rules="base64-source-bytes-no-remote-v1",
         image_transform="source-bytes-no-transform-v1",
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
-        client_configuration_version="wsj-embeddings-config-v1",
+        client_configuration_version="wsj-embeddings-config-v2",
     )
 
     def embed_text(self, text: str) -> tuple[float, ...]:
         if not text:
             raise ValueError("text input must not be empty")
         return (1.0, *(0.0 for _ in range(2047)))
+
+    def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
+        """Tokenize generated fixtures as one exact Unicode codepoint each."""
+
+        return tuple((index, index + 1) for index in range(len(text)))
 
     def embed_image(self, image_base64: str) -> tuple[float, ...]:
         try:

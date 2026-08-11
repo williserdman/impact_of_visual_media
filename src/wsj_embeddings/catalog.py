@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import duckdb
 
+from wsj_embeddings.long_text import LongTextPart
 from wsj_embeddings.models import (
     EmbeddingModality,
     EmbeddingProfile,
@@ -23,13 +24,15 @@ from wsj_embeddings.models import (
     WorkState,
 )
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "7"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "8"
 
 _EMBEDDING_CATALOG_TABLES = {
+    "article_text_aggregation_provenance",
     "embedding_configurations",
     "embedding_generation_history",
     "embedding_work_items",
     "embeddings",
+    "long_text_parts",
     "metadata",
     "multimodal_embedding_provenance",
     "runs",
@@ -122,6 +125,39 @@ _TABLE_COLUMNS = {
         ("formula_version", "VARCHAR", True, None, False),
         ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
+    "long_text_parts": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("article_input_sha256", "VARCHAR", True, None, True),
+        ("part_index", "INTEGER", True, None, True),
+        ("part_count", "INTEGER", True, None, False),
+        ("part_input_sha256", "VARCHAR", True, None, False),
+        ("token_count", "INTEGER", True, None, False),
+        ("state", "VARCHAR", True, None, False),
+        ("attempt_count", "INTEGER", True, None, False),
+        ("error_code", "VARCHAR", False, None, False),
+        ("status_code", "INTEGER", False, None, False),
+        ("retry_after_seconds", "DOUBLE", False, None, False),
+        ("last_run_id", "VARCHAR", True, None, False),
+        ("generation_run_id", "VARCHAR", False, None, False),
+        ("stored_vector_sha256", "VARCHAR", False, None, False),
+        ("vector", "FLOAT[2048]", False, None, False),
+        ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
+    "article_text_aggregation_provenance": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("part_index", "INTEGER", True, None, True),
+        ("article_input_sha256", "VARCHAR", True, None, False),
+        ("part_count", "INTEGER", True, None, False),
+        ("part_generation_run_id", "VARCHAR", True, None, False),
+        ("part_input_sha256", "VARCHAR", True, None, False),
+        ("token_count", "INTEGER", True, None, False),
+        ("part_stored_vector_sha256", "VARCHAR", True, None, False),
+        ("aggregation_version", "VARCHAR", True, None, False),
+        ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
 }
 _KEY_CONSTRAINTS = {
     ("metadata", "PRIMARY KEY", ("key",)),
@@ -146,6 +182,21 @@ _KEY_CONSTRAINTS = {
         "multimodal_embedding_provenance",
         "PRIMARY KEY",
         ("article_id", "configuration_id", "generation_run_id"),
+    ),
+    (
+        "long_text_parts",
+        "PRIMARY KEY",
+        (
+            "article_id",
+            "configuration_id",
+            "article_input_sha256",
+            "part_index",
+        ),
+    ),
+    (
+        "article_text_aggregation_provenance",
+        "PRIMARY KEY",
+        ("article_id", "configuration_id", "generation_run_id", "part_index"),
     ),
 }
 _EXPECTED_CONSTRAINTS = Counter(
@@ -640,6 +691,55 @@ class EmbeddingCatalog:
                     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
                     PRIMARY KEY (
                         article_id, configuration_id, generation_run_id
+                    )
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS long_text_parts (
+                    article_id VARCHAR NOT NULL,
+                    configuration_id VARCHAR NOT NULL,
+                    article_input_sha256 VARCHAR NOT NULL,
+                    part_index INTEGER NOT NULL,
+                    part_count INTEGER NOT NULL,
+                    part_input_sha256 VARCHAR NOT NULL,
+                    token_count INTEGER NOT NULL,
+                    state VARCHAR NOT NULL,
+                    attempt_count INTEGER NOT NULL,
+                    error_code VARCHAR,
+                    status_code INTEGER,
+                    retry_after_seconds DOUBLE,
+                    last_run_id VARCHAR NOT NULL,
+                    generation_run_id VARCHAR,
+                    stored_vector_sha256 VARCHAR,
+                    vector FLOAT[2048],
+                    updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    PRIMARY KEY (
+                        article_id, configuration_id, article_input_sha256,
+                        part_index
+                    )
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS article_text_aggregation_provenance (
+                    article_id VARCHAR NOT NULL,
+                    configuration_id VARCHAR NOT NULL,
+                    generation_run_id VARCHAR NOT NULL,
+                    part_index INTEGER NOT NULL,
+                    article_input_sha256 VARCHAR NOT NULL,
+                    part_count INTEGER NOT NULL,
+                    part_generation_run_id VARCHAR NOT NULL,
+                    part_input_sha256 VARCHAR NOT NULL,
+                    token_count INTEGER NOT NULL,
+                    part_stored_vector_sha256 VARCHAR NOT NULL,
+                    aggregation_version VARCHAR NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    PRIMARY KEY (
+                        article_id, configuration_id, generation_run_id,
+                        part_index
                     )
                 )
                 """
@@ -1232,6 +1332,288 @@ class EmbeddingCatalog:
         )
         self.increment_run(run_id, "attempted")
 
+    def register_long_text_parts(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+        parts: Sequence[LongTextPart],
+        reprocess: bool,
+    ) -> tuple[WorkState, ...]:
+        """Register exact operational parts without creating observations."""
+
+        states: list[WorkState] = []
+        part_count = len(parts)
+        for part in parts:
+            row = self.connection.execute(
+                """
+                SELECT part_count, part_input_sha256, token_count, state,
+                       generation_run_id, stored_vector_sha256, vector
+                FROM long_text_parts
+                WHERE article_id = ? AND configuration_id = ?
+                  AND article_input_sha256 = ? AND part_index = ?
+                """,
+                [
+                    article_id,
+                    configuration_identifier,
+                    article_input_sha256,
+                    part.index,
+                ],
+            ).fetchone()
+            if row is None:
+                self.connection.execute(
+                    """
+                    INSERT INTO long_text_parts
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?,
+                            NULL, NULL, NULL, current_timestamp)
+                    """,
+                    [
+                        article_id,
+                        configuration_identifier,
+                        article_input_sha256,
+                        part.index,
+                        part_count,
+                        part.input_sha256,
+                        part.token_count,
+                        WorkState.QUEUED.value,
+                        run_id,
+                    ],
+                )
+                states.append(WorkState.QUEUED)
+                continue
+            if tuple(row[:3]) != (
+                part_count,
+                part.input_sha256,
+                part.token_count,
+            ):
+                raise ValueError("long-text part identity changed within configuration")
+            state = WorkState(str(row[3]))
+            if reprocess:
+                self.connection.execute(
+                    """
+                    UPDATE long_text_parts
+                    SET state = ?, attempt_count = 0, error_code = NULL,
+                        status_code = NULL, retry_after_seconds = NULL,
+                        last_run_id = ?, generation_run_id = NULL,
+                        stored_vector_sha256 = NULL, vector = NULL,
+                        updated_at = current_timestamp
+                    WHERE article_id = ? AND configuration_id = ?
+                      AND article_input_sha256 = ? AND part_index = ?
+                    """,
+                    [
+                        WorkState.QUEUED.value,
+                        run_id,
+                        article_id,
+                        configuration_identifier,
+                        article_input_sha256,
+                        part.index,
+                    ],
+                )
+                states.append(WorkState.QUEUED)
+                continue
+            proven_success = (
+                state is WorkState.SUCCEEDED
+                and row[4] is not None
+                and row[5] is not None
+                and row[6] is not None
+            )
+            if proven_success:
+                self.connection.execute(
+                    """
+                    UPDATE long_text_parts
+                    SET last_run_id = ?, updated_at = current_timestamp
+                    WHERE article_id = ? AND configuration_id = ?
+                      AND article_input_sha256 = ? AND part_index = ?
+                    """,
+                    [
+                        run_id,
+                        article_id,
+                        configuration_identifier,
+                        article_input_sha256,
+                        part.index,
+                    ],
+                )
+                states.append(WorkState.SUCCEEDED)
+                continue
+            if state in {WorkState.IN_PROGRESS, WorkState.SUCCEEDED}:
+                state = WorkState.INTERRUPTED
+                self.connection.execute(
+                    """
+                    UPDATE long_text_parts
+                    SET state = ?, last_run_id = ?, generation_run_id = NULL,
+                        stored_vector_sha256 = NULL, vector = NULL,
+                        updated_at = current_timestamp
+                    WHERE article_id = ? AND configuration_id = ?
+                      AND article_input_sha256 = ? AND part_index = ?
+                    """,
+                    [
+                        state.value,
+                        run_id,
+                        article_id,
+                        configuration_identifier,
+                        article_input_sha256,
+                        part.index,
+                    ],
+                )
+            else:
+                self.connection.execute(
+                    """
+                    UPDATE long_text_parts
+                    SET last_run_id = ?, updated_at = current_timestamp
+                    WHERE article_id = ? AND configuration_id = ?
+                      AND article_input_sha256 = ? AND part_index = ?
+                    """,
+                    [
+                        run_id,
+                        article_id,
+                        configuration_identifier,
+                        article_input_sha256,
+                        part.index,
+                    ],
+                )
+            states.append(state)
+        return tuple(states)
+
+    def start_long_text_part_attempt(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+        part_index: int,
+    ) -> None:
+        """Checkpoint one part before its hosted request."""
+
+        self.connection.execute(
+            """
+            UPDATE long_text_parts
+            SET state = ?, attempt_count = attempt_count + 1,
+                error_code = NULL, status_code = NULL,
+                retry_after_seconds = NULL, last_run_id = ?,
+                generation_run_id = NULL, stored_vector_sha256 = NULL,
+                vector = NULL, updated_at = current_timestamp
+            WHERE article_id = ? AND configuration_id = ?
+              AND article_input_sha256 = ? AND part_index = ?
+            """,
+            [
+                WorkState.IN_PROGRESS.value,
+                run_id,
+                article_id,
+                configuration_identifier,
+                article_input_sha256,
+                part_index,
+            ],
+        )
+
+    def record_long_text_part_failure(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+        part_index: int,
+        state: WorkState,
+        error_code: str,
+        status_code: int | None,
+        retry_after_seconds: float | None,
+    ) -> None:
+        """Commit one content-free part failure."""
+
+        if not state.is_failure:
+            raise ValueError("part failure requires a failure state")
+        self.connection.execute(
+            """
+            UPDATE long_text_parts
+            SET state = ?, error_code = ?, status_code = ?,
+                retry_after_seconds = ?, last_run_id = ?,
+                generation_run_id = NULL, stored_vector_sha256 = NULL,
+                vector = NULL, updated_at = current_timestamp
+            WHERE article_id = ? AND configuration_id = ?
+              AND article_input_sha256 = ? AND part_index = ?
+            """,
+            [
+                state.value,
+                error_code,
+                status_code,
+                retry_after_seconds,
+                run_id,
+                article_id,
+                configuration_identifier,
+                article_input_sha256,
+                part_index,
+            ],
+        )
+
+    def publish_long_text_part_success(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+        part_index: int,
+        stored_vector_sha256: str,
+        vector: Sequence[float],
+    ) -> None:
+        """Commit one validated operational vector as its durable checkpoint."""
+
+        self.connection.execute(
+            """
+            UPDATE long_text_parts
+            SET state = ?, error_code = NULL, status_code = NULL,
+                retry_after_seconds = NULL, last_run_id = ?,
+                generation_run_id = ?, stored_vector_sha256 = ?, vector = ?,
+                updated_at = current_timestamp
+            WHERE article_id = ? AND configuration_id = ?
+              AND article_input_sha256 = ? AND part_index = ?
+            """,
+            [
+                WorkState.SUCCEEDED.value,
+                run_id,
+                run_id,
+                stored_vector_sha256,
+                list(vector),
+                article_id,
+                configuration_identifier,
+                article_input_sha256,
+                part_index,
+            ],
+        )
+
+    def long_text_part_generation(
+        self,
+        *,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+        part_index: int,
+    ) -> tuple[object, ...]:
+        """Return one proven current part generation for aggregation."""
+
+        row = self.connection.execute(
+            """
+            SELECT generation_run_id, stored_vector_sha256, vector
+            FROM long_text_parts
+            WHERE article_id = ? AND configuration_id = ?
+              AND article_input_sha256 = ? AND part_index = ?
+              AND state = ?
+            """,
+            [
+                article_id,
+                configuration_identifier,
+                article_input_sha256,
+                part_index,
+                WorkState.SUCCEEDED.value,
+            ],
+        ).fetchone()
+        if row is None or any(value is None for value in row):
+            raise ValueError("long-text part lacks a proven generation")
+        return tuple(row)
+
     def record_failure(
         self,
         *,
@@ -1362,6 +1744,66 @@ class EmbeddingCatalog:
             WHERE run_id = ?
             """,
             [run_id],
+        )
+
+    def publish_long_text_success(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        published_at_utc: object,
+        publication_date_new_york: object,
+        dimensions: int,
+        input_sha256: str,
+        stored_vector_sha256: str,
+        vector: Sequence[float],
+        aggregation_version: str,
+        parts: Sequence[tuple[int, str, int, str, str]],
+    ) -> None:
+        """Atomically publish one aggregate and every content-free part link."""
+
+        self.publish_success(
+            run_id=run_id,
+            article_id=article_id,
+            modality=EmbeddingModality.ARTICLE_TEXT.value,
+            configuration_identifier=configuration_identifier,
+            source_relative_path=None,
+            published_at_utc=published_at_utc,
+            publication_date_new_york=publication_date_new_york,
+            dimensions=dimensions,
+            input_sha256=input_sha256,
+            stored_vector_sha256=stored_vector_sha256,
+            vector=vector,
+        )
+        part_count = len(parts)
+        self.connection.executemany(
+            """
+            INSERT INTO article_text_aggregation_provenance
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            """,
+            [
+                [
+                    article_id,
+                    configuration_identifier,
+                    run_id,
+                    part_index,
+                    input_sha256,
+                    part_count,
+                    part_generation_run_id,
+                    part_input_sha256,
+                    token_count,
+                    part_vector_sha256,
+                    aggregation_version,
+                ]
+                for (
+                    part_index,
+                    part_input_sha256,
+                    token_count,
+                    part_generation_run_id,
+                    part_vector_sha256,
+                ) in parts
+            ],
         )
 
     def multimodal_sources(

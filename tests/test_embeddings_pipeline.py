@@ -127,6 +127,39 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("formula_version", "VARCHAR", True, None, False),
         ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
+    "long_text_parts": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("article_input_sha256", "VARCHAR", True, None, True),
+        ("part_index", "INTEGER", True, None, True),
+        ("part_count", "INTEGER", True, None, False),
+        ("part_input_sha256", "VARCHAR", True, None, False),
+        ("token_count", "INTEGER", True, None, False),
+        ("state", "VARCHAR", True, None, False),
+        ("attempt_count", "INTEGER", True, None, False),
+        ("error_code", "VARCHAR", False, None, False),
+        ("status_code", "INTEGER", False, None, False),
+        ("retry_after_seconds", "DOUBLE", False, None, False),
+        ("last_run_id", "VARCHAR", True, None, False),
+        ("generation_run_id", "VARCHAR", False, None, False),
+        ("stored_vector_sha256", "VARCHAR", False, None, False),
+        ("vector", "FLOAT[2048]", False, None, False),
+        ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
+    "article_text_aggregation_provenance": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("part_index", "INTEGER", True, None, True),
+        ("article_input_sha256", "VARCHAR", True, None, False),
+        ("part_count", "INTEGER", True, None, False),
+        ("part_generation_run_id", "VARCHAR", True, None, False),
+        ("part_input_sha256", "VARCHAR", True, None, False),
+        ("token_count", "INTEGER", True, None, False),
+        ("part_stored_vector_sha256", "VARCHAR", True, None, False),
+        ("aggregation_version", "VARCHAR", True, None, False),
+        ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
 }
 EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     ("metadata", ("key",)),
@@ -144,6 +177,19 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     (
         "multimodal_embedding_provenance",
         ("article_id", "configuration_id", "generation_run_id"),
+    ),
+    (
+        "long_text_parts",
+        (
+            "article_id",
+            "configuration_id",
+            "article_input_sha256",
+            "part_index",
+        ),
+    ),
+    (
+        "article_text_aggregation_provenance",
+        ("article_id", "configuration_id", "generation_run_id", "part_index"),
     ),
 }
 
@@ -320,6 +366,30 @@ class RecordingAdapter(FakeEmbeddingAdapter):
         return vector
 
 
+class CharacterTokenLongTextAdapter(FakeEmbeddingAdapter):
+    """Offline tokenizer/encoder whose one-codepoint offsets are hand-checkable."""
+
+    profile = replace(
+        FakeEmbeddingAdapter.profile,
+        tokenizer_revision="synthetic-character-offset-tokenizer-v1",
+        context_token_limit=8,
+        context_rules="markdown-block-greedy-no-overlap-v1",
+        long_text_aggregation="l2-token-count-weighted-mean-float32-v1",
+        client_configuration_version="wsj-embeddings-config-v2",
+    )
+
+    def __init__(self) -> None:
+        self.embedded_texts: list[str] = []
+
+    def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
+        return tuple((index, index + 1) for index in range(len(text)))
+
+    def embed_text(self, text: str) -> tuple[float, ...]:
+        axis = len(self.embedded_texts)
+        self.embedded_texts.append(text)
+        return tuple(1.0 if index == axis else 0.0 for index in range(2048))
+
+
 class RecordingMultimodalAdapter(RecordingAdapter):
     def __init__(self) -> None:
         super().__init__()
@@ -351,10 +421,17 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
     """Break caught: a public embedding rule changes without new eligibility."""
 
     profile = FakeEmbeddingAdapter.profile
-    assert profile.long_text_aggregation == "single-input-provider-pooling-v1"
+    assert (
+        profile.long_text_aggregation
+        == "l2-token-count-weighted-mean-float32-v1"
+    )
     assert (
         JinaEmbeddingAdapter.profile.long_text_aggregation
-        == "single-input-provider-pooling-v1"
+        == "l2-token-count-weighted-mean-float32-v1"
+    )
+    assert JinaEmbeddingAdapter.profile.context_token_limit == 8_192
+    assert "d1e5d70b7b34d927a8cddac458583c4fbe50a914" in (
+        JinaEmbeddingAdapter.profile.tokenizer_revision
     )
     assert (
         FakeEmbeddingAdapter.profile.image_transform
@@ -373,7 +450,7 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
         "output_type": "changed-output-type",
         "normalization": "changed-normalization",
         "tokenizer_revision": "changed-tokenizer",
-        "context_token_limit": 8192,
+        "context_token_limit": 4096,
         "context_rules": "changed-context-rules",
         "long_text_aggregation": "changed-aggregation",
         "image_input_rules": "changed-image-rules",
@@ -516,6 +593,483 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
     assert vector_type == "FLOAT[2048]"
     assert row[7] == (1.0,) + (0.0,) * 2047
     assert snapshot_fixture_inputs(config) == before
+
+
+def test_over_context_markdown_packs_complete_blocks_and_aggregates_every_part(
+    tmp_path,
+):
+    """Break caught: oversized Markdown is sent once or tail blocks are discarded."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    markdown = "# A\n\nBBBB\n\nCC"
+    article_input_sha256 = replace_generated_embedding_markdown(config, markdown)
+    adapter = CharacterTokenLongTextAdapter()
+
+    result = run_embedding_pipeline(config, adapter, limit=1)
+
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=1,
+        succeeded=1,
+        header_absent=1,
+    )
+    assert adapter.embedded_texts == ["# A\n\n", "BBBB\n\nCC"]
+    assert "".join(adapter.embedded_texts) == markdown
+    configuration_identifier = configuration_id(adapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT part_index, part_count, part_input_sha256, token_count,
+                   state, attempt_count, generation_run_id IS NOT NULL,
+                   stored_vector_sha256 IS NOT NULL, vector IS NOT NULL
+            FROM long_text_parts
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+              AND configuration_id = ? AND article_input_sha256 = ?
+            ORDER BY part_index
+            """,
+            [configuration_identifier, article_input_sha256],
+        ).fetchall() == [
+            (
+                0,
+                2,
+                hashlib.sha256(b"# A\n\n").hexdigest(),
+                5,
+                "succeeded",
+                1,
+                True,
+                True,
+                True,
+            ),
+            (
+                1,
+                2,
+                hashlib.sha256(b"BBBB\n\nCC").hexdigest(),
+                8,
+                "succeeded",
+                1,
+                True,
+                True,
+                True,
+            ),
+        ]
+        vector = db.execute(
+            """
+            SELECT vector FROM embeddings
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+              AND modality = 'article_text' AND configuration_id = ?
+            """,
+            [configuration_identifier],
+        ).fetchone()[0]
+        provenance = db.execute(
+            """
+            SELECT part_index, article_input_sha256, part_count, token_count,
+                   aggregation_version
+            FROM article_text_aggregation_provenance
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+              AND configuration_id = ?
+            ORDER BY part_index
+            """,
+            [configuration_identifier],
+        ).fetchall()
+    assert vector == (
+        0.5299989581108093,
+        0.847998321056366,
+        *(0.0 for _ in range(2046)),
+    )
+    assert provenance == [
+        (
+            0,
+            article_input_sha256,
+            2,
+            5,
+            "l2-token-count-weighted-mean-float32-v1",
+        ),
+        (
+            1,
+            article_input_sha256,
+            2,
+            8,
+            "l2-token-count-weighted-mean-float32-v1",
+        ),
+    ]
+    assert validate_embedding_outputs(config).ok
+
+
+def test_markdown_at_exact_token_ceiling_keeps_one_hosted_input(tmp_path):
+    """Break caught: the inclusive hosted boundary is split unnecessarily."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    markdown = "ABCDEFGH"
+    replace_generated_embedding_markdown(config, markdown)
+    adapter = CharacterTokenLongTextAdapter()
+
+    run_embedding_pipeline(config, adapter, limit=1)
+
+    assert adapter.embedded_texts == [markdown]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM long_text_parts").fetchone() == (0,)
+        assert db.execute(
+            "SELECT count(*) FROM article_text_aggregation_provenance"
+        ).fetchone() == (0,)
+
+
+def test_one_oversized_markdown_block_splits_at_reversible_token_boundaries(
+    tmp_path,
+):
+    """Break caught: splitting one huge block drops, overlaps, or rewrites text."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    markdown = "ABCDEFGHIJKLMNOPQR"
+    replace_generated_embedding_markdown(config, markdown)
+    adapter = CharacterTokenLongTextAdapter()
+
+    run_embedding_pipeline(config, adapter, limit=1)
+
+    assert adapter.embedded_texts == ["ABCDEFGH", "IJKLMNOP", "QR"]
+    assert "".join(adapter.embedded_texts) == markdown
+    assert [len(part) for part in adapter.embedded_texts] == [8, 8, 2]
+
+
+def test_oversized_block_respects_overlapping_byte_fallback_token_offsets(tmp_path):
+    """Break caught: multiple tokenizer tokens for one codepoint lose that text."""
+
+    class ByteFallbackTokenizerAdapter(CharacterTokenLongTextAdapter):
+        profile = replace(
+            CharacterTokenLongTextAdapter.profile,
+            context_token_limit=2,
+        )
+
+        def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
+            offsets: list[tuple[int, int]] = []
+            for index, character in enumerate(text):
+                offsets.append((index, index + 1))
+                if character == "😊":
+                    offsets.append((index, index + 1))
+            return tuple(offsets)
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    markdown = "a😊b"
+    replace_generated_embedding_markdown(config, markdown)
+    adapter = ByteFallbackTokenizerAdapter()
+
+    run_embedding_pipeline(config, adapter, limit=1)
+
+    assert adapter.embedded_texts == ["a", "😊", "b"]
+    assert "".join(adapter.embedded_texts) == markdown
+
+
+class StablePartVectorAdapter(CharacterTokenLongTextAdapter):
+    """Return one stable orthogonal fixture vector per generated block."""
+
+    def embed_text(self, text: str) -> tuple[float, ...]:
+        self.embedded_texts.append(text)
+        axis = {"A": 0, "B": 1, "C": 2}[text[0]]
+        return tuple(1.0 if index == axis else 0.0 for index in range(2048))
+
+
+def test_interrupted_long_text_part_resume_does_not_repurchase_committed_part(
+    tmp_path,
+):
+    """Break caught: a crash after part one causes its hosted call to repeat."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    markdown = "AAAA\n\nBBBB\n\nCCCC"
+    article_input_sha256 = replace_generated_embedding_markdown(config, markdown)
+
+    class InterruptSecondPartAdapter(StablePartVectorAdapter):
+        def embed_text(self, text: str) -> tuple[float, ...]:
+            if text.startswith("BBBB"):
+                self.embedded_texts.append(text)
+                raise SyntheticInterruption
+            return super().embed_text(text)
+
+    interrupted_adapter = InterruptSecondPartAdapter()
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(config, interrupted_adapter, limit=1)
+
+    configuration_identifier = configuration_id(interrupted_adapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT part_index, state, attempt_count, vector IS NOT NULL
+            FROM long_text_parts
+            WHERE configuration_id = ? AND article_input_sha256 = ?
+            ORDER BY part_index
+            """,
+            [configuration_identifier, article_input_sha256],
+        ).fetchall() == [
+            (0, "succeeded", 1, True),
+            (1, "in_progress", 1, False),
+            (2, "queued", 0, False),
+        ]
+
+    resumed_adapter = StablePartVectorAdapter()
+    resumed = run_embedding_pipeline(config, resumed_adapter, limit=1)
+
+    assert resumed == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=1,
+        succeeded=1,
+        interrupted=1,
+        header_absent=1,
+    )
+    assert resumed_adapter.embedded_texts == ["BBBB\n\n", "CCCC"]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT part_index, state, attempt_count
+            FROM long_text_parts
+            WHERE configuration_id = ? AND article_input_sha256 = ?
+            ORDER BY part_index
+            """,
+            [configuration_identifier, article_input_sha256],
+        ).fetchall() == [
+            (0, "succeeded", 1),
+            (1, "succeeded", 2),
+            (2, "succeeded", 1),
+        ]
+
+
+def test_failed_long_text_part_is_content_free_and_resumes_remaining_parts(tmp_path):
+    """Break caught: a part failure leaks text or discards successful checkpoints."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    markdown = "AAAA\n\nBBBB\n\nCCCC"
+    article_input_sha256 = replace_generated_embedding_markdown(config, markdown)
+
+    class FailSecondPartAdapter(StablePartVectorAdapter):
+        def embed_text(self, text: str) -> tuple[float, ...]:
+            if text.startswith("BBBB"):
+                self.embedded_texts.append(text)
+                raise JinaHostedAdapterError(
+                    "rate_limit",
+                    retryable=True,
+                    status_code=429,
+                    retry_after_seconds=2.0,
+                )
+            return super().embed_text(text)
+
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        run_embedding_pipeline(config, FailSecondPartAdapter(), limit=1)
+    assert "AAAA" not in str(raised.value)
+    assert "BBBB" not in str(raised.value)
+    assert "CCCC" not in str(raised.value)
+
+    configuration_identifier = configuration_id(StablePartVectorAdapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT part_index, state, attempt_count, error_code, status_code,
+                   retry_after_seconds
+            FROM long_text_parts
+            WHERE configuration_id = ? AND article_input_sha256 = ?
+            ORDER BY part_index
+            """,
+            [configuration_identifier, article_input_sha256],
+        ).fetchall() == [
+            (0, "succeeded", 1, None, None, None),
+            (1, "retryable", 1, "rate_limit", 429, 2.0),
+            (2, "queued", 0, None, None, None),
+        ]
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+
+    resumed_adapter = StablePartVectorAdapter()
+    result = run_embedding_pipeline(config, resumed_adapter, limit=1)
+
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=1,
+        succeeded=1,
+        header_absent=1,
+    )
+    assert resumed_adapter.embedded_texts == ["BBBB\n\n", "CCCC"]
+
+
+def test_validator_requires_complete_long_text_aggregation_provenance(tmp_path):
+    """Break caught: deleting part linkage leaves an aggregate looking complete."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+    run_embedding_pipeline(config, StablePartVectorAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            DELETE FROM article_text_aggregation_provenance
+            WHERE part_index = 1
+            """
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "missing_long_text_provenance" in codes
+
+
+def test_validator_recomputes_long_text_aggregate_from_all_weighted_parts(tmp_path):
+    """Break caught: self-consistent part tampering is not checked against aggregate."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+    run_embedding_pipeline(config, StablePartVectorAdapter(), limit=1)
+    replacement_vector = [0.0, 0.0, 0.0, 1.0, *([0.0] * 2044)]
+    replacement_hash = hashlib.sha256(
+        b"".join(struct.pack("<f", value) for value in replacement_vector)
+    ).hexdigest()
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            UPDATE long_text_parts
+            SET vector = ?, stored_vector_sha256 = ?
+            WHERE part_index = 0
+            """,
+            [replacement_vector, replacement_hash],
+        )
+        db.execute(
+            """
+            UPDATE article_text_aggregation_provenance
+            SET part_stored_vector_sha256 = ?
+            WHERE part_index = 0
+            """,
+            [replacement_hash],
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "long_text_vector_mismatch" in codes
+
+
+def test_changed_long_markdown_replaces_aggregate_and_multimodal_not_old_parts(
+    tmp_path,
+):
+    """Break caught: new Markdown reuses old parts or leaves its composite stale."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    first_markdown = "AAAA\n\nBBBB\n\nCCCC"
+    first_sha256 = replace_generated_embedding_markdown(config, first_markdown)
+    attach_generated_header_image(config, b"generated long-text header")
+    run_embedding_pipeline(config, StablePartVectorAdapter(), limit=1)
+    configuration_identifier = configuration_id(StablePartVectorAdapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        before_generations = dict(
+            db.execute(
+                """
+                SELECT modality, generation_run_id
+                FROM embedding_work_items
+                WHERE configuration_id = ?
+                """,
+                [configuration_identifier],
+            ).fetchall()
+        )
+
+    second_markdown = "AAAA\n\nBBBB\n\nCCCD"
+    second_sha256 = replace_generated_embedding_markdown(config, second_markdown)
+    adapter = StablePartVectorAdapter()
+    result = run_embedding_pipeline(config, adapter, limit=1)
+
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=2,
+        reused=1,
+        attempted=1,
+        succeeded=2,
+    )
+    assert adapter.embedded_texts == ["AAAA\n\n", "BBBB\n\n", "CCCD"]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        after_generations = dict(
+            db.execute(
+                """
+                SELECT modality, generation_run_id
+                FROM embedding_work_items
+                WHERE configuration_id = ?
+                """,
+                [configuration_identifier],
+            ).fetchall()
+        )
+        assert db.execute(
+            """
+            SELECT article_input_sha256, count(*)
+            FROM long_text_parts
+            WHERE configuration_id = ?
+            GROUP BY article_input_sha256
+            ORDER BY article_input_sha256
+            """,
+            [configuration_identifier],
+        ).fetchall() == sorted([(first_sha256, 3), (second_sha256, 3)])
+        assert db.execute(
+            """
+            SELECT modality, superseded_reason
+            FROM embedding_generation_history
+            WHERE configuration_id = ?
+            ORDER BY modality
+            """,
+            [configuration_identifier],
+        ).fetchall() == [
+            ("article_text", "input_changed"),
+            ("multimodal_article", "input_changed"),
+        ]
+    assert after_generations["header_image"] == before_generations["header_image"]
+    assert after_generations["article_text"] != before_generations["article_text"]
+    assert (
+        after_generations["multimodal_article"]
+        != before_generations["multimodal_article"]
+    )
+    assert validate_embedding_outputs(config).ok
+
+
+def test_changed_chunking_configuration_creates_distinct_parts_and_aggregate(
+    tmp_path,
+):
+    """Break caught: a changed ceiling silently reinterprets old part vectors."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+    first_adapter = StablePartVectorAdapter()
+    run_embedding_pipeline(config, first_adapter, limit=1)
+
+    class SmallerCeilingAdapter(StablePartVectorAdapter):
+        profile = replace(
+            StablePartVectorAdapter.profile,
+            context_token_limit=7,
+        )
+
+    second_adapter = SmallerCeilingAdapter()
+    run_embedding_pipeline(config, second_adapter, limit=1)
+    first_configuration = configuration_id(first_adapter.profile)
+    second_configuration = configuration_id(second_adapter.profile)
+
+    assert first_configuration != second_configuration
+    assert first_adapter.embedded_texts == ["AAAA\n\n", "BBBB\n\n", "CCCC"]
+    assert second_adapter.embedded_texts == ["AAAA\n\n", "BBBB\n\n", "CCCC"]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT configuration_id, count(*)
+            FROM long_text_parts
+            GROUP BY configuration_id
+            ORDER BY configuration_id
+            """
+        ).fetchall() == sorted(
+            [(first_configuration, 3), (second_configuration, 3)]
+        )
+        assert db.execute(
+            """
+            SELECT configuration_id, count(*)
+            FROM embeddings
+            WHERE modality = 'article_text'
+            GROUP BY configuration_id
+            ORDER BY configuration_id
+            """
+        ).fetchall() == sorted(
+            [(first_configuration, 1), (second_configuration, 1)]
+        )
+    assert validate_embedding_outputs(
+        config, configuration_id=first_configuration
+    ).ok
+    assert validate_embedding_outputs(
+        config, configuration_id=second_configuration
+    ).ok
 
 
 def test_pipeline_publishes_all_three_modalities_with_source_provenance(tmp_path):
@@ -2415,7 +2969,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_seven_multimodal_provenance_schema(
+def test_embedding_catalog_has_exact_version_eight_long_text_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -2484,10 +3038,12 @@ def test_embedding_catalog_has_exact_version_seven_multimodal_provenance_schema(
         if not_null
     )
     assert table_types == {
+        "article_text_aggregation_provenance": "BASE TABLE",
         "embedding_configurations": "BASE TABLE",
         "embedding_generation_history": "BASE TABLE",
         "embedding_work_items": "BASE TABLE",
         "embeddings": "BASE TABLE",
+        "long_text_parts": "BASE TABLE",
         "metadata": "BASE TABLE",
         "multimodal_embedding_provenance": "BASE TABLE",
         "runs": "BASE TABLE",
@@ -2495,7 +3051,7 @@ def test_embedding_catalog_has_exact_version_seven_multimodal_provenance_schema(
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "7")]
+    assert metadata == [("schema_version", "8")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -2647,6 +3203,33 @@ def test_pipeline_refuses_version_six_embedding_catalog_without_migration(tmp_pa
         assert "multimodal_embedding_provenance" not in {
             row[0] for row in db.execute("SHOW TABLES").fetchall()
         }
+
+
+def test_pipeline_refuses_version_seven_embedding_catalog_without_migration(tmp_path):
+    """Break caught: durable long-text state is silently added in place."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP TABLE IF EXISTS article_text_aggregation_provenance")
+        db.execute("DROP TABLE IF EXISTS long_text_parts")
+        db.execute("UPDATE metadata SET value = '7' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("7",)
+        assert {
+            "article_text_aggregation_provenance",
+            "long_text_parts",
+        }.isdisjoint({row[0] for row in db.execute("SHOW TABLES").fetchall()})
 
 
 def test_validator_accepts_fresh_synthetic_embedding_output(tmp_path):

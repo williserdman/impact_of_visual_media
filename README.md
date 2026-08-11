@@ -15,7 +15,7 @@ downstream.
 The repository also contains a downstream text/header-image embedding slice.
 `wsj-embeddings smoke` creates one generated canonical article in a temporary
 directory, encodes it with a deterministic fake adapter, publishes a
-2,048-dimensional normalized `article_text` vector to a separate six-table
+2,048-dimensional normalized `article_text` vector to a separate nine-table
 DuckDB catalog, validates it, and removes the fixture. It never reads the
 configured archive or calls a network service. `wsj-embeddings pilot` is a
 separate, explicit hosted Jina v4 measurement command: it sends only fixed
@@ -164,7 +164,16 @@ lexical limit.
 
 The run sends each selected canonical Markdown artifact in full and each
 eligible local header image as base64 of its exact source bytes, with hosted
-truncation disabled. It never uses remote inline-image URLs. Run/configuration setup and each selected item's
+truncation disabled. Markdown at or below the conservative 8,192-token ceiling
+keeps the single hosted-input path. Longer Markdown is greedily partitioned at
+complete blank-line-delimited block boundaries; an individually oversized
+block is partitioned only at tokenizer offsets. The exact substrings concatenate
+back to the original Markdown without overlap or loss. The tokenizer is the
+official `jinaai/jina-embeddings-v4` `tokenizer.json` at immutable revision
+`d1e5d70b7b34d927a8cddac458583c4fbe50a914`; runtime acquisition verifies SHA-256
+`9c5ae00e602b8860cbd784ba82a8aa14e8feecec692e7076590d014d7b7fdafa` before
+loading it. Automated tests inject an offline tokenizer and never download the
+artifact. The run never uses remote inline-image URLs. Run/configuration setup and each selected item's
 queue/recovery registration use separate bounded transactions. Each validated
 source vector and its successful work checkpoint commit before the next
 modality is attempted. Once both sources succeed under the same configuration,
@@ -278,14 +287,14 @@ references only; the pipeline never downloads them.
 
 ## Text, header-image, and multimodal embedding catalog contract
 
-The downstream catalog is a separate schema-version-7 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-8 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted, limit-only production CLI.
-Versions 1 through 6 are refused without migration; move reproducible derived
+Versions 1 through 7 are refused without migration; move reproducible derived
 output aside or choose a fresh embedding output root.
 
-The catalog has exactly seven base tables and no indexes:
+The catalog has exactly nine base tables and no indexes:
 
 | Table | Ordered columns | Key |
 |---|---|---|
@@ -296,6 +305,8 @@ The catalog has exactly seven base tables and no indexes:
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 | `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
+| `long_text_parts` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `part_count INTEGER`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `updated_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index)` |
+| `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
 
 The source path is nullable for article text and absent images. The input hash
 is nullable for `not_applicable` image work and only one applicable case: a
@@ -321,8 +332,12 @@ key-sorted JSON covering model alias, observed hosted model/API metadata, task,
 dimensions, output type, normalization, tokenizer/context rules, long-text
 aggregation, image input/transform rules, multimodal formula, and client
 configuration version. The current long-text rule is
-`single-input-provider-pooling-v1`: the complete input receives one
-provider-pooled vector. `input_sha256` hashes the exact canonical Markdown or
+`l2-token-count-weighted-mean-float32-v1`. Inputs through 8,192 tokens receive
+one provider-pooled vector. Longer inputs commit each normalized operational
+part vector independently, then publish one canonical `article_text` vector as
+the float32 L2-normalized token-count-weighted mean. Part vectors and their
+append-only aggregate linkage are audit/resume state, never additional research
+observations in `embeddings`. `input_sha256` hashes the exact canonical Markdown or
 local header-image bytes. For `multimodal_article`, it hashes the content-free
 source-generation identity and formula. `stored_vector_sha256` hashes the
 normalized vector encoded as little-endian float32 values. Current modalities
@@ -367,6 +382,10 @@ immutable generator. It requires provenance for every active and superseded
 composite, re-derives its content-free input identity, resolves both source
 links, and recomputes each active equal-weight normalized midpoint. An
 impossible midpoint is reported rather than skipped.
+It also validates part identities, limits, lifecycle/vector checkpoints, and
+aggregate linkage, then independently recomputes each active long-text vector
+from all normalized token-weighted parts. Missing provenance or self-consistent
+part tampering is therefore reported without loading a tokenizer or credential.
 It emits stable issues without article text or vector values, including
 distinct missing, queued, in-progress, interrupted, retryable, and terminal
 header-image dispositions; a true no-header `not_applicable` row is valid and

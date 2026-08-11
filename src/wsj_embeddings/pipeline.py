@@ -24,6 +24,11 @@ from wsj_embeddings.canonical_markdown import (
 )
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingPipelineConfig
+from wsj_embeddings.long_text import (
+    LongTextPart,
+    LongTextPlanningError,
+    plan_long_text_parts,
+)
 from wsj_embeddings.models import (
     CanonicalArticle,
     EmbeddingInventoryResult,
@@ -53,6 +58,22 @@ class _PreparedHeaderImage:
 @dataclass(frozen=True, slots=True)
 class _MissingHeaderImage:
     source_relative_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SuccessfulLongTextPart:
+    part: LongTextPart
+    generation_run_id: str
+    stored_vector_sha256: str
+    vector: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedEmbedding:
+    input_sha256: str
+    stored_vector_sha256: str
+    vector: tuple[float, ...]
+    long_text_parts: tuple[_SuccessfulLongTextPart, ...] = ()
 
 
 class EmbeddingPipelineError(RuntimeError):
@@ -271,12 +292,16 @@ def run_embedding_pipeline(
                         configuration_identifier=configuration_identifier,
                     )
                 try:
-                    input_sha256, vector_hash, vector = _prepare_embedding(
+                    prepared_embedding = _prepare_embedding(
                         config,
                         adapter,
+                        catalog,
+                        run_id,
+                        configuration_identifier,
                         article,
                         modality=modality,
                         prepared_image=prepared_image,
+                        reprocess=reprocess,
                     )
                 except JinaHostedAdapterError as error:
                     with catalog.transaction():
@@ -316,19 +341,51 @@ def run_embedding_pipeline(
                     else None
                 )
                 with catalog.transaction():
-                    catalog.publish_success(
-                        run_id=run_id,
-                        article_id=article.article_id,
-                        modality=modality,
-                        configuration_identifier=configuration_identifier,
-                        source_relative_path=source_relative_path,
-                        published_at_utc=article.published_at_utc,
-                        publication_date_new_york=article.publication_date_new_york,
-                        dimensions=profile.dimensions,
-                        input_sha256=input_sha256,
-                        stored_vector_sha256=vector_hash,
-                        vector=vector,
-                    )
+                    if prepared_embedding.long_text_parts:
+                        catalog.publish_long_text_success(
+                            run_id=run_id,
+                            article_id=article.article_id,
+                            configuration_identifier=configuration_identifier,
+                            published_at_utc=article.published_at_utc,
+                            publication_date_new_york=(
+                                article.publication_date_new_york
+                            ),
+                            dimensions=profile.dimensions,
+                            input_sha256=prepared_embedding.input_sha256,
+                            stored_vector_sha256=(
+                                prepared_embedding.stored_vector_sha256
+                            ),
+                            vector=prepared_embedding.vector,
+                            aggregation_version=profile.long_text_aggregation,
+                            parts=tuple(
+                                (
+                                    item.part.index,
+                                    item.part.input_sha256,
+                                    item.part.token_count,
+                                    item.generation_run_id,
+                                    item.stored_vector_sha256,
+                                )
+                                for item in prepared_embedding.long_text_parts
+                            ),
+                        )
+                    else:
+                        catalog.publish_success(
+                            run_id=run_id,
+                            article_id=article.article_id,
+                            modality=modality,
+                            configuration_identifier=configuration_identifier,
+                            source_relative_path=source_relative_path,
+                            published_at_utc=article.published_at_utc,
+                            publication_date_new_york=(
+                                article.publication_date_new_york
+                            ),
+                            dimensions=profile.dimensions,
+                            input_sha256=prepared_embedding.input_sha256,
+                            stored_vector_sha256=(
+                                prepared_embedding.stored_vector_sha256
+                            ),
+                            vector=prepared_embedding.vector,
+                        )
         for article in articles:
             with catalog.transaction():
                 _publish_multimodal_article(
@@ -457,21 +514,25 @@ def _read_articles(
 def _prepare_embedding(
     config: EmbeddingPipelineConfig,
     adapter: EmbeddingAdapter,
+    catalog: EmbeddingCatalog,
+    run_id: str,
+    configuration_identifier: str,
     article: CanonicalArticle,
     *,
     modality: str,
     prepared_image: _PreparedHeaderImage | _MissingHeaderImage | None,
-) -> tuple[str, str, tuple[float, ...]]:
+    reprocess: bool,
+) -> _PreparedEmbedding:
     if modality == _HEADER_IMAGE_MODALITY:
         assert isinstance(prepared_image, _PreparedHeaderImage)
         embedded = adapter.embed_image(
             base64.b64encode(prepared_image.data).decode("ascii")
         )
         vector = _normalized_vector(embedded, article.article_id)
-        return (
-            prepared_image.input_sha256,
-            _vector_hash(vector),
-            vector,
+        return _PreparedEmbedding(
+            input_sha256=prepared_image.input_sha256,
+            stored_vector_sha256=_vector_hash(vector),
+            vector=vector,
         )
     assert modality == _ARTICLE_TEXT_MODALITY
     try:
@@ -491,13 +552,161 @@ def _prepare_embedding(
         raise EmbeddingPipelineError(
             "canonical_input_hash_mismatch", article.article_id
         )
-    embedded = adapter.embed_text(markdown)
-    vector = _normalized_vector(embedded, article.article_id)
-    return (
-        input_sha256,
-        _vector_hash(vector),
-        vector,
+    try:
+        parts = plan_long_text_parts(
+            markdown,
+            adapter,
+            token_limit=adapter.profile.context_token_limit,
+        )
+    except LongTextPlanningError as error:
+        raise EmbeddingPipelineError(
+            "invalid_tokenizer_offsets", article.article_id
+        ) from error
+    if not parts:
+        embedded = adapter.embed_text(markdown)
+        vector = _normalized_vector(embedded, article.article_id)
+        return _PreparedEmbedding(
+            input_sha256=input_sha256,
+            stored_vector_sha256=_vector_hash(vector),
+            vector=vector,
+        )
+    successful_parts = _embed_long_text_parts(
+        catalog,
+        adapter,
+        run_id=run_id,
+        configuration_identifier=configuration_identifier,
+        article=article,
+        article_input_sha256=input_sha256,
+        parts=parts,
+        reprocess=reprocess,
     )
+    aggregate = _long_text_vector(successful_parts, article.article_id)
+    return _PreparedEmbedding(
+        input_sha256=input_sha256,
+        stored_vector_sha256=_vector_hash(aggregate),
+        vector=aggregate,
+        long_text_parts=successful_parts,
+    )
+
+
+def _embed_long_text_parts(
+    catalog: EmbeddingCatalog,
+    adapter: EmbeddingAdapter,
+    *,
+    run_id: str,
+    configuration_identifier: str,
+    article: CanonicalArticle,
+    article_input_sha256: str,
+    parts: tuple[LongTextPart, ...],
+    reprocess: bool,
+) -> tuple[_SuccessfulLongTextPart, ...]:
+    """Resume exact part checkpoints and purchase only unproven vectors."""
+
+    try:
+        with catalog.transaction():
+            states = catalog.register_long_text_parts(
+                run_id=run_id,
+                article_id=article.article_id,
+                configuration_identifier=configuration_identifier,
+                article_input_sha256=article_input_sha256,
+                parts=parts,
+                reprocess=reprocess,
+            )
+    except ValueError as error:
+        raise EmbeddingPipelineError(
+            "invalid_long_text_state", article.article_id
+        ) from error
+    successful: list[_SuccessfulLongTextPart] = []
+    for part, state in zip(parts, states, strict=True):
+        if state is not WorkState.SUCCEEDED:
+            with catalog.transaction():
+                catalog.start_long_text_part_attempt(
+                    run_id=run_id,
+                    article_id=article.article_id,
+                    configuration_identifier=configuration_identifier,
+                    article_input_sha256=article_input_sha256,
+                    part_index=part.index,
+                )
+            try:
+                vector = _normalized_vector(
+                    adapter.embed_text(part.text),
+                    article.article_id,
+                )
+            except JinaHostedAdapterError as error:
+                failure_state = (
+                    WorkState.RETRYABLE if error.retryable else WorkState.TERMINAL
+                )
+                with catalog.transaction():
+                    catalog.record_long_text_part_failure(
+                        run_id=run_id,
+                        article_id=article.article_id,
+                        configuration_identifier=configuration_identifier,
+                        article_input_sha256=article_input_sha256,
+                        part_index=part.index,
+                        state=failure_state,
+                        error_code=error.code,
+                        status_code=error.status_code,
+                        retry_after_seconds=error.retry_after_seconds,
+                    )
+                raise
+            vector_sha256 = _vector_hash(vector)
+            with catalog.transaction():
+                catalog.publish_long_text_part_success(
+                    run_id=run_id,
+                    article_id=article.article_id,
+                    configuration_identifier=configuration_identifier,
+                    article_input_sha256=article_input_sha256,
+                    part_index=part.index,
+                    stored_vector_sha256=vector_sha256,
+                    vector=vector,
+                )
+        try:
+            generation_run_id, vector_sha256, vector_values = (
+                catalog.long_text_part_generation(
+                    article_id=article.article_id,
+                    configuration_identifier=configuration_identifier,
+                    article_input_sha256=article_input_sha256,
+                    part_index=part.index,
+                )
+            )
+            vector = _verified_source_vector(
+                vector_values,
+                str(vector_sha256),
+                article.article_id,
+            )
+        except (EmbeddingPipelineError, ValueError) as error:
+            raise EmbeddingPipelineError(
+                "invalid_long_text_state", article.article_id
+            ) from error
+        successful.append(
+            _SuccessfulLongTextPart(
+                part=part,
+                generation_run_id=str(generation_run_id),
+                stored_vector_sha256=str(vector_sha256),
+                vector=vector,
+            )
+        )
+    return tuple(successful)
+
+
+def _long_text_vector(
+    parts: Sequence[_SuccessfulLongTextPart],
+    article_id: str,
+) -> tuple[float, ...]:
+    """Return the normalized token-count-weighted mean of normalized parts."""
+
+    if not parts or any(part.part.token_count < 1 for part in parts):
+        raise EmbeddingPipelineError("invalid_long_text_state", article_id)
+    total_tokens = sum(part.part.token_count for part in parts)
+    weighted = tuple(
+        sum(
+            part.part.token_count * part.vector[dimension]
+            for part in parts
+        )
+        / total_tokens
+        for dimension in range(_VECTOR_DIMENSIONS)
+    )
+    return _normalized_vector(weighted, article_id)
 
 
 def _prepare_header_image(
