@@ -23,7 +23,7 @@ from wsj_embeddings.models import (
     WorkState,
 )
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "4"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "5"
 
 _EMBEDDING_CATALOG_TABLES = {
     "embedding_configurations",
@@ -81,6 +81,7 @@ _TABLE_COLUMNS = {
         ("status_code", "INTEGER", False, None, False),
         ("retry_after_seconds", "DOUBLE", False, None, False),
         ("last_run_id", "VARCHAR", True, None, False),
+        ("generation_run_id", "VARCHAR", False, None, False),
         ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "embeddings": (
@@ -553,6 +554,7 @@ class EmbeddingCatalog:
                     status_code INTEGER,
                     retry_after_seconds DOUBLE,
                     last_run_id VARCHAR NOT NULL,
+                    generation_run_id VARCHAR,
                     updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
                     PRIMARY KEY (article_id, modality, configuration_id)
                 )
@@ -760,7 +762,8 @@ class EmbeddingCatalog:
             self.connection.execute(
                 """
                 INSERT INTO embedding_work_items
-                VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, current_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, NULL,
+                        current_timestamp)
                 """,
                 [
                     article_id,
@@ -849,7 +852,8 @@ class EmbeddingCatalog:
             self.connection.execute(
                 """
                 UPDATE embedding_work_items
-                SET state = ?, last_run_id = ?, updated_at = current_timestamp
+                SET state = ?, last_run_id = ?, generation_run_id = NULL,
+                    updated_at = current_timestamp
                 WHERE article_id = ? AND modality = ? AND configuration_id = ?
                 """,
                 [
@@ -886,7 +890,7 @@ class EmbeddingCatalog:
             self.connection.execute(
                 """
                 INSERT INTO embedding_work_items
-                VALUES (?, ?, ?, NULL, NULL, ?, 0, NULL, NULL, NULL, ?,
+                VALUES (?, ?, ?, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, NULL,
                         current_timestamp)
                 """,
                 [
@@ -915,6 +919,7 @@ class EmbeddingCatalog:
             SET source_relative_path = NULL, input_sha256 = NULL, state = ?,
                 attempt_count = 0, error_code = NULL, status_code = NULL,
                 retry_after_seconds = NULL, last_run_id = ?,
+                generation_run_id = NULL,
                 updated_at = current_timestamp
             WHERE article_id = ? AND modality = ? AND configuration_id = ?
             """,
@@ -962,6 +967,7 @@ class EmbeddingCatalog:
                 input_sha256 = COALESCE(?, input_sha256), state = ?,
                 attempt_count = 0, error_code = NULL, status_code = NULL,
                 retry_after_seconds = NULL, last_run_id = ?,
+                generation_run_id = NULL,
                 updated_at = current_timestamp
             WHERE article_id = ? AND modality = ? AND configuration_id = ?
             """,
@@ -987,7 +993,7 @@ class EmbeddingCatalog:
     ) -> None:
         row = self.connection.execute(
             """
-            SELECT w.last_run_id, e.source_relative_path, e.input_sha256,
+            SELECT w.generation_run_id, e.source_relative_path, e.input_sha256,
                    e.stored_vector_sha256
             FROM embeddings AS e
             JOIN embedding_work_items AS w
@@ -1042,6 +1048,7 @@ class EmbeddingCatalog:
             SET state = ?, attempt_count = attempt_count + 1,
                 error_code = NULL, status_code = NULL,
                 retry_after_seconds = NULL, last_run_id = ?,
+                generation_run_id = NULL,
                 updated_at = current_timestamp
             WHERE article_id = ? AND modality = ? AND configuration_id = ?
             """,
@@ -1076,6 +1083,7 @@ class EmbeddingCatalog:
             UPDATE embedding_work_items
             SET state = ?, error_code = ?, status_code = ?,
                 retry_after_seconds = ?, last_run_id = ?,
+                generation_run_id = NULL,
                 updated_at = current_timestamp
             WHERE article_id = ? AND modality = ? AND configuration_id = ?
             """,
@@ -1142,13 +1150,15 @@ class EmbeddingCatalog:
             SET state = ?, source_relative_path = ?, input_sha256 = ?,
                 error_code = NULL,
                 status_code = NULL, retry_after_seconds = NULL,
-                last_run_id = ?, updated_at = current_timestamp
+                last_run_id = ?, generation_run_id = ?,
+                updated_at = current_timestamp
             WHERE article_id = ? AND modality = ? AND configuration_id = ?
             """,
             [
                 WorkState.SUCCEEDED.value,
                 source_relative_path,
                 input_sha256,
+                run_id,
                 run_id,
                 article_id,
                 modality,

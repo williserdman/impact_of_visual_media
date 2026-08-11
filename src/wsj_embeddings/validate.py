@@ -24,7 +24,11 @@ from wsj_embeddings.models import (
     WorkState,
 )
 from wsj_embeddings.pipeline import _VECTOR_DIMENSIONS
-from wsj_embeddings.source_image import SourceImageError, read_source_image
+from wsj_embeddings.source_image import (
+    SourceImageError,
+    is_safe_source_relative_path,
+    read_source_image,
+)
 from wsj_pipeline.catalog import Catalog, CatalogError
 
 
@@ -265,11 +269,29 @@ def _validate_work_items(
             [configuration_id],
         ).fetchall()
     )
+    embedding_keys = {
+        row[:3]
+        for row in connection.execute(
+            """
+            SELECT article_id, modality, configuration_id
+            FROM embeddings
+            WHERE configuration_id = ?
+            """,
+            [configuration_id],
+        ).fetchall()
+    }
+    run_ids = {
+        row[0]
+        for row in connection.execute(
+            "SELECT run_id FROM runs WHERE configuration_id = ?",
+            [configuration_id],
+        ).fetchall()
+    }
     rows = connection.execute(
         """
         SELECT article_id, modality, configuration_id, source_relative_path,
                input_sha256, state, attempt_count, error_code, status_code,
-               retry_after_seconds
+               retry_after_seconds, generation_run_id
         FROM embedding_work_items
         WHERE configuration_id = ?
         """,
@@ -287,6 +309,7 @@ def _validate_work_items(
             error_code,
             status_code,
             retry_after_seconds,
+            generation_run_id,
         ) = row
         try:
             work_state = WorkState(state)
@@ -316,21 +339,63 @@ def _validate_work_items(
                 "embedding_without_success_checkpoint",
                 "embedding rows lack a matching successful work checkpoint",
             )
-        if work_state is WorkState.NOT_APPLICABLE and (
-            modality != EmbeddingModality.HEADER_IMAGE.value
-            or source_relative_path is not None
-            or input_sha256 is not None
-            or attempt_count != 0
-        ):
-            _append(
-                issues,
-                "invalid_not_applicable_checkpoint",
-                "not-applicable image work retains input or attempt metadata",
-            )
         failure_metadata_present = any(
             value is not None
             for value in (error_code, status_code, retry_after_seconds)
         )
+        if work_state is WorkState.NOT_APPLICABLE:
+            if (
+                modality != EmbeddingModality.HEADER_IMAGE.value
+                or source_relative_path is not None
+                or input_sha256 is not None
+                or attempt_count != 0
+                or failure_metadata_present
+                or generation_run_id is not None
+            ):
+                _append(
+                    issues,
+                    "invalid_not_applicable_checkpoint",
+                    "not-applicable image work retains generation metadata",
+                )
+            if (article_id, modality, configuration_identifier) in embedding_keys:
+                _append(
+                    issues,
+                    "embedding_without_success_checkpoint",
+                    "embedding rows lack a matching successful work checkpoint",
+                )
+        else:
+            if not _is_sha256(input_sha256):
+                _append(
+                    issues,
+                    "invalid_work_input_hash",
+                    "applicable embedding work lacks a valid input hash",
+                )
+            if modality == EmbeddingModality.HEADER_IMAGE.value:
+                if not is_safe_source_relative_path(source_relative_path):
+                    _append(
+                        issues,
+                        "invalid_source_relative_path",
+                        "embedding work uses an unsafe source-relative path",
+                    )
+            elif source_relative_path is not None:
+                _append(
+                    issues,
+                    "invalid_source_relative_path",
+                    "only header-image work may retain a source-relative path",
+                )
+            if work_state.is_reusable_success:
+                if generation_run_id not in run_ids:
+                    _append(
+                        issues,
+                        "invalid_generation_checkpoint",
+                        "successful work lacks its generating run identity",
+                    )
+            elif generation_run_id is not None:
+                _append(
+                    issues,
+                    "invalid_generation_checkpoint",
+                    "non-successful work retains a generating run identity",
+                )
         if work_state.is_failure:
             if error_code is None or attempt_count < 1:
                 _append(
@@ -399,6 +464,19 @@ def _validate_embeddings(
                 "invalid_modality",
                 "embedding rows use an unsupported modality",
             )
+        if modality == EmbeddingModality.HEADER_IMAGE.value:
+            if not is_safe_source_relative_path(source_relative_path):
+                _append(
+                    issues,
+                    "invalid_source_relative_path",
+                    "header-image embeddings use an unsafe source-relative path",
+                )
+        elif source_relative_path is not None:
+            _append(
+                issues,
+                "invalid_source_relative_path",
+                "only header-image embeddings may retain a source-relative path",
+            )
         if dimensions != _VECTOR_DIMENSIONS:
             _append(
                 issues,
@@ -423,12 +501,6 @@ def _validate_embeddings(
                 "embedding publication metadata differs from the canonical article",
             )
         if modality == EmbeddingModality.ARTICLE_TEXT.value:
-            if source_relative_path is not None:
-                _append(
-                    issues,
-                    "invalid_source_relative_path",
-                    "article text embeddings retain an unexpected source path",
-                )
             _validate_markdown_hash(config, article, input_sha256, issues)
         elif modality == EmbeddingModality.HEADER_IMAGE.value:
             _validate_header_image_hash(
@@ -455,20 +527,41 @@ def _validate_generation_history(
     reasons = {reason.value for reason in SupersessionReason}
     rows = connection.execute(
         """
-        SELECT generation_run_id, input_sha256, stored_vector_sha256,
-               superseded_run_id, superseded_reason
+        SELECT modality, source_relative_path, generation_run_id, input_sha256,
+               stored_vector_sha256, superseded_run_id, superseded_reason
         FROM embedding_generation_history
         WHERE configuration_id = ?
         """,
         [configuration_id],
     ).fetchall()
     for (
+        modality,
+        source_relative_path,
         generation_run_id,
         input_sha256,
         vector_sha256,
         superseded_run_id,
         reason,
     ) in rows:
+        if modality not in {item.value for item in EmbeddingModality}:
+            _append(
+                issues,
+                "invalid_generation_modality",
+                "embedding generation history uses an unsupported modality",
+            )
+        if modality == EmbeddingModality.HEADER_IMAGE.value:
+            if not is_safe_source_relative_path(source_relative_path):
+                _append(
+                    issues,
+                    "invalid_generation_source_path",
+                    "header-image generation history uses an unsafe source path",
+                )
+        elif source_relative_path is not None:
+            _append(
+                issues,
+                "invalid_generation_source_path",
+                "non-image generation history retains a source path",
+            )
         if generation_run_id not in run_ids or superseded_run_id not in run_ids:
             _append(
                 issues,

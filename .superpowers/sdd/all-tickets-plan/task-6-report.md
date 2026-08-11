@@ -148,3 +148,122 @@ not run.
 None. The shared virtual environment's installed console script is not linked
 to this worktree, so smoke and live help were verified against worktree source
 with `PYTHONPATH=src`. No machine configuration changed.
+
+## Fix round 1: immutable generation provenance and validation hardening
+
+### Review findings addressed
+
+- `embedding_work_items.generation_run_id` now records the run that actually
+  generated an active successful vector. `last_run_id` remains mutable
+  observation/attempt bookkeeping. Reuse updates only `last_run_id`; success
+  sets both fields; invalidation, attempts, failures, interruption, and
+  `not_applicable` clear generation identity. Supersession history reads the
+  immutable generation field.
+- Schema version is now 5. Exact schema tests and explicit schema-v4 refusal
+  extend the no-migration contract; versions 1 through 4 are refused.
+- Read-only validation requires a valid SHA-256 for every applicable work row,
+  permits `source_relative_path` only for `header_image`, and syntactically
+  rejects absolute, traversal, and HTTP(S) paths. `not_applicable` requires a
+  header-image key with null path/hash/generation, zero attempts, no failure
+  metadata, and no active vector. Successful work requires a valid generating
+  run, while non-successful work may not retain one.
+- Generation history now validates supported modality plus its conditional
+  source-path contract: header images require a safe archive-relative path and
+  other modalities require null.
+- Direct generated fixtures prove replacement-after-open detection and
+  hard-link rejection through the existing stable-byte image reader, retaining
+  the domain-specific `unsafe_header_image_path` coordinator error.
+
+### RED and GREEN
+
+```bash
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_pipeline.py \
+  -k 'version_five or refuses_version_four or image_supersession_after_reuse or header_image_replacement_after_safe_open or hard_linked_header_image or missing_or_malformed_active_work_hash or invalid_work_and_vector_source_paths or vector_for_not_applicable or malformed_generation_modality_and_path'
+```
+
+Observed RED: `11 failed, 4 passed, 65 deselected in 26.34s`. The replacement
+and hard-link cases already failed closed through the stable reader, while the
+new schema/provenance field and malformed work/history contracts were absent.
+One article-text path case also passed because that narrower invariant already
+existed.
+
+After schema v5, immutable generation transitions, shared syntactic path
+recognition, and conditional validation, the same focused selection observed
+GREEN: `15 passed, 65 deselected in 29.62s`.
+
+Additional malformed fixtures for forbidden `not_applicable` generation/error
+metadata and missing/unknown successful generation runs observed
+`3 passed, 80 deselected in 5.57s`.
+
+The provenance fixture generates an image, reuses it unchanged in a later run,
+then changes the exact bytes. It proves `last_run_id` advances on reuse while
+`generation_run_id` does not, and the later history row attributes the archived
+image vector to its true first generating run rather than the replay.
+
+### Fix-round focused verification
+
+```bash
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_pipeline.py
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_pipeline.py \
+  -k 'reports_run_without_configuration_reference or image_supersession_after_reuse or version_five or malformed_generation_modality_and_path'
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_cli.py
+/home/willis/projects/finance_wsj/.venv/bin/ruff check \
+  src/wsj_embeddings tests/test_embeddings_pipeline.py \
+  tests/test_embeddings_cli.py
+PYTHONPATH=src /home/willis/projects/finance_wsj/.venv/bin/python \
+  -m wsj_embeddings smoke
+PYTHONPATH=src /home/willis/projects/finance_wsj/.venv/bin/python \
+  -m wsj_embeddings run --help
+git diff --check
+git ls-files | rg '^(data|artifacts|outputs)/'
+```
+
+Observed:
+
+- the focused coordinator/catalog/validation module reached
+  `82 passed, 1 failed in 137.97s`; the sole failure was an existing exact
+  assertion that now correctly receives both the missing run-configuration
+  issue and the consequential invalid successful generation checkpoint;
+- after updating that expected additive diagnosis, the affected provenance,
+  schema, history, and run-reference selection was
+  `6 passed, 77 deselected in 15.62s`;
+- focused CLI: `17 passed in 14.42s`;
+- changed Python Ruff: `All checks passed!`;
+- generated smoke:
+  `{"articles": 1, "embeddings": 1, "validation_ok": true}`;
+- live `run --help` retained the required roots, positive limit, optional
+  article-text reprocess, and explicit hosted authorization;
+- `git diff --check` produced no output; current-facing README/crash-course
+  searches found no stale schema-v4 claims; and the tracked generated-artifact
+  audit produced no matches (expected `rg` exit 1).
+
+No full repository suite, licensed archive, live credential, network request,
+or full-corpus operation was used.
+
+### Fix-round self-review
+
+- Generation identity is written only in the same transaction that publishes
+  vector success. Reuse updates observation metadata without changing it.
+- Every transition that removes or cannot prove an active success clears the
+  generation field. History reads only that field, never mutable
+  `last_run_id`.
+- Validator run-identity checks are configuration-scoped and diagnose both a
+  broken run reference and any success that consequently lacks valid
+  generation provenance.
+- Applicable work hashes are syntactically exact lowercase SHA-256 values.
+  Absent work is the only nullable-hash state and cannot retain a vector,
+  attempt, failure, source path, or generation run.
+- The shared syntactic image-path predicate performs no I/O and rejects
+  absolute, traversal, and HTTP(S) identities. The stable-byte reader still
+  owns descriptor-relative no-follow/replacement checks and domain-specific
+  errors.
+- Generation history accepts only the domain modality vocabulary, requires a
+  safe local path for header images, and forbids paths for text/multimodal
+  generations. It still stores no bodies, bytes, vectors, URLs, or exception
+  text.
+
+Fix-round concerns: none.

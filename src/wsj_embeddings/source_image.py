@@ -20,6 +20,8 @@ class SourceImageError(RuntimeError):
 def read_source_image(root: Path, relative_value: str) -> bytes:
     """Read one unchanged source-relative regular single-link image leaf."""
 
+    if not is_safe_source_relative_path(relative_value):
+        raise SourceImageError("unsafe")
     status, descriptor = open_relative_regular(root, relative_value)
     if status != "ok":
         raise SourceImageError(status)
@@ -52,6 +54,24 @@ def read_source_image(root: Path, relative_value: str) -> bytes:
     if _snapshot_identity(after) != _snapshot_identity(current):
         raise SourceImageError("unsafe")
     return data
+
+
+def is_safe_source_relative_path(relative_value: object) -> bool:
+    """Recognize one contained local path without resolving or opening it."""
+
+    if not isinstance(relative_value, str) or not relative_value:
+        return False
+    if relative_value.lower().startswith(("http://", "https://")):
+        return False
+    relative = Path(relative_value)
+    return (
+        not relative.is_absolute()
+        and bool(relative.parts)
+        and all(
+            part not in {"", ".", ".."} and Path(part).name == part
+            for part in relative.parts
+        )
+    )
 
 
 def _snapshot_identity(file_stat: os.stat_result) -> tuple[int, ...]:

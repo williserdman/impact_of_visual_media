@@ -270,11 +270,11 @@ references only; the pipeline never downloads them.
 
 ## Text and header-image embedding catalog contract
 
-The downstream catalog is a separate schema-version-4 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-5 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted, limit-only production CLI.
-Versions 1 through 3 are refused without migration; move reproducible derived
+Versions 1 through 4 are refused without migration; move reproducible derived
 output aside or choose a fresh embedding output root.
 
 The catalog has exactly six base tables and no indexes:
@@ -284,7 +284,7 @@ The catalog has exactly six base tables and no indexes:
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
 | `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
-| `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
+| `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 
@@ -305,6 +305,10 @@ encoded as little-endian float32 values. Current modalities are `article_text`
 and `header_image`; vectors must be finite, nonzero, L2-normalized, and exactly
 2,048-dimensional. Superseded history stores only identities, hashes, run IDs,
 reason, and time; it never stores Markdown, image bytes, or historical vectors.
+`last_run_id` records the latest observation or attempt, while nullable
+`generation_run_id` is set only for a successful active vector and remains
+unchanged across reuse. Supersession history therefore names the run that
+actually generated the archived vector rather than a later replay.
 
 A retained catalog can be queried without joining back to article bodies:
 
