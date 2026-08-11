@@ -11,6 +11,7 @@ import pytest
 import wsj_embeddings.pipeline as embedding_pipeline_module
 from wsj_embeddings import FakeEmbeddingAdapter
 from wsj_embeddings.adapters import JinaHttpResponse
+from wsj_embeddings.catalog import configuration_id
 from wsj_embeddings.cli import main
 from wsj_pipeline.catalog import ArticleRecord, Catalog
 
@@ -196,6 +197,7 @@ def test_authorized_limited_run_embeds_complete_lexical_winner_with_fake(
     assert json.loads(line) == {
         "articles": 1,
         "attempted": 1,
+        "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
         "embeddings": 1,
         "interrupted": 0,
         "retryable": 0,
@@ -219,6 +221,62 @@ def test_authorized_limited_run_embeds_complete_lexical_winner_with_fake(
             date(2024, 1, 3),
         )
     ]
+
+
+def test_authorized_reprocess_flag_regenerates_only_the_limited_cli_scope(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Break caught: CLI reprocess is ignored or expands beyond its positive limit."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+    assert (
+        main(
+            [
+                "run",
+                *root_arguments(*roots),
+                "--limit",
+                "2",
+                "--authorize-hosted-processing",
+            ],
+            adapter_factory=RecordingFakeAdapter,
+        )
+        == 0
+    )
+    capsys.readouterr()
+    adapter = RecordingFakeAdapter()
+
+    exit_code = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--limit",
+            "1",
+            "--reprocess",
+            "--authorize-hosted-processing",
+        ],
+        adapter_factory=lambda: adapter,
+    )
+    result = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert result == {
+        "articles": 1,
+        "attempted": 1,
+        "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
+        "embeddings": 1,
+        "interrupted": 0,
+        "retryable": 0,
+        "reused": 0,
+        "succeeded": 1,
+        "terminal": 0,
+    }
+    assert adapter.texts == ["# Complete A\n\nFirst paragraph.\n"]
+    with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (2,)
+        assert db.execute(
+            "SELECT article_id FROM embedding_generation_history"
+        ).fetchall() == [("wsj:A",)]
 
 
 def test_authorized_run_reports_missing_credential_without_output_state(

@@ -120,12 +120,12 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/config.py` | resolved disjoint roots and explicit hosted-processing authorization | CLI configuration loading |
 | `wsj_embeddings/adapters.py` | injected adapter protocol, deterministic fake adapter, and fixed hosted Jina adapter | corpus selection or output mutation |
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
-| `wsj_embeddings/catalog.py` | separate schema version 2, exact read-only inspection, bounded checkpoint transactions | preprocessing catalog mutation |
+| `wsj_embeddings/catalog.py` | separate schema version 3, exact read-only inspection, bounded lifecycle/generation transactions | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection, text encoding, hashes, and publication | hosted credential loading |
 | `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
 | `wsj_embeddings/pilot.py` | fixed generated hosted text/image/boundary probes and content-free observations | corpus or filesystem input/output |
-| `wsj_embeddings/cli.py` | `smoke`, `pilot`, credential-free `inventory`, and authorized limit-only production `run` | preprocessing mutation or full embedding reconciliation |
+| `wsj_embeddings/cli.py` | `smoke`, `pilot`, credential-free `inventory`, and authorized limit-only production `run` with bounded reprocess | preprocessing mutation or full embedding reconciliation |
 
 The installed `wsj-embeddings` command accepts `smoke`, `pilot`, `inventory`,
 and `run`. `smoke`
@@ -139,7 +139,9 @@ without constructing an adapter or requiring `JINA_API_KEY`. `run` requires a
 positive `--limit`, three explicit disjoint roots, and
 `--authorize-hosted-processing`; it selects by `ORDER BY article_id LIMIT ?`,
 uses the production Jina adapter with truncation disabled, and never reconciles
-unselected rows. The existing `wsj-pipeline` command surface is unchanged.
+unselected rows. Optional `--reprocess` regenerates only that selected limit,
+and success JSON includes its deterministic `configuration_id`. The existing
+`wsj-pipeline` command surface is unchanged.
 
 ## 4. Cleaned Markdown contract
 
@@ -247,21 +249,24 @@ ORDER BY published_at_utc, article_id;
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 2 has exactly five base tables, no views, and
-no indexes. Only classified failure-detail columns are nullable. Version 1 and
-malformed output are refused without migration.
+catalog. Embedding schema version 3 has exactly six base tables, no views, and
+no indexes. Only classified failure-detail columns are nullable. Versions 1 and
+2 and malformed output are refused without migration.
 
 | Table | Ordered columns and DuckDB types | Primary key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
-| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR` | `configuration_id` |
+| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
 | `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
+| `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 
 `configuration_id` is the SHA-256 of compact, key-sorted JSON for every
-`EmbeddingProfile` field: `model`, `task`, `dimensions`, `output_type`, and
-`normalization`. `input_sha256` covers the exact UTF-8 canonical Markdown
+`EmbeddingProfile` field: model alias and observed hosted model/API metadata,
+task, dimensions, output type, normalization, tokenizer/context rules,
+long-text aggregation, image rules/transform, multimodal formula, and client
+configuration version. `input_sha256` covers the exact UTF-8 canonical Markdown
 bytes. After finite/nonzero checks and L2 normalization, values are rounded to
 float32; `stored_vector_sha256` covers their concatenated little-endian float32
 representation. Work state is one of `queued`, `in_progress`, `succeeded`,
@@ -278,7 +283,10 @@ interruption before that commit leaves requeueable work; an interruption after
 it reuses the proven success. Earlier registration and article checkpoints
 therefore survive a later retryable, terminal, or interrupted operation.
 Failure rows retain only stable adapter codes, numeric status/retry metadata,
-and attempt counts.
+and attempt counts. A changed input or explicit bounded reprocess first records
+the superseded success's content-free input/vector hashes and run identities in
+`embedding_generation_history`. A changed configuration creates separate work
+and leaves prior-configuration vectors immutable and queryable.
 
 The research query seam is:
 
@@ -296,6 +304,7 @@ SELECT
 FROM embeddings AS e
 JOIN embedding_configurations AS c USING (configuration_id)
 WHERE e.modality = 'article_text'
+  AND e.configuration_id = '<configuration_id>'
 ORDER BY e.published_at_utc, e.article_id;
 ```
 
@@ -481,15 +490,17 @@ reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
-embeddings. It checks the exact five-table embedding schema first, opens the
+embeddings. It checks the exact six-table embedding schema first, opens the
 preprocessing catalog through its public exact-schema contract, and reports
 stable sorted issues for configuration identity/reference failures, malformed
-work lifecycle/failure checkpoints, missing vectors claimed by successful work,
+work lifecycle/failure checkpoints, malformed generation provenance, missing
+vectors claimed by successful work,
 unsupported modality/dimension, orphaned canonical identities, publication
 mismatch, unsafe or missing canonical Markdown, input-hash mismatch,
 non-finite/zero/non-unit vectors, and float32 vector-hash mismatch. Messages
-never contain Markdown, vector values, or credentials. Validation detects but
-does not repair state.
+never contain Markdown, vector values, or credentials. When configurations
+coexist, validation requires one explicit configuration identity and never
+mixes generations. Validation detects but does not repair state.
 
 ## 11. Test map
 
@@ -562,8 +573,9 @@ orphan cleanup, and full-only missing-source reconciliation.
   limited-only: affirmative hosted-processing authorization and a positive
   lexical article limit are mandatory. Unchanged successful article text is
   reused; retryable/interrupted work resumes and terminal work is not retried
-  implicitly. Broader input/configuration invalidation and full reconciliation
-  remain later boundaries.
+  implicitly. `--reprocess` regenerates only that selected limit and retains
+  superseded-generation provenance. Full reconciliation remains a later
+  boundary.
 - A multimodal job may combine Markdown with the source-relative
   `header_image_path`. It may independently choose whether to retrieve remote
   `inline_image_urls`; this pipeline never does so.

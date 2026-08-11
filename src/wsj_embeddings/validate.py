@@ -13,19 +13,17 @@ from wsj_embeddings.canonical_markdown import (
     CanonicalMarkdownError,
     read_canonical_markdown,
 )
-from wsj_embeddings.catalog import (
-    EmbeddingCatalog,
-    EmbeddingCatalogError,
-    configuration_id,
-)
+from wsj_embeddings.catalog import EmbeddingCatalog, EmbeddingCatalogError
+from wsj_embeddings.catalog import configuration_id as profile_configuration_id
 from wsj_embeddings.config import EmbeddingPipelineConfig
-from wsj_embeddings.models import CanonicalArticle, EmbeddingProfile
-from wsj_embeddings.pipeline import (
-    _ARTICLE_TEXT_MODALITY,
-    _SUCCEEDED,
-    _VECTOR_DIMENSIONS,
-    _WORK_STATES,
+from wsj_embeddings.models import (
+    CanonicalArticle,
+    EmbeddingModality,
+    EmbeddingProfile,
+    SupersessionReason,
+    WorkState,
 )
+from wsj_embeddings.pipeline import _VECTOR_DIMENSIONS
 from wsj_pipeline.catalog import Catalog, CatalogError
 
 
@@ -50,6 +48,8 @@ class EmbeddingValidationResult:
 
 def validate_embedding_outputs(
     config: EmbeddingPipelineConfig,
+    *,
+    configuration_id: str | None = None,
 ) -> EmbeddingValidationResult:
     """Check embedding output against canonical generated preprocessing state."""
 
@@ -60,9 +60,28 @@ def validate_embedding_outputs(
             articles = _canonical_articles(config, issues)
             if articles is not None:
                 _validate_configurations(catalog.connection, issues)
-                _validate_run_coverage(catalog.connection, issues)
-                _validate_work_items(catalog.connection, issues)
-                _validate_embeddings(catalog.connection, config, articles, issues)
+                selected_configuration_id = _select_configuration_id(
+                    catalog.connection,
+                    configuration_id,
+                    issues,
+                )
+                if selected_configuration_id is not None:
+                    _validate_run_coverage(
+                        catalog.connection, selected_configuration_id, issues
+                    )
+                    _validate_work_items(
+                        catalog.connection, selected_configuration_id, issues
+                    )
+                    _validate_embeddings(
+                        catalog.connection,
+                        config,
+                        articles,
+                        selected_configuration_id,
+                        issues,
+                    )
+                    _validate_generation_history(
+                        catalog.connection, selected_configuration_id, issues
+                    )
     except EmbeddingCatalogError:
         issues.append(
             EmbeddingValidationIssue(
@@ -114,14 +133,34 @@ def _validate_configurations(
     invalid = False
     rows = connection.execute(
         """
-        SELECT configuration_id, model, task, dimensions, output_type, normalization
+        SELECT configuration_id, model, observed_model, observed_api_version,
+               task, dimensions, output_type, normalization,
+               tokenizer_revision, context_token_limit, context_rules,
+               long_text_aggregation, image_input_rules, image_transform,
+               multimodal_formula, client_configuration_version
         FROM embedding_configurations
         """
     ).fetchall()
     configuration_ids = {row[0] for row in rows}
     for row in rows:
-        profile = EmbeddingProfile(*row[1:])
-        if row[0] != configuration_id(profile):
+        profile = EmbeddingProfile(
+            model=row[1],
+            observed_model=row[2],
+            observed_api_version=row[3],
+            task=row[4],
+            dimensions=row[5],
+            output_type=row[6],
+            normalization=row[7],
+            tokenizer_revision=row[8],
+            context_token_limit=row[9],
+            context_rules=row[10],
+            long_text_aggregation=row[11],
+            image_input_rules=row[12],
+            image_transform=row[13],
+            multimodal_formula=row[14],
+            client_configuration_version=row[15],
+        )
+        if row[0] != profile_configuration_id(profile):
             invalid = True
     if invalid:
         issues.append(
@@ -142,8 +181,40 @@ def _validate_configurations(
         )
 
 
+def _select_configuration_id(
+    connection: duckdb.DuckDBPyConnection,
+    requested: str | None,
+    issues: list[EmbeddingValidationIssue],
+) -> str | None:
+    configuration_ids = tuple(
+        row[0]
+        for row in connection.execute(
+            "SELECT configuration_id FROM embedding_configurations "
+            "ORDER BY configuration_id"
+        ).fetchall()
+    )
+    if requested is not None:
+        if requested not in configuration_ids:
+            _append(
+                issues,
+                "unknown_configuration_id",
+                "validation configuration identity is not present",
+            )
+            return None
+        return requested
+    if len(configuration_ids) > 1:
+        _append(
+            issues,
+            "configuration_id_required",
+            "validation requires a configuration identity when generations coexist",
+        )
+        return None
+    return configuration_ids[0] if configuration_ids else None
+
+
 def _validate_run_coverage(
     connection: duckdb.DuckDBPyConnection,
+    configuration_id: str,
     issues: list[EmbeddingValidationIssue],
 ) -> None:
     missing = connection.execute(
@@ -153,17 +224,20 @@ def _validate_run_coverage(
                    max(runs.embeddings) AS expected_embeddings
             FROM runs
             JOIN embedding_configurations USING (configuration_id)
+            WHERE runs.configuration_id = ?
             GROUP BY runs.configuration_id
         ), vector_counts AS (
             SELECT configuration_id, count(*) AS published_embeddings
             FROM embeddings
+            WHERE configuration_id = ?
             GROUP BY configuration_id
         )
         SELECT count(*)
         FROM run_claims
         LEFT JOIN vector_counts USING (configuration_id)
         WHERE coalesce(published_embeddings, 0) < expected_embeddings
-        """
+        """,
+        [configuration_id, configuration_id],
     ).fetchone()[0]
     if missing:
         _append(
@@ -175,6 +249,7 @@ def _validate_run_coverage(
 
 def _validate_work_items(
     connection: duckdb.DuckDBPyConnection,
+    configuration_id: str,
     issues: list[EmbeddingValidationIssue],
 ) -> None:
     embeddings = set(
@@ -182,7 +257,9 @@ def _validate_work_items(
             """
             SELECT article_id, modality, configuration_id, input_sha256
             FROM embeddings
-            """
+            WHERE configuration_id = ?
+            """,
+            [configuration_id],
         ).fetchall()
     )
     rows = connection.execute(
@@ -190,7 +267,9 @@ def _validate_work_items(
         SELECT article_id, modality, configuration_id, input_sha256, state,
                attempt_count, error_code, status_code, retry_after_seconds
         FROM embedding_work_items
-        """
+        WHERE configuration_id = ?
+        """,
+        [configuration_id],
     ).fetchall()
     for row in rows:
         (
@@ -204,7 +283,9 @@ def _validate_work_items(
             status_code,
             retry_after_seconds,
         ) = row
-        if state not in _WORK_STATES:
+        try:
+            work_state = WorkState(state)
+        except ValueError:
             _append(
                 issues,
                 "invalid_work_state",
@@ -217,13 +298,13 @@ def _validate_work_items(
             configuration_identifier,
             input_sha256,
         ) in embeddings
-        if state == _SUCCEEDED and not has_matching_embedding:
+        if work_state.is_reusable_success and not has_matching_embedding:
             _append(
                 issues,
                 "missing_published_embedding",
                 "successful embedding runs lack their published vectors",
             )
-        elif state != _SUCCEEDED and has_matching_embedding:
+        elif not work_state.is_reusable_success and has_matching_embedding:
             _append(
                 issues,
                 "embedding_without_success_checkpoint",
@@ -233,7 +314,7 @@ def _validate_work_items(
             value is not None
             for value in (error_code, status_code, retry_after_seconds)
         )
-        if state in {"retryable", "terminal"}:
+        if work_state.is_failure:
             if error_code is None or attempt_count < 1:
                 _append(
                     issues,
@@ -252,6 +333,7 @@ def _validate_embeddings(
     connection: duckdb.DuckDBPyConnection,
     config: EmbeddingPipelineConfig,
     articles: dict[str, CanonicalArticle],
+    selected_configuration_id: str,
     issues: list[EmbeddingValidationIssue],
 ) -> None:
     rows = connection.execute(
@@ -260,8 +342,10 @@ def _validate_embeddings(
                publication_date_new_york, dimensions, input_sha256,
                stored_vector_sha256, vector
         FROM embeddings
+        WHERE configuration_id = ?
         ORDER BY article_id, modality, configuration_id
-        """
+        """,
+        [selected_configuration_id],
     ).fetchall()
     configuration_ids = {
         row[0]
@@ -288,7 +372,7 @@ def _validate_embeddings(
                 "missing_configuration_reference",
                 "embedding rows lack a configuration reference",
             )
-        if modality != _ARTICLE_TEXT_MODALITY:
+        if modality != EmbeddingModality.ARTICLE_TEXT.value:
             _append(
                 issues,
                 "invalid_modality",
@@ -318,6 +402,63 @@ def _validate_embeddings(
                 "embedding publication metadata differs from the canonical article",
             )
         _validate_markdown_hash(config, article, input_sha256, issues)
+
+
+def _validate_generation_history(
+    connection: duckdb.DuckDBPyConnection,
+    configuration_id: str,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    run_ids = {
+        row[0]
+        for row in connection.execute(
+            "SELECT run_id FROM runs WHERE configuration_id = ?",
+            [configuration_id],
+        ).fetchall()
+    }
+    reasons = {reason.value for reason in SupersessionReason}
+    rows = connection.execute(
+        """
+        SELECT generation_run_id, input_sha256, stored_vector_sha256,
+               superseded_run_id, superseded_reason
+        FROM embedding_generation_history
+        WHERE configuration_id = ?
+        """,
+        [configuration_id],
+    ).fetchall()
+    for (
+        generation_run_id,
+        input_sha256,
+        vector_sha256,
+        superseded_run_id,
+        reason,
+    ) in rows:
+        if generation_run_id not in run_ids or superseded_run_id not in run_ids:
+            _append(
+                issues,
+                "invalid_generation_run_reference",
+                "embedding generation history lacks a matching run reference",
+            )
+        if reason not in reasons:
+            _append(
+                issues,
+                "invalid_supersession_reason",
+                "embedding generation history uses an unsupported reason",
+            )
+        if not _is_sha256(input_sha256) or not _is_sha256(vector_sha256):
+            _append(
+                issues,
+                "invalid_generation_hash",
+                "embedding generation history contains an invalid hash",
+            )
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _validate_markdown_hash(

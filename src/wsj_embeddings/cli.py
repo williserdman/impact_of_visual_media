@@ -16,7 +16,7 @@ from wsj_embeddings.adapters import (
     JinaHostedAdapterError,
     JinaTransport,
 )
-from wsj_embeddings.catalog import EmbeddingCatalogError
+from wsj_embeddings.catalog import EmbeddingCatalogError, configuration_id
 from wsj_embeddings.config import EmbeddingConfigError, EmbeddingPipelineConfig
 from wsj_embeddings.pilot import run_jina_pilot
 from wsj_embeddings.pipeline import (
@@ -70,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run")
     _add_root_arguments(run)
     run.add_argument("--limit", required=True, type=_positive_int)
+    run.add_argument("--reprocess", action="store_true")
     run.add_argument("--authorize-hosted-processing", action="store_true")
     return parser
 
@@ -159,9 +160,16 @@ def main(
                 if adapter_factory is None
                 else adapter_factory()
             )
-            result = run_embedding_pipeline(config, adapter, limit=args.limit)
+            result = run_embedding_pipeline(
+                config,
+                adapter,
+                limit=args.limit,
+                reprocess=args.reprocess,
+            )
         except _OPERATIONAL_ERRORS as error:
             return _report_operational_error(error)
-        print(json.dumps(asdict(result), sort_keys=True))
+        payload = asdict(result)
+        payload["configuration_id"] = configuration_id(adapter.profile)
+        print(json.dumps(payload, sort_keys=True))
         return 0
     raise AssertionError(f"unhandled command {args.command}")

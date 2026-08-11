@@ -7,7 +7,7 @@ import json
 import os
 import stat
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import asdict
 from pathlib import Path
@@ -15,12 +15,18 @@ from uuid import uuid4
 
 import duckdb
 
-from wsj_embeddings.models import EmbeddingProfile
+from wsj_embeddings.models import (
+    EmbeddingProfile,
+    EmbeddingRunResult,
+    SupersessionReason,
+    WorkState,
+)
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "2"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "3"
 
 _EMBEDDING_CATALOG_TABLES = {
     "embedding_configurations",
+    "embedding_generation_history",
     "embedding_work_items",
     "embeddings",
     "metadata",
@@ -34,10 +40,20 @@ _TABLE_COLUMNS = {
     "embedding_configurations": (
         ("configuration_id", "VARCHAR", True, None, True),
         ("model", "VARCHAR", True, None, False),
+        ("observed_model", "VARCHAR", True, None, False),
+        ("observed_api_version", "VARCHAR", True, None, False),
         ("task", "VARCHAR", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
         ("output_type", "VARCHAR", True, None, False),
         ("normalization", "VARCHAR", True, None, False),
+        ("tokenizer_revision", "VARCHAR", True, None, False),
+        ("context_token_limit", "INTEGER", True, None, False),
+        ("context_rules", "VARCHAR", True, None, False),
+        ("long_text_aggregation", "VARCHAR", True, None, False),
+        ("image_input_rules", "VARCHAR", True, None, False),
+        ("image_transform", "VARCHAR", True, None, False),
+        ("multimodal_formula", "VARCHAR", True, None, False),
+        ("client_configuration_version", "VARCHAR", True, None, False),
     ),
     "runs": (
         ("run_id", "VARCHAR", True, None, True),
@@ -76,6 +92,17 @@ _TABLE_COLUMNS = {
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("vector", "FLOAT[2048]", True, None, False),
     ),
+    "embedding_generation_history": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("modality", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("input_sha256", "VARCHAR", True, None, False),
+        ("stored_vector_sha256", "VARCHAR", True, None, False),
+        ("superseded_run_id", "VARCHAR", True, None, False),
+        ("superseded_reason", "VARCHAR", True, None, False),
+        ("superseded_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
 }
 _KEY_CONSTRAINTS = {
     ("metadata", "PRIMARY KEY", ("key",)),
@@ -90,6 +117,11 @@ _KEY_CONSTRAINTS = {
         "embeddings",
         "PRIMARY KEY",
         ("article_id", "modality", "configuration_id"),
+    ),
+    (
+        "embedding_generation_history",
+        "PRIMARY KEY",
+        ("article_id", "modality", "configuration_id", "generation_run_id"),
     ),
 }
 _EXPECTED_CONSTRAINTS = Counter(
@@ -114,6 +146,9 @@ _CATALOG_DIRECTORY_FLAGS = (
 )
 _CATALOG_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _CATALOG_WRITE_FLAGS = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+_RUN_COUNT_COLUMNS = frozenset(
+    {"reused", "attempted", "succeeded", "retryable", "terminal", "interrupted"}
+)
 
 
 class EmbeddingCatalogError(RuntimeError):
@@ -466,10 +501,20 @@ class EmbeddingCatalog:
                 CREATE TABLE IF NOT EXISTS embedding_configurations (
                     configuration_id VARCHAR PRIMARY KEY,
                     model VARCHAR NOT NULL,
+                    observed_model VARCHAR NOT NULL,
+                    observed_api_version VARCHAR NOT NULL,
                     task VARCHAR NOT NULL,
                     dimensions INTEGER NOT NULL,
                     output_type VARCHAR NOT NULL,
-                    normalization VARCHAR NOT NULL
+                    normalization VARCHAR NOT NULL,
+                    tokenizer_revision VARCHAR NOT NULL,
+                    context_token_limit INTEGER NOT NULL,
+                    context_rules VARCHAR NOT NULL,
+                    long_text_aggregation VARCHAR NOT NULL,
+                    image_input_rules VARCHAR NOT NULL,
+                    image_transform VARCHAR NOT NULL,
+                    multimodal_formula VARCHAR NOT NULL,
+                    client_configuration_version VARCHAR NOT NULL
                 )
                 """
             )
@@ -521,6 +566,24 @@ class EmbeddingCatalog:
                     stored_vector_sha256 VARCHAR NOT NULL,
                     vector FLOAT[2048] NOT NULL,
                     PRIMARY KEY (article_id, modality, configuration_id)
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embedding_generation_history (
+                    article_id VARCHAR NOT NULL,
+                    modality VARCHAR NOT NULL,
+                    configuration_id VARCHAR NOT NULL,
+                    generation_run_id VARCHAR NOT NULL,
+                    input_sha256 VARCHAR NOT NULL,
+                    stored_vector_sha256 VARCHAR NOT NULL,
+                    superseded_run_id VARCHAR NOT NULL,
+                    superseded_reason VARCHAR NOT NULL,
+                    superseded_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    PRIMARY KEY (
+                        article_id, modality, configuration_id, generation_run_id
+                    )
                 )
                 """
             )
@@ -611,6 +674,383 @@ class EmbeddingCatalog:
             "unsupported embedding catalog schema; move derived output aside "
             "or choose a fresh output root"
         )
+
+    def begin_run(
+        self,
+        run_id: str,
+        configuration_identifier: str,
+        profile: EmbeddingProfile,
+        article_count: int,
+    ) -> None:
+        """Persist one immutable configuration and content-free run record."""
+
+        self.connection.execute(
+            """
+            INSERT INTO embedding_configurations (
+                configuration_id, model, observed_model, observed_api_version,
+                task, dimensions, output_type, normalization,
+                tokenizer_revision, context_token_limit, context_rules,
+                long_text_aggregation, image_input_rules, image_transform,
+                multimodal_formula, client_configuration_version
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (configuration_id) DO NOTHING
+            """,
+            [
+                configuration_identifier,
+                profile.model,
+                profile.observed_model,
+                profile.observed_api_version,
+                profile.task,
+                profile.dimensions,
+                profile.output_type,
+                profile.normalization,
+                profile.tokenizer_revision,
+                profile.context_token_limit,
+                profile.context_rules,
+                profile.long_text_aggregation,
+                profile.image_input_rules,
+                profile.image_transform,
+                profile.multimodal_formula,
+                profile.client_configuration_version,
+            ],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO runs (
+                run_id, configuration_id, articles, embeddings, reused,
+                attempted, succeeded, retryable, terminal, interrupted, started_at
+            )
+            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, current_timestamp)
+            """,
+            [run_id, configuration_identifier, article_count],
+        )
+
+    def register_work(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+        input_sha256: str,
+        published_at_utc: object,
+        publication_date_new_york: object,
+        reprocess: bool,
+    ) -> WorkState:
+        """Register or recover one bounded item and invalidate only its vector."""
+
+        row = self.connection.execute(
+            """
+            SELECT state, input_sha256
+            FROM embedding_work_items
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [article_id, modality, configuration_identifier],
+        ).fetchone()
+        if row is None:
+            self.connection.execute(
+                """
+                INSERT INTO embedding_work_items
+                VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, current_timestamp)
+                """,
+                [
+                    article_id,
+                    modality,
+                    configuration_identifier,
+                    input_sha256,
+                    WorkState.QUEUED.value,
+                    run_id,
+                ],
+            )
+            return WorkState.QUEUED
+        state = WorkState(str(row[0]))
+        prior_input_sha256 = str(row[1])
+        if reprocess or prior_input_sha256 != input_sha256:
+            reason = (
+                SupersessionReason.EXPLICIT_REPROCESS
+                if reprocess
+                else SupersessionReason.INPUT_CHANGED
+            )
+            self._archive_active_generation(
+                run_id=run_id,
+                article_id=article_id,
+                modality=modality,
+                configuration_identifier=configuration_identifier,
+                reason=reason,
+            )
+            self.connection.execute(
+                """
+                DELETE FROM embeddings
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [article_id, modality, configuration_identifier],
+            )
+            self.connection.execute(
+                """
+                UPDATE embedding_work_items
+                SET input_sha256 = ?, state = ?, attempt_count = 0,
+                    error_code = NULL, status_code = NULL,
+                    retry_after_seconds = NULL, last_run_id = ?,
+                    updated_at = current_timestamp
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [
+                    input_sha256,
+                    WorkState.QUEUED.value,
+                    run_id,
+                    article_id,
+                    modality,
+                    configuration_identifier,
+                ],
+            )
+            return WorkState.QUEUED
+        proven_success = state.is_reusable_success and bool(
+            self.connection.execute(
+                """
+                SELECT count(*)
+                FROM embeddings
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                  AND input_sha256 = ?
+                """,
+                [article_id, modality, configuration_identifier, input_sha256],
+            ).fetchone()[0]
+        )
+        if proven_success:
+            self.connection.execute(
+                """
+                UPDATE embeddings
+                SET published_at_utc = ?, publication_date_new_york = ?
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [
+                    published_at_utc,
+                    publication_date_new_york,
+                    article_id,
+                    modality,
+                    configuration_identifier,
+                ],
+            )
+            return WorkState.SUCCEEDED
+        if state is WorkState.IN_PROGRESS or state.is_reusable_success:
+            self.connection.execute(
+                """
+                UPDATE embedding_work_items
+                SET state = ?, last_run_id = ?, updated_at = current_timestamp
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [
+                    WorkState.INTERRUPTED.value,
+                    run_id,
+                    article_id,
+                    modality,
+                    configuration_identifier,
+                ],
+            )
+            self.increment_run(run_id, "interrupted")
+            return WorkState.INTERRUPTED
+        return state
+
+    def _archive_active_generation(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+        reason: SupersessionReason,
+    ) -> None:
+        row = self.connection.execute(
+            """
+            SELECT w.last_run_id, e.input_sha256, e.stored_vector_sha256
+            FROM embeddings AS e
+            JOIN embedding_work_items AS w
+              USING (article_id, modality, configuration_id)
+            WHERE e.article_id = ? AND e.modality = ?
+              AND e.configuration_id = ?
+            """,
+            [article_id, modality, configuration_identifier],
+        ).fetchone()
+        if row is None:
+            return
+        generation_run_id, input_sha256, stored_vector_sha256 = row
+        self.connection.execute(
+            """
+            INSERT INTO embedding_generation_history
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            ON CONFLICT (
+                article_id, modality, configuration_id, generation_run_id
+            ) DO NOTHING
+            """,
+            [
+                article_id,
+                modality,
+                configuration_identifier,
+                generation_run_id,
+                input_sha256,
+                stored_vector_sha256,
+                run_id,
+                reason.value,
+            ],
+        )
+
+    def start_attempt(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+    ) -> None:
+        """Checkpoint in-progress before any content read or adapter request."""
+
+        self.connection.execute(
+            """
+            UPDATE embedding_work_items
+            SET state = ?, attempt_count = attempt_count + 1,
+                error_code = NULL, status_code = NULL,
+                retry_after_seconds = NULL, last_run_id = ?,
+                updated_at = current_timestamp
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                WorkState.IN_PROGRESS.value,
+                run_id,
+                article_id,
+                modality,
+                configuration_identifier,
+            ],
+        )
+        self.increment_run(run_id, "attempted")
+
+    def record_failure(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+        state: WorkState,
+        error_code: str,
+        status_code: int | None,
+        retry_after_seconds: float | None,
+    ) -> None:
+        """Commit one content-free retryable or terminal checkpoint."""
+
+        if not state.is_failure:
+            raise ValueError("failure checkpoint requires a failure state")
+        self.connection.execute(
+            """
+            UPDATE embedding_work_items
+            SET state = ?, error_code = ?, status_code = ?,
+                retry_after_seconds = ?, last_run_id = ?,
+                updated_at = current_timestamp
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                state.value,
+                error_code,
+                status_code,
+                retry_after_seconds,
+                run_id,
+                article_id,
+                modality,
+                configuration_identifier,
+            ],
+        )
+        self.increment_run(run_id, state.value)
+
+    def publish_success(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+        published_at_utc: object,
+        publication_date_new_york: object,
+        dimensions: int,
+        input_sha256: str,
+        stored_vector_sha256: str,
+        vector: Sequence[float],
+    ) -> None:
+        """Publish one vector and its success checkpoint atomically."""
+
+        self.connection.execute(
+            """
+            INSERT INTO embeddings
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (article_id, modality, configuration_id)
+            DO UPDATE SET
+                published_at_utc = excluded.published_at_utc,
+                publication_date_new_york = excluded.publication_date_new_york,
+                dimensions = excluded.dimensions,
+                input_sha256 = excluded.input_sha256,
+                stored_vector_sha256 = excluded.stored_vector_sha256,
+                vector = excluded.vector
+            """,
+            [
+                article_id,
+                modality,
+                configuration_identifier,
+                published_at_utc,
+                publication_date_new_york,
+                dimensions,
+                input_sha256,
+                stored_vector_sha256,
+                list(vector),
+            ],
+        )
+        self.connection.execute(
+            """
+            UPDATE embedding_work_items
+            SET state = ?, input_sha256 = ?, error_code = NULL,
+                status_code = NULL, retry_after_seconds = NULL,
+                last_run_id = ?, updated_at = current_timestamp
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                WorkState.SUCCEEDED.value,
+                input_sha256,
+                run_id,
+                article_id,
+                modality,
+                configuration_identifier,
+            ],
+        )
+        self.connection.execute(
+            """
+            UPDATE runs
+            SET embeddings = embeddings + 1, succeeded = succeeded + 1
+            WHERE run_id = ?
+            """,
+            [run_id],
+        )
+
+    def increment_run(self, run_id: str, column: str) -> None:
+        """Increment one whitelisted content-free run counter."""
+
+        if column not in _RUN_COUNT_COLUMNS:
+            raise AssertionError("unsupported run count")
+        self.connection.execute(
+            f"UPDATE runs SET {column} = {column} + 1 WHERE run_id = ?",
+            [run_id],
+        )
+
+    def run_result(self, run_id: str) -> EmbeddingRunResult:
+        """Read one completed or interrupted run's stable counters."""
+
+        row = self.connection.execute(
+            """
+            SELECT articles, embeddings, reused, attempted, succeeded,
+                   retryable, terminal, interrupted
+            FROM runs
+            WHERE run_id = ?
+            """,
+            [run_id],
+        ).fetchone()
+        assert row is not None
+        return EmbeddingRunResult(*(int(value) for value in row))
 
     @contextmanager
     def transaction(self) -> Iterator[None]:

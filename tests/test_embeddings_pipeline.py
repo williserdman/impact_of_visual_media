@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -43,10 +43,20 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
     "embedding_configurations": (
         ("configuration_id", "VARCHAR", True, None, True),
         ("model", "VARCHAR", True, None, False),
+        ("observed_model", "VARCHAR", True, None, False),
+        ("observed_api_version", "VARCHAR", True, None, False),
         ("task", "VARCHAR", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
         ("output_type", "VARCHAR", True, None, False),
         ("normalization", "VARCHAR", True, None, False),
+        ("tokenizer_revision", "VARCHAR", True, None, False),
+        ("context_token_limit", "INTEGER", True, None, False),
+        ("context_rules", "VARCHAR", True, None, False),
+        ("long_text_aggregation", "VARCHAR", True, None, False),
+        ("image_input_rules", "VARCHAR", True, None, False),
+        ("image_transform", "VARCHAR", True, None, False),
+        ("multimodal_formula", "VARCHAR", True, None, False),
+        ("client_configuration_version", "VARCHAR", True, None, False),
     ),
     "runs": (
         ("run_id", "VARCHAR", True, None, True),
@@ -85,6 +95,17 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("vector", "FLOAT[2048]", True, None, False),
     ),
+    "embedding_generation_history": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("modality", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("input_sha256", "VARCHAR", True, None, False),
+        ("stored_vector_sha256", "VARCHAR", True, None, False),
+        ("superseded_run_id", "VARCHAR", True, None, False),
+        ("superseded_reason", "VARCHAR", True, None, False),
+        ("superseded_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
 }
 EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     ("metadata", ("key",)),
@@ -95,6 +116,10 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
         ("article_id", "modality", "configuration_id"),
     ),
     ("embeddings", ("article_id", "modality", "configuration_id")),
+    (
+        "embedding_generation_history",
+        ("article_id", "modality", "configuration_id", "generation_run_id"),
+    ),
 }
 
 
@@ -236,6 +261,36 @@ class PriorConfigurationAdapter(FakeEmbeddingAdapter):
     )
 
 
+def test_configuration_identity_covers_every_meaning_bearing_profile_field():
+    """Break caught: a public embedding rule changes without new eligibility."""
+
+    profile = FakeEmbeddingAdapter.profile
+    alternatives = {
+        "model": "changed-model-alias",
+        "observed_model": "changed-observed-model",
+        "observed_api_version": "changed-api-version",
+        "task": "changed-task",
+        "dimensions": 1024,
+        "output_type": "changed-output-type",
+        "normalization": "changed-normalization",
+        "tokenizer_revision": "changed-tokenizer",
+        "context_token_limit": 8192,
+        "context_rules": "changed-context-rules",
+        "long_text_aggregation": "changed-aggregation",
+        "image_input_rules": "changed-image-rules",
+        "image_transform": "changed-image-transform",
+        "multimodal_formula": "changed-multimodal-formula",
+        "client_configuration_version": "changed-client-version",
+    }
+
+    assert set(asdict(profile)) == set(alternatives)
+    baseline = configuration_id(profile)
+    assert all(
+        configuration_id(replace(profile, **{name: value})) != baseline
+        for name, value in alternatives.items()
+    )
+
+
 def test_config_rejects_truthy_non_boolean_hosted_processing_authorization(
     tmp_path,
 ):
@@ -370,6 +425,192 @@ def test_replaying_unchanged_success_reuses_checkpoint_without_adapter_call(tmp_
             FROM embedding_work_items
             """
         ).fetchone() == ("succeeded", 1, None, None, None)
+
+
+def test_metadata_only_preprocessing_change_reuses_vector_and_refreshes_metadata(
+    tmp_path,
+):
+    """Break caught: path/date-only canonical changes repurchase the same vector."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, RecordingAdapter(), limit=1)
+    old_path = (
+        config.preprocessing_output_root / "text" / "2024" / "01" / "02" / "article.md"
+    )
+    new_path = config.preprocessing_output_root / "text" / "metadata-only.md"
+    new_path.write_bytes(old_path.read_bytes())
+    new_published = datetime(2024, 1, 4, 15, 30, tzinfo=UTC)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            """
+            UPDATE articles
+            SET cleaned_markdown_path = ?, published_at_utc = ?,
+                publication_date_new_york = ?
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+            """,
+            ["text/metadata-only.md", new_published, date(2024, 1, 4)],
+        )
+    replay_adapter = RecordingAdapter()
+
+    replay = run_embedding_pipeline(config, replay_adapter, limit=1)
+
+    assert replay.reused == 1
+    assert replay_adapter.calls == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT published_at_utc, publication_date_new_york
+            FROM embeddings
+            """
+        ).fetchone() == (new_published, date(2024, 1, 4))
+        assert db.execute(
+            "SELECT count(*) FROM embedding_generation_history"
+        ).fetchone() == (0,)
+
+
+def test_changed_markdown_regenerates_only_affected_text_and_audits_prior_generation(
+    tmp_path,
+):
+    """Break caught: one content change repurchases siblings or loses provenance."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Unchanged sibling\n",
+    )
+    run_embedding_pipeline(config, RecordingAdapter(), limit=2)
+    changed_hash = replace_generated_embedding_markdown(
+        config, "# Changed generated article\n"
+    )
+    adapter = RecordingAdapter()
+
+    result = run_embedding_pipeline(config, adapter, limit=2)
+
+    assert result.reused == 1
+    assert result.succeeded == 1
+    assert adapter.calls == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT article_id, input_sha256 FROM embeddings ORDER BY article_id"
+        ).fetchall()[0] == ("wsj:SYNTHETIC-EMBEDDING", changed_hash)
+        history = db.execute(
+            """
+            SELECT article_id, modality, configuration_id, generation_run_id,
+                   input_sha256, stored_vector_sha256, superseded_run_id,
+                   superseded_reason
+            FROM embedding_generation_history
+            """
+        ).fetchone()
+    assert history is not None
+    assert history[:3] == (
+        "wsj:SYNTHETIC-EMBEDDING",
+        "article_text",
+        configuration_id(FakeEmbeddingAdapter.profile),
+    )
+    assert history[3] != history[6]
+    assert history[4] == hashlib.sha256(b"#\n").hexdigest()
+    assert len(history[5]) == 64
+    assert history[7] == "input_changed"
+
+
+def test_changed_configuration_keeps_both_vectors_and_requires_validation_selector(
+    tmp_path,
+):
+    """Break caught: changed meaning overwrites or silently mixes old vectors."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), limit=1)
+    active_id = configuration_id(FakeEmbeddingAdapter.profile)
+    prior_id = configuration_id(PriorConfigurationAdapter.profile)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT configuration_id FROM embeddings ORDER BY configuration_id"
+        ).fetchall() == sorted([(active_id,), (prior_id,)])
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "configuration_id_required",
+                "validation requires a configuration identity when generations coexist",
+            ),
+        )
+    )
+    assert validate_embedding_outputs(
+        config, configuration_id=active_id
+    ) == EmbeddingValidationResult(issues=())
+    assert validate_embedding_outputs(
+        config, configuration_id=prior_id
+    ) == EmbeddingValidationResult(issues=())
+
+
+def test_explicit_reprocess_is_bounded_and_audits_replaced_success(tmp_path):
+    """Break caught: reprocess expands beyond its limit or destroys prior provenance."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Unchanged sibling\n",
+    )
+    run_embedding_pipeline(config, RecordingAdapter(), limit=2)
+    adapter = RecordingAdapter()
+
+    result = run_embedding_pipeline(config, adapter, limit=1, reprocess=True)
+
+    assert result.reused == 0
+    assert result.succeeded == 1
+    assert adapter.calls == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (2,)
+        assert db.execute(
+            """
+            SELECT article_id, superseded_reason
+            FROM embedding_generation_history
+            """
+        ).fetchall() == [
+            ("wsj:SYNTHETIC-EMBEDDING", "explicit_reprocess")
+        ]
+        assert db.execute(
+            """
+            SELECT article_id, attempt_count
+            FROM embedding_work_items
+            ORDER BY article_id
+            """
+        ).fetchall() == [
+            ("wsj:SYNTHETIC-EMBEDDING", 1),
+            ("wsj:ZZZ-SYNTHETIC-EMBEDDING", 1),
+        ]
+
+
+def test_validator_reports_malformed_generation_history(tmp_path):
+    """Break caught: superseded provenance can be corrupted without detection."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    run_embedding_pipeline(
+        config,
+        FakeEmbeddingAdapter(),
+        limit=1,
+        reprocess=True,
+    )
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            UPDATE embedding_generation_history
+            SET superseded_reason = 'synthetic-invalid-reason'
+            """
+        )
+
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "invalid_supersession_reason",
+                "embedding generation history uses an unsupported reason",
+            ),
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -791,7 +1032,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_two_checkpoint_schema(tmp_path):
+def test_embedding_catalog_has_exact_version_three_generation_schema(tmp_path):
     database_path = tmp_path / "catalog.duckdb"
 
     with EmbeddingCatalog.open(database_path):
@@ -859,6 +1100,7 @@ def test_embedding_catalog_has_exact_version_two_checkpoint_schema(tmp_path):
     )
     assert table_types == {
         "embedding_configurations": "BASE TABLE",
+        "embedding_generation_history": "BASE TABLE",
         "embedding_work_items": "BASE TABLE",
         "embeddings": "BASE TABLE",
         "metadata": "BASE TABLE",
@@ -867,7 +1109,7 @@ def test_embedding_catalog_has_exact_version_two_checkpoint_schema(tmp_path):
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "2")]
+    assert metadata == [("schema_version", "3")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -890,6 +1132,29 @@ def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_pa
         assert db.execute("SHOW TABLES").fetchall() == [("metadata",)]
         assert db.execute("SELECT * FROM metadata").fetchall() == [
             ("schema_version", "1")
+        ]
+
+
+def test_pipeline_refuses_version_two_embedding_catalog_without_migration(tmp_path):
+    """Break caught: opening checkpoint output silently upgrades it in place."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "CREATE TABLE metadata (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL)"
+        )
+        db.execute("INSERT INTO metadata VALUES ('schema_version', '2')")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SHOW TABLES").fetchall() == [("metadata",)]
+        assert db.execute("SELECT * FROM metadata").fetchall() == [
+            ("schema_version", "2")
         ]
 
 

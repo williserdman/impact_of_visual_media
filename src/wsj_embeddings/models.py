@@ -4,6 +4,41 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from enum import StrEnum
+
+
+class EmbeddingModality(StrEnum):
+    """Research-facing vector modalities shared by coordination and validation."""
+
+    ARTICLE_TEXT = "article_text"
+    HEADER_IMAGE = "header_image"
+    MULTIMODAL_ARTICLE = "multimodal_article"
+
+
+class WorkState(StrEnum):
+    """Durable lifecycle vocabulary for one modality/configuration item."""
+
+    QUEUED = "queued"
+    IN_PROGRESS = "in_progress"
+    SUCCEEDED = "succeeded"
+    RETRYABLE = "retryable"
+    TERMINAL = "terminal"
+    INTERRUPTED = "interrupted"
+
+    @property
+    def is_failure(self) -> bool:
+        return self in {WorkState.RETRYABLE, WorkState.TERMINAL}
+
+    @property
+    def is_reusable_success(self) -> bool:
+        return self is WorkState.SUCCEEDED
+
+
+class SupersessionReason(StrEnum):
+    """Stable causes for retaining superseded vector provenance."""
+
+    INPUT_CHANGED = "input_changed"
+    EXPLICIT_REPROCESS = "explicit_reprocess"
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +60,17 @@ class EmbeddingProfile:
     task: str
     dimensions: int
     output_type: str = "float"
-    normalization: str = "l2-client-v1"
+    normalization: str = "l2-client-float32-v1"
+    observed_model: str = "jina-embeddings-v4"
+    observed_api_version: str = "2026.07.27.1603"
+    tokenizer_revision: str = "jinaai/jina-embeddings-v4-hosted-2026-08-11"
+    context_token_limit: int = 32_768
+    context_rules: str = "complete-input-truncate-false-late-chunking-false-v1"
+    long_text_aggregation: str = "l2-token-count-weighted-mean-v1"
+    image_input_rules: str = "base64-source-bytes-no-remote-v1"
+    image_transform: str = "not-implemented-v1"
+    multimodal_formula: str = "l2-normalize-0.5-text-0.5-image-v1"
+    client_configuration_version: str = "wsj-embeddings-config-v1"
 
 
 @dataclass(frozen=True, slots=True)

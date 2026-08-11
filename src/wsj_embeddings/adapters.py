@@ -188,6 +188,18 @@ class JinaEmbeddingAdapter:
         model=_JINA_MODEL,
         task=_JINA_TASK,
         dimensions=_JINA_DIMENSIONS,
+        output_type="float",
+        normalization="l2-client-float32-v1",
+        observed_model=_JINA_MODEL,
+        observed_api_version="2026.07.27.1603",
+        tokenizer_revision="jinaai/jina-embeddings-v4-hosted-2026-08-11",
+        context_token_limit=32_768,
+        context_rules="complete-input-truncate-false-late-chunking-false-v1",
+        long_text_aggregation="l2-token-count-weighted-mean-v1",
+        image_input_rules="base64-source-bytes-no-remote-v1",
+        image_transform="not-implemented-v1",
+        multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
+        client_configuration_version="wsj-embeddings-config-v1",
     )
 
     def __init__(
@@ -420,6 +432,18 @@ class FakeEmbeddingAdapter:
         model="fake-jina-embeddings-v4",
         task="retrieval.passage",
         dimensions=2048,
+        output_type="float",
+        normalization="l2-client-float32-v1",
+        observed_model="fake-jina-embeddings-v4",
+        observed_api_version="synthetic-v1",
+        tokenizer_revision="synthetic-jina-v4-tokenizer-v1",
+        context_token_limit=32_768,
+        context_rules="complete-input-truncate-false-late-chunking-false-v1",
+        long_text_aggregation="l2-token-count-weighted-mean-v1",
+        image_input_rules="base64-source-bytes-no-remote-v1",
+        image_transform="not-implemented-v1",
+        multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
+        client_configuration_version="wsj-embeddings-config-v1",
     )
 
     def embed_text(self, text: str) -> tuple[float, ...]:
