@@ -307,7 +307,9 @@ the next hosted call, so a crash or retryable failure repurchases only unproven
 parts. Retryable errors become terminal on the third committed attempt; the
 part, parent article work, and run counter transition atomically. Replay repairs
 a legacy split terminal or an interrupted attempt-three checkpoint without an
-additional hosted call.
+additional hosted call. Ordinary replay preserves that terminal disposition;
+explicit reprocess instead resets every mutable part checkpoint in one
+transaction before the first new hosted part call.
 Explicit reprocess clears the current checkpoint but never a generation named
 by active or archived aggregate provenance. Aggregate provenance links the one
 research vector to each immutable part generation, content hash, token count,

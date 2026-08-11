@@ -347,7 +347,9 @@ token-count-weighted mean. Retryable part requests become terminal after three
 committed attempts. The part, parent article work, and terminal run count change
 in one transaction. If attempt three was checkpointed before an interruption,
 replay terminalizes the work without another hosted call. Mutable checkpoints
-point to append-only part-generation
+remain terminal on ordinary replay; bounded explicit reprocess atomically resets
+every part before making new hosted calls. Mutable checkpoints point to
+append-only part-generation
 rows; explicit reprocess clears only the checkpoint, never a generation named
 by active or archived aggregate provenance. Part vectors and their append-only
 aggregate linkage are audit/resume state, never additional research

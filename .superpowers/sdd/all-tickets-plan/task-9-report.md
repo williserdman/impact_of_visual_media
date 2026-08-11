@@ -311,3 +311,55 @@ Round-2 self-review:
   removing only the reviewed version-nine additions, while the separately
   malformed fixture prevents a relabeled current schema from masquerading as
   historical output.
+
+## Review-fix round 3
+
+The interruption-safe exhausted-part guard now applies only to ordinary replay.
+An explicit bounded reprocess deliberately continues to the existing
+`register_long_text_parts(..., reprocess=True)` transaction, which resets every
+mutable checkpoint before any new hosted part request. Append-only part
+generations and active or archived aggregate provenance remain untouched.
+
+The generated public coordinator fixture first publishes an aggregate, then
+uses explicit reprocess to archive it and ordinary retries to drive the middle
+part to the configured terminal ceiling. It proves an ordinary replay makes no
+hosted call. A second explicit reprocess uses the public checkpoint failpoint
+to observe that, before the first adapter call, the first part is
+`in_progress/1` and both later parts—including the formerly terminal part—are
+already `queued/0`. The run then calls all three parts, publishes three new
+immutable generations and a new aggregate, leaves the parent `succeeded/1`,
+resolves the archived aggregate's original provenance unchanged, and passes
+cross-artifact validation.
+
+Round-3 red-green evidence:
+
+- before the coordinator policy gate, the final explicit reprocess remained
+  terminal with zero attempts or embeddings:
+  `1 failed, 128 deselected in 12.31s`; and
+- after excluding explicit reprocess from the ordinary replay guard, the full
+  terminal/replay/reprocess fixture passed:
+  `1 passed, 128 deselected in 18.54s`; and
+- the affected immutable-reprocess, bounded-terminal, atomic-terminal, and new
+  explicit-reprocess group passed:
+  `4 passed, 125 deselected in 55.61s`;
+- changed-file Ruff: `All checks passed!`;
+- worktree-source smoke:
+  `{"articles": 1, "embeddings": 1, "validation_ok": true}`;
+- worktree-source `run --help` retained all three explicit roots, positive
+  `--limit`, `--reprocess`, and hosted authorization; and
+- `git diff --check`, the tracked generated-artifact audit, and the focused
+  stale-claim audit produced no findings.
+
+Round-3 self-review:
+
+- The only production behavior change is the coordinator condition guarding
+  exhausted-part repair; no schema, identity, tokenizer, aggregation, or retry
+  semantics changed.
+- Ordinary replay still checks terminal/exhausted parts before parent
+  `start_attempt` and therefore remains zero-call.
+- Explicit reprocess resets every part in one existing catalog transaction.
+  The first checkpoint and failpoint occur only after that transaction commits,
+  so the fixture directly observes the requested durable ordering.
+- Reprocess resets mutable attempt counts and vectors only. Immutable part
+  generations referenced by archived aggregate provenance remain addressable
+  and validation re-resolves them after the new aggregate is published.

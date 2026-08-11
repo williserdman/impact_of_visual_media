@@ -302,7 +302,7 @@ def run_embedding_pipeline(
                     continue
                 if isinstance(prepared_image, _MissingHeaderImage):
                     continue
-                if modality == _ARTICLE_TEXT_MODALITY:
+                if modality == _ARTICLE_TEXT_MODALITY and not reprocess:
                     with catalog.transaction():
                         exhausted = catalog.terminalize_exhausted_long_text_work(
                             run_id=run_id,

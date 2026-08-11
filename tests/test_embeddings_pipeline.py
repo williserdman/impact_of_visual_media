@@ -1007,6 +1007,198 @@ def test_retryable_long_text_part_becomes_terminal_at_profile_attempt_limit(
     assert tuple(adapter.embedded_texts) == calls_before_replay
 
 
+def test_explicit_reprocess_regenerates_terminal_same_input_long_text(tmp_path):
+    """Break caught: terminal replay repair blocks deliberate reprocessing."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    article_input_sha256 = replace_generated_embedding_markdown(
+        config,
+        "AAAA\n\nBBBB\n\nCCCC",
+    )
+    initial_adapter = StablePartVectorAdapter()
+    run_embedding_pipeline(config, initial_adapter, limit=1)
+    configuration_identifier = configuration_id(initial_adapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        first_aggregate_run = db.execute(
+            """
+            SELECT generation_run_id
+            FROM embedding_work_items
+            WHERE configuration_id = ? AND modality = 'article_text'
+            """,
+            [configuration_identifier],
+        ).fetchone()[0]
+        first_provenance = db.execute(
+            """
+            SELECT p.part_index, p.part_generation_run_id,
+                   g.part_input_sha256, g.stored_vector_sha256
+            FROM article_text_aggregation_provenance AS p
+            JOIN long_text_part_generations AS g
+              ON g.article_id = p.article_id
+             AND g.configuration_id = p.configuration_id
+             AND g.article_input_sha256 = p.article_input_sha256
+             AND g.part_index = p.part_index
+             AND g.generation_run_id = p.part_generation_run_id
+            WHERE p.generation_run_id = ?
+            ORDER BY p.part_index
+            """,
+            [first_aggregate_run],
+        ).fetchall()
+
+    class AlwaysRetrySecondPartAdapter(StablePartVectorAdapter):
+        def embed_text(self, text: str) -> tuple[float, ...]:
+            if text.startswith("BBBB"):
+                self.embedded_texts.append(text)
+                raise JinaHostedAdapterError("rate_limit", retryable=True)
+            return super().embed_text(text)
+
+    failing_adapter = AlwaysRetrySecondPartAdapter()
+    with pytest.raises(JinaHostedAdapterError):
+        run_embedding_pipeline(
+            config,
+            failing_adapter,
+            limit=1,
+            reprocess=True,
+        )
+    for _attempt in range(2):
+        with pytest.raises(JinaHostedAdapterError):
+            run_embedding_pipeline(config, failing_adapter, limit=1)
+
+    calls_before_replay = tuple(failing_adapter.embedded_texts)
+    terminal_replay = run_embedding_pipeline(config, failing_adapter, limit=1)
+    assert terminal_replay == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        terminal=1,
+        header_absent=1,
+    )
+    assert tuple(failing_adapter.embedded_texts) == calls_before_replay
+
+    checkpoint_states: list[list[tuple[int, str, int]]] = []
+
+    def observe_first_reprocess_checkpoint(
+        part_index: int,
+        attempt_count: int,
+    ) -> None:
+        if part_index != 0:
+            return
+        assert attempt_count == 1
+        with duckdb.connect(str(config.embedding_catalog)) as db:
+            checkpoint_states.append(
+                db.execute(
+                    """
+                    SELECT part_index, state, attempt_count
+                    FROM long_text_parts
+                    WHERE configuration_id = ? AND article_input_sha256 = ?
+                    ORDER BY part_index
+                    """,
+                    [configuration_identifier, article_input_sha256],
+                ).fetchall()
+            )
+
+    regenerated_adapter = StablePartVectorAdapter()
+    regenerated = run_embedding_pipeline(
+        config,
+        regenerated_adapter,
+        limit=1,
+        reprocess=True,
+        failpoints=EmbeddingPipelineFailpoints(
+            after_long_text_part_attempt_checkpoint=(
+                observe_first_reprocess_checkpoint
+            ),
+        ),
+    )
+
+    assert regenerated == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=1,
+        succeeded=1,
+        header_absent=1,
+    )
+    assert regenerated_adapter.embedded_texts == [
+        "AAAA\n\n",
+        "BBBB\n\n",
+        "CCCC",
+    ]
+    assert checkpoint_states == [
+        [
+            (0, "in_progress", 1),
+            (1, "queued", 0),
+            (2, "queued", 0),
+        ]
+    ]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        parent = db.execute(
+            """
+            SELECT state, attempt_count, generation_run_id
+            FROM embedding_work_items
+            WHERE configuration_id = ? AND modality = 'article_text'
+            """,
+            [configuration_identifier],
+        ).fetchone()
+        assert parent[:2] == ("succeeded", 1)
+        final_aggregate_run = parent[2]
+        assert final_aggregate_run != first_aggregate_run
+        assert db.execute(
+            """
+            SELECT part_index, state, attempt_count, generation_run_id
+            FROM long_text_parts
+            WHERE configuration_id = ? AND article_input_sha256 = ?
+            ORDER BY part_index
+            """,
+            [configuration_identifier, article_input_sha256],
+        ).fetchall() == [
+            (0, "succeeded", 1, final_aggregate_run),
+            (1, "succeeded", 1, final_aggregate_run),
+            (2, "succeeded", 1, final_aggregate_run),
+        ]
+        assert db.execute(
+            """
+            SELECT part_index, part_generation_run_id
+            FROM article_text_aggregation_provenance
+            WHERE generation_run_id = ?
+            ORDER BY part_index
+            """,
+            [final_aggregate_run],
+        ).fetchall() == [
+            (0, final_aggregate_run),
+            (1, final_aggregate_run),
+            (2, final_aggregate_run),
+        ]
+        assert db.execute(
+            """
+            SELECT count(*) FROM long_text_part_generations
+            WHERE generation_run_id = ?
+            """,
+            [final_aggregate_run],
+        ).fetchone() == (3,)
+        assert db.execute(
+            """
+            SELECT count(*) FROM embedding_generation_history
+            WHERE modality = 'article_text' AND generation_run_id = ?
+              AND superseded_reason = 'explicit_reprocess'
+            """,
+            [first_aggregate_run],
+        ).fetchone() == (1,)
+        assert db.execute(
+            """
+            SELECT p.part_index, p.part_generation_run_id,
+                   g.part_input_sha256, g.stored_vector_sha256
+            FROM article_text_aggregation_provenance AS p
+            JOIN long_text_part_generations AS g
+              ON g.article_id = p.article_id
+             AND g.configuration_id = p.configuration_id
+             AND g.article_input_sha256 = p.article_input_sha256
+             AND g.part_index = p.part_index
+             AND g.generation_run_id = p.part_generation_run_id
+            WHERE p.generation_run_id = ?
+            ORDER BY p.part_index
+            """,
+            [first_aggregate_run],
+        ).fetchall() == first_provenance
+    assert validate_embedding_outputs(config).ok
+
+
 def test_terminal_part_transition_survives_crash_before_outer_failure_handling(
     tmp_path,
 ):
