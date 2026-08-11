@@ -1,4 +1,4 @@
-"""Deterministic downstream embeddings for generated preprocessing outputs."""
+"""Deterministic downstream text/image embeddings for preprocessing outputs."""
 
 from wsj_embeddings.adapters import EmbeddingAdapter, FakeEmbeddingAdapter
 from wsj_embeddings.catalog import EmbeddingCatalogError

@@ -24,6 +24,7 @@ class WorkState(StrEnum):
     RETRYABLE = "retryable"
     TERMINAL = "terminal"
     INTERRUPTED = "interrupted"
+    NOT_APPLICABLE = "not_applicable"
 
     @property
     def is_failure(self) -> bool:
@@ -50,6 +51,7 @@ class CanonicalArticle:
     published_at_utc: datetime
     publication_date_new_york: date
     cleaned_markdown_sha256: str
+    header_image_path: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +70,7 @@ class EmbeddingProfile:
     context_rules: str = "complete-input-truncate-false-late-chunking-false-v1"
     long_text_aggregation: str = "single-input-provider-pooling-v1"
     image_input_rules: str = "base64-source-bytes-no-remote-v1"
-    image_transform: str = "not-implemented-v1"
+    image_transform: str = "source-bytes-no-transform-v1"
     multimodal_formula: str = "l2-normalize-0.5-text-0.5-image-v1"
     client_configuration_version: str = "wsj-embeddings-config-v1"
 

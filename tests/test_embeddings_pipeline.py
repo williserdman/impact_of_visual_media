@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import struct
 from collections import Counter
@@ -76,7 +77,8 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("article_id", "VARCHAR", True, None, True),
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
-        ("input_sha256", "VARCHAR", True, None, False),
+        ("source_relative_path", "VARCHAR", False, None, False),
+        ("input_sha256", "VARCHAR", False, None, False),
         ("state", "VARCHAR", True, None, False),
         ("attempt_count", "INTEGER", True, None, False),
         ("error_code", "VARCHAR", False, None, False),
@@ -89,6 +91,7 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("article_id", "VARCHAR", True, None, True),
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
+        ("source_relative_path", "VARCHAR", False, None, False),
         ("published_at_utc", "TIMESTAMP WITH TIME ZONE", True, None, False),
         ("publication_date_new_york", "DATE", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
@@ -101,6 +104,7 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
         ("generation_run_id", "VARCHAR", True, None, True),
+        ("source_relative_path", "VARCHAR", False, None, False),
         ("input_sha256", "VARCHAR", True, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("superseded_run_id", "VARCHAR", True, None, False),
@@ -224,6 +228,29 @@ def replace_generated_embedding_markdown(
     return input_sha256
 
 
+def attach_generated_header_image(
+    config: EmbeddingPipelineConfig,
+    image_bytes: bytes,
+    *,
+    relative_path: str = "synthetic/article_main_image.png",
+) -> str:
+    """Attach one generated local image and one forbidden remote reference."""
+
+    image_path = config.source_root / relative_path
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    image_path.write_bytes(image_bytes)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            """
+            UPDATE articles
+            SET header_image_path = ?, inline_image_urls = ?
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+            """,
+            [relative_path, ["https://example.invalid/never-fetch.png"]],
+        )
+    return relative_path
+
+
 def seed_generated_modality_success(
     config: EmbeddingPipelineConfig,
     *,
@@ -241,6 +268,9 @@ def seed_generated_modality_success(
     input_sha256 = hashlib.sha256(
         f"{article_id}:{modality}:{configuration_identifier}".encode()
     ).hexdigest()
+    source_relative_path = (
+        "synthetic/seed-header.png" if modality == "header_image" else None
+    )
     with duckdb.connect(str(config.embedding_catalog)) as db:
         generation_run_id = db.execute(
             """
@@ -263,12 +293,25 @@ def seed_generated_modality_success(
         db.execute(
             """
             INSERT INTO embedding_work_items
-            VALUES (?, ?, ?, ?, 'succeeded', 1, NULL, NULL, NULL, ?, current_timestamp)
+            VALUES (?, ?, ?, ?, ?, 'succeeded', 1, NULL, NULL, NULL, ?,
+                    current_timestamp)
+            ON CONFLICT (article_id, modality, configuration_id)
+            DO UPDATE SET
+                source_relative_path = excluded.source_relative_path,
+                input_sha256 = excluded.input_sha256,
+                state = excluded.state,
+                attempt_count = excluded.attempt_count,
+                error_code = NULL,
+                status_code = NULL,
+                retry_after_seconds = NULL,
+                last_run_id = excluded.last_run_id,
+                updated_at = now()
             """,
             [
                 article_id,
                 modality,
                 configuration_identifier,
+                source_relative_path,
                 input_sha256,
                 generation_run_id,
             ],
@@ -276,12 +319,13 @@ def seed_generated_modality_success(
         db.execute(
             """
             INSERT INTO embeddings
-            VALUES (?, ?, ?, ?, ?, 2048, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 2048, ?, ?, ?)
             """,
             [
                 article_id,
                 modality,
                 configuration_identifier,
+                source_relative_path,
                 published_at_utc,
                 publication_date_new_york,
                 input_sha256,
@@ -321,6 +365,18 @@ class RecordingAdapter(FakeEmbeddingAdapter):
         return vector
 
 
+class RecordingMultimodalAdapter(RecordingAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.image_calls = 0
+        self.encoded_images: list[str] = []
+
+    def embed_image(self, image_base64: str) -> tuple[float, ...]:
+        self.image_calls += 1
+        self.encoded_images.append(image_base64)
+        return super().embed_image(image_base64)
+
+
 class PriorConfigurationAdapter(FakeEmbeddingAdapter):
     profile = EmbeddingProfile(
         model="synthetic-prior-model",
@@ -337,6 +393,14 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
     assert (
         JinaEmbeddingAdapter.profile.long_text_aggregation
         == "single-input-provider-pooling-v1"
+    )
+    assert (
+        FakeEmbeddingAdapter.profile.image_transform
+        == "source-bytes-no-transform-v1"
+    )
+    assert (
+        JinaEmbeddingAdapter.profile.image_transform
+        == "source-bytes-no-transform-v1"
     )
     alternatives = {
         "model": "changed-model-alias",
@@ -444,7 +508,7 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
             FROM embeddings
             """
         ).fetchone()
-        vector_type = db.execute("PRAGMA table_info('embeddings')").fetchall()[8][2]
+        vector_type = db.execute("PRAGMA table_info('embeddings')").fetchall()[9][2]
     assert row[:5] == (
         "wsj:SYNTHETIC-EMBEDDING",
         "article_text",
@@ -455,6 +519,179 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
     assert vector_type == "FLOAT[2048]"
     assert row[7] == (1.0,) + (0.0,) * 2047
     assert snapshot_fixture_inputs(config) == before
+
+
+def test_pipeline_publishes_text_and_exact_local_header_image_independently(tmp_path):
+    """Break caught: local image bytes/path are omitted or remote URLs are queued."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    image_bytes = b"\x89PNG\r\n\x1a\nsynthetic-header-image"
+    relative_path = attach_generated_header_image(config, image_bytes)
+    adapter = RecordingMultimodalAdapter()
+
+    result = run_embedding_pipeline(config, adapter, limit=1)
+
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=2,
+        attempted=2,
+        succeeded=2,
+    )
+    assert adapter.calls == 1
+    assert adapter.image_calls == 1
+    assert adapter.encoded_images == [base64.b64encode(image_bytes).decode("ascii")]
+    configuration_identifier = configuration_id(adapter.profile)
+    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        rows = db.execute(
+            """
+            SELECT article_id, modality, configuration_id, source_relative_path,
+                   input_sha256, stored_vector_sha256, vector
+            FROM embeddings
+            ORDER BY modality
+            """
+        ).fetchall()
+        work = db.execute(
+            """
+            SELECT modality, source_relative_path, input_sha256, state,
+                   attempt_count
+            FROM embedding_work_items
+            ORDER BY modality
+            """
+        ).fetchall()
+    assert rows[0][:4] == (
+        "wsj:SYNTHETIC-EMBEDDING",
+        "article_text",
+        configuration_identifier,
+        None,
+    )
+    assert rows[1][:5] == (
+        "wsj:SYNTHETIC-EMBEDDING",
+        "header_image",
+        configuration_identifier,
+        relative_path,
+        image_sha256,
+    )
+    assert len(rows[1][5]) == 64
+    assert rows[1][6] == (0.0, 1.0) + (0.0,) * 2046
+    assert work == [
+        ("article_text", None, hashlib.sha256(b"#\n").hexdigest(), "succeeded", 1),
+        ("header_image", relative_path, image_sha256, "succeeded", 1),
+    ]
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(issues=())
+
+
+def test_absent_then_added_header_image_does_not_regenerate_successful_text(tmp_path):
+    """Break caught: absent image is implicit or later image work repurchases text."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    first_adapter = RecordingMultimodalAdapter()
+
+    first = run_embedding_pipeline(config, first_adapter, limit=1)
+
+    assert first == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=1,
+        succeeded=1,
+    )
+    assert first_adapter.calls == 1
+    assert first_adapter.image_calls == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, source_relative_path, input_sha256, state,
+                   attempt_count
+            FROM embedding_work_items
+            ORDER BY modality
+            """
+        ).fetchall() == [
+            (
+                "article_text",
+                None,
+                hashlib.sha256(b"#\n").hexdigest(),
+                "succeeded",
+                1,
+            ),
+            ("header_image", None, None, "not_applicable", 0),
+        ]
+
+    image_bytes = b"generated-later-image"
+    relative_path = attach_generated_header_image(config, image_bytes)
+    second_adapter = RecordingMultimodalAdapter()
+
+    second = run_embedding_pipeline(config, second_adapter, limit=1)
+
+    assert second == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        reused=1,
+        attempted=1,
+        succeeded=1,
+    )
+    assert second_adapter.calls == 0
+    assert second_adapter.image_calls == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT source_relative_path, input_sha256, state, attempt_count
+            FROM embedding_work_items
+            WHERE modality = 'header_image'
+            """
+        ).fetchone() == (
+            relative_path,
+            hashlib.sha256(image_bytes).hexdigest(),
+            "succeeded",
+            1,
+        )
+
+
+@pytest.mark.parametrize("unsafe_path", ("../outside.png", "/absolute.png"))
+def test_pipeline_rejects_uncontained_header_image_paths(tmp_path, unsafe_path):
+    """Break caught: a catalogued image path escapes the immutable archive root."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            """
+            UPDATE articles SET header_image_path = ?
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+            """,
+            [unsafe_path],
+        )
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
+
+    assert raised.value.code == "unsafe_header_image_path"
+    assert not config.embedding_output_root.exists()
+
+
+def test_pipeline_refuses_symlinked_header_image_without_reading_referent(tmp_path):
+    """Break caught: a catalogued local image follows a symlink outside its root."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    outside_image = tmp_path / "outside-secret.png"
+    outside_image.write_bytes(b"outside generated bytes")
+    relative_path = "synthetic/link.png"
+    image_path = config.source_root / relative_path
+    image_path.parent.mkdir(parents=True)
+    image_path.symlink_to(outside_image)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            """
+            UPDATE articles SET header_image_path = ?
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+            """,
+            [relative_path],
+        )
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
+
+    assert raised.value.code == "unsafe_header_image_path"
+    assert "outside generated bytes" not in str(raised.value)
+    assert not config.embedding_output_root.exists()
 
 
 def test_replaying_unchanged_success_reuses_checkpoint_without_adapter_call(tmp_path):
@@ -610,12 +847,8 @@ def test_text_supersession_invalidates_only_its_multimodal_dependent(
     run_embedding_pipeline(config, PriorConfigurationAdapter(), limit=2)
     current_profile = FakeEmbeddingAdapter.profile
     prior_profile = PriorConfigurationAdapter.profile
-    seed_generated_modality_success(
-        config,
-        article_id=target_id,
-        modality="header_image",
-        profile=current_profile,
-    )
+    attach_generated_header_image(config, b"generated independent header")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
     seed_generated_modality_success(
         config,
         article_id=target_id,
@@ -745,9 +978,10 @@ def test_explicit_reprocess_is_bounded_and_audits_replaced_success(tmp_path):
         ]
         assert db.execute(
             """
-            SELECT article_id, attempt_count
-            FROM embedding_work_items
-            ORDER BY article_id
+                SELECT article_id, attempt_count
+                FROM embedding_work_items
+                WHERE modality = 'article_text'
+                ORDER BY article_id
             """
         ).fetchall() == [
             ("wsj:SYNTHETIC-EMBEDDING", 1),
@@ -914,10 +1148,11 @@ def test_retryable_failure_can_succeed_after_an_earlier_checkpoint(tmp_path):
         ).fetchall() == [("wsj:SYNTHETIC-EMBEDDING",)]
         assert db.execute(
             """
-            SELECT article_id, state, attempt_count, error_code, status_code,
-                   retry_after_seconds
-            FROM embedding_work_items
-            ORDER BY article_id
+                SELECT article_id, state, attempt_count, error_code, status_code,
+                       retry_after_seconds
+                FROM embedding_work_items
+                WHERE modality = 'article_text'
+                ORDER BY article_id
             """
         ).fetchall() == [
             (
@@ -1145,8 +1380,15 @@ def test_registration_checkpoint_survives_later_registration_interruption(
 
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
-            "SELECT article_id, state FROM embedding_work_items"
-        ).fetchall() == [("wsj:SYNTHETIC-EMBEDDING", "queued")]
+            """
+            SELECT article_id, modality, state
+            FROM embedding_work_items
+            ORDER BY article_id, modality
+            """
+        ).fetchall() == [
+            ("wsj:SYNTHETIC-EMBEDDING", "article_text", "queued"),
+            ("wsj:SYNTHETIC-EMBEDDING", "header_image", "not_applicable"),
+        ]
         assert db.execute("SELECT articles FROM runs").fetchall() == [(2,)]
 
     resumed = run_embedding_pipeline(config, RecordingAdapter(), limit=2)
@@ -1203,7 +1445,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_three_generation_schema(tmp_path):
+def test_embedding_catalog_has_exact_version_four_image_generation_schema(tmp_path):
     database_path = tmp_path / "catalog.duckdb"
 
     with EmbeddingCatalog.open(database_path):
@@ -1280,7 +1522,7 @@ def test_embedding_catalog_has_exact_version_three_generation_schema(tmp_path):
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "3")]
+    assert metadata == [("schema_version", "4")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -1326,6 +1568,29 @@ def test_pipeline_refuses_version_two_embedding_catalog_without_migration(tmp_pa
         assert db.execute("SHOW TABLES").fetchall() == [("metadata",)]
         assert db.execute("SELECT * FROM metadata").fetchall() == [
             ("schema_version", "2")
+        ]
+
+
+def test_pipeline_refuses_version_three_embedding_catalog_without_migration(tmp_path):
+    """Break caught: image provenance columns are silently added in place."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "CREATE TABLE metadata (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL)"
+        )
+        db.execute("INSERT INTO metadata VALUES ('schema_version', '3')")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SHOW TABLES").fetchall() == [("metadata",)]
+        assert db.execute("SELECT * FROM metadata").fetchall() == [
+            ("schema_version", "3")
         ]
 
 

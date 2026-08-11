@@ -12,7 +12,7 @@ embed, summarize, classify, download remote images, fetch market data,
 construct graphs, label events, or run trading research. Those jobs belong
 downstream.
 
-The repository also contains a downstream article-text embedding slice.
+The repository also contains a downstream text/header-image embedding slice.
 `wsj-embeddings smoke` creates one generated canonical article in a temporary
 directory, encodes it with a deterministic fake adapter, publishes a
 2,048-dimensional normalized `article_text` vector to a separate six-table
@@ -22,7 +22,8 @@ separate, explicit hosted Jina v4 measurement command: it sends only fixed
 internally generated text and PNG bytes, never reads the archive or creates
 catalog/output state. `wsj-embeddings inventory` reads only canonical catalog
 metadata, while `wsj-embeddings run` exposes an explicitly authorized,
-strictly limited production Jina article-text scope.
+strictly limited production Jina scope for canonical article text and optional
+local header images. Remote editorial-image URLs remain references only.
 
 For the data model and maintenance guide, read the
 [architecture crash course](docs/architecture-crash-course.md).
@@ -156,14 +157,16 @@ limit and the separate `--authorize-hosted-processing` assertion. A configured
   --authorize-hosted-processing
 ```
 
-Add `--reprocess` only when the selected positive limit must be regenerated
-despite matching content and configuration. Reprocess never expands beyond
-that lexical limit.
+Add `--reprocess` only when article text in the selected positive limit must be
+regenerated despite matching content and configuration. Independent unchanged
+header-image successes remain reusable. Reprocess never expands beyond that
+lexical limit.
 
-The run sends each selected canonical Markdown artifact in full with hosted
-truncation disabled. Run/configuration setup and each selected item's
+The run sends each selected canonical Markdown artifact in full and each
+eligible local header image as base64 of its exact source bytes, with hosted
+truncation disabled. It never uses remote inline-image URLs. Run/configuration setup and each selected item's
 queue/recovery registration use separate bounded transactions. Each validated
-vector and its successful work checkpoint commit before the next article is
+vector and its successful work checkpoint commit before the next modality is
 attempted. Replaying the same limit reuses unchanged successes without another
 hosted request; when input changes, the mismatched vector is removed atomically
 with checkpoint invalidation before replacement is attempted. Any existing
@@ -265,13 +268,13 @@ Resolve `cleaned_markdown_path` against the output root and
 `header_image_path` against the source root. Remote `inline_image_urls` are
 references only; the pipeline never downloads them.
 
-## Article text embedding catalog contract
+## Text and header-image embedding catalog contract
 
-The downstream catalog is a separate schema-version-3 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-4 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted, limit-only production CLI.
-Versions 1 and 2 are refused without migration; move reproducible derived
+Versions 1 through 3 are refused without migration; move reproducible derived
 output aside or choose a fresh embedding output root.
 
 The catalog has exactly six base tables and no indexes:
@@ -281,23 +284,25 @@ The catalog has exactly six base tables and no indexes:
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
 | `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
-| `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
-| `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
-| `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
+| `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
+| `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
+| `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 
-Only the three failure-detail columns are nullable; they retain classified
-codes and numeric response/retry metadata, never exception text or editorial
-content. Work states are `queued`, `in_progress`, `succeeded`, `retryable`,
-`terminal`, and `interrupted`. `configuration_id` is the SHA-256 of compact,
+The source path is nullable for article text and absent images; the input hash
+is nullable only for `not_applicable` image work. The three failure-detail
+columns retain classified codes and numeric response/retry metadata, never
+exception text or editorial content. Work states are `queued`, `in_progress`,
+`succeeded`, `retryable`, `terminal`, `interrupted`, and `not_applicable`.
+`configuration_id` is the SHA-256 of compact,
 key-sorted JSON covering model alias, observed hosted model/API metadata, task,
 dimensions, output type, normalization, tokenizer/context rules, long-text
 aggregation, image input/transform rules, multimodal formula, and client
 configuration version. The current long-text rule is
 `single-input-provider-pooling-v1`: the complete input receives one
-provider-pooled vector. `input_sha256` hashes the exact
-canonical Markdown bytes. `stored_vector_sha256` hashes the normalized vector
-encoded as little-endian float32 values. The current modality is exactly
-`article_text`; vectors must be finite, nonzero, L2-normalized, and exactly
+provider-pooled vector. `input_sha256` hashes the exact canonical Markdown or
+local header-image bytes. `stored_vector_sha256` hashes the normalized vector
+encoded as little-endian float32 values. Current modalities are `article_text`
+and `header_image`; vectors must be finite, nonzero, L2-normalized, and exactly
 2,048-dimensional. Superseded history stores only identities, hashes, run IDs,
 reason, and time; it never stores Markdown, image bytes, or historical vectors.
 
@@ -306,6 +311,7 @@ A retained catalog can be queried without joining back to article bodies:
 ```sql
 SELECT
     e.article_id,
+    e.source_relative_path,
     e.published_at_utc,
     e.publication_date_new_york,
     c.model,
@@ -313,7 +319,7 @@ SELECT
     e.vector
 FROM embeddings AS e
 JOIN embedding_configurations AS c USING (configuration_id)
-WHERE e.modality = 'article_text'
+WHERE e.modality IN ('article_text', 'header_image')
   AND e.configuration_id = '<configuration_id>'
   AND e.publication_date_new_york
       BETWEEN DATE '2024-01-01' AND DATE '2024-01-31'
@@ -322,8 +328,9 @@ ORDER BY e.published_at_utc, e.article_id;
 
 Embedding validation opens both catalogs read-only, checks exact schemas before
 data, links each vector to a canonical `articles` row, rehashes canonical
-Markdown through no-follow descriptors, checks publication metadata and both
-hashes, and verifies that successful run counts still have published vectors.
+Markdown and local header images through no-follow descriptors, checks
+publication metadata and both hashes, and verifies that successful run counts
+still have published vectors.
 It emits stable issues without article text or vector values. When more than
 one configuration exists, callers must select an explicit `configuration_id`;
 validation never silently mixes generations.
@@ -385,7 +392,9 @@ embedding catalog is inspected through a read-only DuckDB connection before a
 writable connection is opened, and a replacement between those phases is
 refused. Canonical Markdown is reopened below the preprocessing output root
 through no-follow directory descriptors; symlinked, non-regular, multiply
-linked, or replaced leaves are rejected. Embedding mutation is confined below
+linked, or replaced leaves are rejected. Local header images use the same
+containment and no-follow rules below the immutable source root and are sent to
+Jina only as base64 of those exact bytes. Embedding mutation is confined below
 its disjoint output root. The coordinator opens every output-root component
 without following links, then creates its catalog and exclusive `pipeline.lock`
 relative to that anchored directory. Lock cleanup compares file identity and

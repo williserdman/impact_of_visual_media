@@ -1,7 +1,8 @@
-"""Read-only preprocessing consumption and article-text embedding publication."""
+"""Read-only preprocessing consumption and text/image embedding publication."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import math
 import os
@@ -9,6 +10,7 @@ import stat
 import struct
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
@@ -28,10 +30,19 @@ from wsj_embeddings.models import (
     EmbeddingRunResult,
     WorkState,
 )
+from wsj_embeddings.source_image import SourceImageError, read_source_image
 from wsj_pipeline.catalog import Catalog, CatalogError
 
 _ARTICLE_TEXT_MODALITY = EmbeddingModality.ARTICLE_TEXT.value
+_HEADER_IMAGE_MODALITY = EmbeddingModality.HEADER_IMAGE.value
 _VECTOR_DIMENSIONS = 2048
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedHeaderImage:
+    source_relative_path: str
+    input_sha256: str
+    data: bytes
 
 
 class EmbeddingPipelineError(RuntimeError):
@@ -165,7 +176,7 @@ def run_embedding_pipeline(
     limit: int,
     reprocess: bool = False,
 ) -> EmbeddingRunResult:
-    """Publish normalized article-text vectors for a bounded canonical slice."""
+    """Publish independent text/header vectors for a bounded canonical slice."""
 
     if not config.hosted_processing_authorized:
         raise HostedProcessingAuthorizationError
@@ -178,6 +189,10 @@ def run_embedding_pipeline(
     if profile.dimensions != _VECTOR_DIMENSIONS:
         raise ValueError("adapter profile dimensions must be 2048")
     articles = _read_articles(config, limit)
+    prepared_images = {
+        article.article_id: _prepare_header_image(config, article)
+        for article in articles
+    }
     configuration_identifier = configuration_id(profile)
     run_id = str(uuid4())
     with (
@@ -188,68 +203,94 @@ def run_embedding_pipeline(
             catalog.begin_run(
                 run_id, configuration_identifier, profile, len(articles)
             )
-        registered_states: dict[str, WorkState] = {}
+        registered_states: dict[tuple[str, str], WorkState] = {}
         for article in articles:
             with catalog.transaction():
-                registered_states[article.article_id] = _register_work(
-                    catalog,
-                    run_id,
-                    configuration_identifier,
-                    article,
-                    reprocess=reprocess,
+                registered_states[(article.article_id, _ARTICLE_TEXT_MODALITY)] = (
+                    _register_work(
+                        catalog,
+                        run_id,
+                        configuration_identifier,
+                        article,
+                        reprocess=reprocess,
+                    )
+                )
+            with catalog.transaction():
+                registered_states[(article.article_id, _HEADER_IMAGE_MODALITY)] = (
+                    _register_header_work(
+                        catalog,
+                        run_id,
+                        configuration_identifier,
+                        article,
+                        prepared_images[article.article_id],
+                    )
                 )
         for article in articles:
-            state = registered_states[article.article_id]
-            if state.is_reusable_success:
+            for modality, prepared_image in (
+                (_ARTICLE_TEXT_MODALITY, None),
+                (_HEADER_IMAGE_MODALITY, prepared_images[article.article_id]),
+            ):
+                state = registered_states[(article.article_id, modality)]
+                if state is WorkState.NOT_APPLICABLE:
+                    continue
+                if state.is_reusable_success:
+                    with catalog.transaction():
+                        catalog.increment_run(run_id, "reused")
+                    continue
+                if state is WorkState.TERMINAL:
+                    with catalog.transaction():
+                        catalog.increment_run(run_id, "terminal")
+                    continue
                 with catalog.transaction():
-                    catalog.increment_run(run_id, "reused")
-                continue
-            if state is WorkState.TERMINAL:
-                with catalog.transaction():
-                    catalog.increment_run(run_id, "terminal")
-                continue
-            with catalog.transaction():
-                catalog.start_attempt(
-                    run_id=run_id,
-                    article_id=article.article_id,
-                    modality=_ARTICLE_TEXT_MODALITY,
-                    configuration_identifier=configuration_identifier,
-                )
-            try:
-                input_sha256, vector_hash, vector = _prepare_embedding(
-                    config,
-                    adapter,
-                    article,
-                )
-            except JinaHostedAdapterError as error:
-                failure_state = (
-                    WorkState.RETRYABLE if error.retryable else WorkState.TERMINAL
-                )
-                with catalog.transaction():
-                    catalog.record_failure(
+                    catalog.start_attempt(
                         run_id=run_id,
                         article_id=article.article_id,
-                        modality=_ARTICLE_TEXT_MODALITY,
+                        modality=modality,
                         configuration_identifier=configuration_identifier,
-                        state=failure_state,
-                        error_code=error.code,
-                        status_code=error.status_code,
-                        retry_after_seconds=error.retry_after_seconds,
                     )
-                raise
-            with catalog.transaction():
-                catalog.publish_success(
-                    run_id=run_id,
-                    article_id=article.article_id,
-                    modality=_ARTICLE_TEXT_MODALITY,
-                    configuration_identifier=configuration_identifier,
-                    published_at_utc=article.published_at_utc,
-                    publication_date_new_york=article.publication_date_new_york,
-                    dimensions=profile.dimensions,
-                    input_sha256=input_sha256,
-                    stored_vector_sha256=vector_hash,
-                    vector=vector,
+                try:
+                    input_sha256, vector_hash, vector = _prepare_embedding(
+                        config,
+                        adapter,
+                        article,
+                        modality=modality,
+                        prepared_image=prepared_image,
+                    )
+                except JinaHostedAdapterError as error:
+                    failure_state = (
+                        WorkState.RETRYABLE if error.retryable else WorkState.TERMINAL
+                    )
+                    with catalog.transaction():
+                        catalog.record_failure(
+                            run_id=run_id,
+                            article_id=article.article_id,
+                            modality=modality,
+                            configuration_identifier=configuration_identifier,
+                            state=failure_state,
+                            error_code=error.code,
+                            status_code=error.status_code,
+                            retry_after_seconds=error.retry_after_seconds,
+                        )
+                    raise
+                source_relative_path = (
+                    prepared_image.source_relative_path
+                    if prepared_image is not None
+                    else None
                 )
+                with catalog.transaction():
+                    catalog.publish_success(
+                        run_id=run_id,
+                        article_id=article.article_id,
+                        modality=modality,
+                        configuration_identifier=configuration_identifier,
+                        source_relative_path=source_relative_path,
+                        published_at_utc=article.published_at_utc,
+                        publication_date_new_york=article.publication_date_new_york,
+                        dimensions=profile.dimensions,
+                        input_sha256=input_sha256,
+                        stored_vector_sha256=vector_hash,
+                        vector=vector,
+                    )
         result = catalog.run_result(run_id)
     return result
 
@@ -268,10 +309,43 @@ def _register_work(
             article_id=article.article_id,
             modality=_ARTICLE_TEXT_MODALITY,
             configuration_identifier=configuration_identifier,
+            source_relative_path=None,
             input_sha256=article.cleaned_markdown_sha256,
             published_at_utc=article.published_at_utc,
             publication_date_new_york=article.publication_date_new_york,
             reprocess=reprocess,
+        )
+    except ValueError as error:
+        raise EmbeddingPipelineError(
+            "invalid_work_state", article.article_id
+        ) from error
+
+
+def _register_header_work(
+    catalog: EmbeddingCatalog,
+    run_id: str,
+    configuration_identifier: str,
+    article: CanonicalArticle,
+    prepared_image: _PreparedHeaderImage | None,
+) -> WorkState:
+    try:
+        if prepared_image is None:
+            return catalog.register_not_applicable(
+                run_id=run_id,
+                article_id=article.article_id,
+                modality=_HEADER_IMAGE_MODALITY,
+                configuration_identifier=configuration_identifier,
+            )
+        return catalog.register_work(
+            run_id=run_id,
+            article_id=article.article_id,
+            modality=_HEADER_IMAGE_MODALITY,
+            configuration_identifier=configuration_identifier,
+            source_relative_path=prepared_image.source_relative_path,
+            input_sha256=prepared_image.input_sha256,
+            published_at_utc=article.published_at_utc,
+            publication_date_new_york=article.publication_date_new_york,
+            reprocess=False,
         )
     except ValueError as error:
         raise EmbeddingPipelineError(
@@ -313,7 +387,8 @@ def _read_articles(
             rows = db.execute(
                 """
                 SELECT article_id, cleaned_markdown_path, published_at_utc,
-                       publication_date_new_york, cleaned_markdown_sha256
+                       publication_date_new_york, cleaned_markdown_sha256,
+                       header_image_path
                 FROM articles
                 ORDER BY article_id
                 LIMIT ?
@@ -329,7 +404,22 @@ def _prepare_embedding(
     config: EmbeddingPipelineConfig,
     adapter: EmbeddingAdapter,
     article: CanonicalArticle,
+    *,
+    modality: str,
+    prepared_image: _PreparedHeaderImage | None,
 ) -> tuple[str, str, tuple[float, ...]]:
+    if modality == _HEADER_IMAGE_MODALITY:
+        assert prepared_image is not None
+        embedded = adapter.embed_image(
+            base64.b64encode(prepared_image.data).decode("ascii")
+        )
+        vector = _normalized_vector(embedded, article.article_id)
+        return (
+            prepared_image.input_sha256,
+            _vector_hash(vector),
+            vector,
+        )
+    assert modality == _ARTICLE_TEXT_MODALITY
     try:
         markdown_bytes = read_canonical_markdown(
             config.preprocessing_output_root,
@@ -349,12 +439,38 @@ def _prepare_embedding(
         )
     embedded = adapter.embed_text(markdown)
     vector = _normalized_vector(embedded, article.article_id)
-    packed = b"".join(struct.pack("<f", value) for value in vector)
     return (
         input_sha256,
-        hashlib.sha256(packed).hexdigest(),
+        _vector_hash(vector),
         vector,
     )
+
+
+def _prepare_header_image(
+    config: EmbeddingPipelineConfig,
+    article: CanonicalArticle,
+) -> _PreparedHeaderImage | None:
+    if article.header_image_path is None:
+        return None
+    try:
+        image_bytes = read_source_image(config.source_root, article.header_image_path)
+    except SourceImageError as error:
+        code = (
+            "missing_header_image"
+            if error.status == "missing"
+            else "unsafe_header_image_path"
+        )
+        raise EmbeddingPipelineError(code, article.article_id) from error
+    return _PreparedHeaderImage(
+        source_relative_path=article.header_image_path,
+        input_sha256=hashlib.sha256(image_bytes).hexdigest(),
+        data=image_bytes,
+    )
+
+
+def _vector_hash(vector: tuple[float, ...]) -> str:
+    packed = b"".join(struct.pack("<f", value) for value in vector)
+    return hashlib.sha256(packed).hexdigest()
 
 
 def _normalized_vector(

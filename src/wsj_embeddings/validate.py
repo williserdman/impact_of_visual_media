@@ -1,4 +1,4 @@
-"""Credential-free integrity validation for published article text embeddings."""
+"""Credential-free integrity validation for published text/image embeddings."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from wsj_embeddings.models import (
     WorkState,
 )
 from wsj_embeddings.pipeline import _VECTOR_DIMENSIONS
+from wsj_embeddings.source_image import SourceImageError, read_source_image
 from wsj_pipeline.catalog import Catalog, CatalogError
 
 
@@ -111,7 +112,8 @@ def _canonical_articles(
             rows = db.execute(
                 """
                 SELECT article_id, cleaned_markdown_path, published_at_utc,
-                       publication_date_new_york, cleaned_markdown_sha256
+                       publication_date_new_york, cleaned_markdown_sha256,
+                       header_image_path
                 FROM articles
                 """
             ).fetchall()
@@ -255,7 +257,8 @@ def _validate_work_items(
     embeddings = set(
         connection.execute(
             """
-            SELECT article_id, modality, configuration_id, input_sha256
+            SELECT article_id, modality, configuration_id,
+                   source_relative_path, input_sha256
             FROM embeddings
             WHERE configuration_id = ?
             """,
@@ -264,8 +267,9 @@ def _validate_work_items(
     )
     rows = connection.execute(
         """
-        SELECT article_id, modality, configuration_id, input_sha256, state,
-               attempt_count, error_code, status_code, retry_after_seconds
+        SELECT article_id, modality, configuration_id, source_relative_path,
+               input_sha256, state, attempt_count, error_code, status_code,
+               retry_after_seconds
         FROM embedding_work_items
         WHERE configuration_id = ?
         """,
@@ -276,6 +280,7 @@ def _validate_work_items(
             article_id,
             modality,
             configuration_identifier,
+            source_relative_path,
             input_sha256,
             state,
             attempt_count,
@@ -296,6 +301,7 @@ def _validate_work_items(
             article_id,
             modality,
             configuration_identifier,
+            source_relative_path,
             input_sha256,
         ) in embeddings
         if work_state.is_reusable_success and not has_matching_embedding:
@@ -309,6 +315,17 @@ def _validate_work_items(
                 issues,
                 "embedding_without_success_checkpoint",
                 "embedding rows lack a matching successful work checkpoint",
+            )
+        if work_state is WorkState.NOT_APPLICABLE and (
+            modality != EmbeddingModality.HEADER_IMAGE.value
+            or source_relative_path is not None
+            or input_sha256 is not None
+            or attempt_count != 0
+        ):
+            _append(
+                issues,
+                "invalid_not_applicable_checkpoint",
+                "not-applicable image work retains input or attempt metadata",
             )
         failure_metadata_present = any(
             value is not None
@@ -339,8 +356,8 @@ def _validate_embeddings(
     rows = connection.execute(
         """
         SELECT article_id, modality, configuration_id, published_at_utc,
-               publication_date_new_york, dimensions, input_sha256,
-               stored_vector_sha256, vector
+               source_relative_path, publication_date_new_york, dimensions,
+               input_sha256, stored_vector_sha256, vector
         FROM embeddings
         WHERE configuration_id = ?
         ORDER BY article_id, modality, configuration_id
@@ -359,6 +376,7 @@ def _validate_embeddings(
             modality,
             configuration_identifier,
             published_at_utc,
+            source_relative_path,
             publication_date,
             dimensions,
             input_sha256,
@@ -372,7 +390,10 @@ def _validate_embeddings(
                 "missing_configuration_reference",
                 "embedding rows lack a configuration reference",
             )
-        if modality != EmbeddingModality.ARTICLE_TEXT.value:
+        if modality not in {
+            EmbeddingModality.ARTICLE_TEXT.value,
+            EmbeddingModality.HEADER_IMAGE.value,
+        }:
             _append(
                 issues,
                 "invalid_modality",
@@ -401,7 +422,22 @@ def _validate_embeddings(
                 "publication_metadata_mismatch",
                 "embedding publication metadata differs from the canonical article",
             )
-        _validate_markdown_hash(config, article, input_sha256, issues)
+        if modality == EmbeddingModality.ARTICLE_TEXT.value:
+            if source_relative_path is not None:
+                _append(
+                    issues,
+                    "invalid_source_relative_path",
+                    "article text embeddings retain an unexpected source path",
+                )
+            _validate_markdown_hash(config, article, input_sha256, issues)
+        elif modality == EmbeddingModality.HEADER_IMAGE.value:
+            _validate_header_image_hash(
+                config,
+                article,
+                source_relative_path,
+                input_sha256,
+                issues,
+            )
 
 
 def _validate_generation_history(
@@ -491,6 +527,50 @@ def _validate_markdown_hash(
             issues,
             "input_hash_mismatch",
             "embedding input hash differs from canonical Markdown",
+        )
+
+
+def _validate_header_image_hash(
+    config: EmbeddingPipelineConfig,
+    article: CanonicalArticle,
+    source_relative_path: str | None,
+    input_sha256: str,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    if (
+        source_relative_path is None
+        or source_relative_path != article.header_image_path
+    ):
+        _append(
+            issues,
+            "header_image_path_mismatch",
+            "embedding header image path differs from the canonical article",
+        )
+        return
+    try:
+        image_bytes = read_source_image(config.source_root, source_relative_path)
+    except SourceImageError as error:
+        code = (
+            "missing_header_image"
+            if error.status == "missing"
+            else "unsafe_header_image_path"
+        )
+        message = (
+            "canonical header image is unavailable"
+            if error.status == "missing"
+            else "canonical header image path is unsafe"
+        )
+        _append(
+            issues,
+            code,
+            message,
+        )
+        return
+    if hashlib.sha256(image_bytes).hexdigest() != input_sha256:
+        _append(
+            issues,
+            "input_hash_mismatch",
+            "embedding input hash differs from the canonical header image",
         )
 
 

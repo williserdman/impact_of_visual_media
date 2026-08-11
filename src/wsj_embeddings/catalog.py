@@ -1,4 +1,4 @@
-"""Minimal versioned DuckDB catalog for article-text embeddings."""
+"""Minimal versioned DuckDB catalog for text and local-image embeddings."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from wsj_embeddings.models import (
     WorkState,
 )
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "3"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "4"
 
 _EMBEDDING_CATALOG_TABLES = {
     "embedding_configurations",
@@ -73,7 +73,8 @@ _TABLE_COLUMNS = {
         ("article_id", "VARCHAR", True, None, True),
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
-        ("input_sha256", "VARCHAR", True, None, False),
+        ("source_relative_path", "VARCHAR", False, None, False),
+        ("input_sha256", "VARCHAR", False, None, False),
         ("state", "VARCHAR", True, None, False),
         ("attempt_count", "INTEGER", True, None, False),
         ("error_code", "VARCHAR", False, None, False),
@@ -86,6 +87,7 @@ _TABLE_COLUMNS = {
         ("article_id", "VARCHAR", True, None, True),
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
+        ("source_relative_path", "VARCHAR", False, None, False),
         ("published_at_utc", "TIMESTAMP WITH TIME ZONE", True, None, False),
         ("publication_date_new_york", "DATE", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
@@ -98,6 +100,7 @@ _TABLE_COLUMNS = {
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
         ("generation_run_id", "VARCHAR", True, None, True),
+        ("source_relative_path", "VARCHAR", False, None, False),
         ("input_sha256", "VARCHAR", True, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("superseded_run_id", "VARCHAR", True, None, False),
@@ -542,7 +545,8 @@ class EmbeddingCatalog:
                     article_id VARCHAR NOT NULL,
                     modality VARCHAR NOT NULL,
                     configuration_id VARCHAR NOT NULL,
-                    input_sha256 VARCHAR NOT NULL,
+                    source_relative_path VARCHAR,
+                    input_sha256 VARCHAR,
                     state VARCHAR NOT NULL,
                     attempt_count INTEGER NOT NULL,
                     error_code VARCHAR,
@@ -560,6 +564,7 @@ class EmbeddingCatalog:
                     article_id VARCHAR NOT NULL,
                     modality VARCHAR NOT NULL,
                     configuration_id VARCHAR NOT NULL,
+                    source_relative_path VARCHAR,
                     published_at_utc TIMESTAMP WITH TIME ZONE NOT NULL,
                     publication_date_new_york DATE NOT NULL,
                     dimensions INTEGER NOT NULL,
@@ -577,6 +582,7 @@ class EmbeddingCatalog:
                     modality VARCHAR NOT NULL,
                     configuration_id VARCHAR NOT NULL,
                     generation_run_id VARCHAR NOT NULL,
+                    source_relative_path VARCHAR,
                     input_sha256 VARCHAR NOT NULL,
                     stored_vector_sha256 VARCHAR NOT NULL,
                     superseded_run_id VARCHAR NOT NULL,
@@ -734,6 +740,7 @@ class EmbeddingCatalog:
         article_id: str,
         modality: str,
         configuration_identifier: str,
+        source_relative_path: str | None,
         input_sha256: str,
         published_at_utc: object,
         publication_date_new_york: object,
@@ -753,12 +760,13 @@ class EmbeddingCatalog:
             self.connection.execute(
                 """
                 INSERT INTO embedding_work_items
-                VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, current_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, current_timestamp)
                 """,
                 [
                     article_id,
                     modality,
                     configuration_identifier,
+                    source_relative_path,
                     input_sha256,
                     WorkState.QUEUED.value,
                     run_id,
@@ -779,6 +787,7 @@ class EmbeddingCatalog:
                 modality=modality,
                 configuration_identifier=configuration_identifier,
                 reason=reason,
+                replacement_source_relative_path=source_relative_path,
                 replacement_input_sha256=input_sha256,
             )
             if modality == EmbeddingModality.ARTICLE_TEXT.value:
@@ -788,6 +797,7 @@ class EmbeddingCatalog:
                     modality=EmbeddingModality.MULTIMODAL_ARTICLE.value,
                     configuration_identifier=configuration_identifier,
                     reason=reason,
+                    replacement_source_relative_path=None,
                     replacement_input_sha256=None,
                 )
             return WorkState.QUEUED
@@ -806,12 +816,29 @@ class EmbeddingCatalog:
             self.connection.execute(
                 """
                 UPDATE embeddings
-                SET published_at_utc = ?, publication_date_new_york = ?
+                SET source_relative_path = ?, published_at_utc = ?,
+                    publication_date_new_york = ?
                 WHERE article_id = ? AND modality = ? AND configuration_id = ?
                 """,
                 [
+                    source_relative_path,
                     published_at_utc,
                     publication_date_new_york,
+                    article_id,
+                    modality,
+                    configuration_identifier,
+                ],
+            )
+            self.connection.execute(
+                """
+                UPDATE embedding_work_items
+                SET source_relative_path = ?, last_run_id = ?,
+                    updated_at = current_timestamp
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [
+                    source_relative_path,
+                    run_id,
                     article_id,
                     modality,
                     configuration_identifier,
@@ -837,6 +864,70 @@ class EmbeddingCatalog:
             return WorkState.INTERRUPTED
         return state
 
+    def register_not_applicable(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+    ) -> WorkState:
+        """Persist an optional modality that has no canonical local input."""
+
+        row = self.connection.execute(
+            """
+            SELECT state
+            FROM embedding_work_items
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [article_id, modality, configuration_identifier],
+        ).fetchone()
+        if row is None:
+            self.connection.execute(
+                """
+                INSERT INTO embedding_work_items
+                VALUES (?, ?, ?, NULL, NULL, ?, 0, NULL, NULL, NULL, ?,
+                        current_timestamp)
+                """,
+                [
+                    article_id,
+                    modality,
+                    configuration_identifier,
+                    WorkState.NOT_APPLICABLE.value,
+                    run_id,
+                ],
+            )
+            return WorkState.NOT_APPLICABLE
+        state = WorkState(str(row[0]))
+        if state is not WorkState.NOT_APPLICABLE:
+            self._invalidate_work_generation(
+                run_id=run_id,
+                article_id=article_id,
+                modality=modality,
+                configuration_identifier=configuration_identifier,
+                reason=SupersessionReason.INPUT_CHANGED,
+                replacement_source_relative_path=None,
+                replacement_input_sha256=None,
+            )
+        self.connection.execute(
+            """
+            UPDATE embedding_work_items
+            SET source_relative_path = NULL, input_sha256 = NULL, state = ?,
+                attempt_count = 0, error_code = NULL, status_code = NULL,
+                retry_after_seconds = NULL, last_run_id = ?,
+                updated_at = current_timestamp
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                WorkState.NOT_APPLICABLE.value,
+                run_id,
+                article_id,
+                modality,
+                configuration_identifier,
+            ],
+        )
+        return WorkState.NOT_APPLICABLE
+
     def _invalidate_work_generation(
         self,
         *,
@@ -845,6 +936,7 @@ class EmbeddingCatalog:
         modality: str,
         configuration_identifier: str,
         reason: SupersessionReason,
+        replacement_source_relative_path: str | None,
         replacement_input_sha256: str | None,
     ) -> None:
         """Archive, remove, and queue one exact existing generation."""
@@ -866,13 +958,15 @@ class EmbeddingCatalog:
         self.connection.execute(
             """
             UPDATE embedding_work_items
-            SET input_sha256 = COALESCE(?, input_sha256), state = ?,
+            SET source_relative_path = ?,
+                input_sha256 = COALESCE(?, input_sha256), state = ?,
                 attempt_count = 0, error_code = NULL, status_code = NULL,
                 retry_after_seconds = NULL, last_run_id = ?,
                 updated_at = current_timestamp
             WHERE article_id = ? AND modality = ? AND configuration_id = ?
             """,
             [
+                replacement_source_relative_path,
                 replacement_input_sha256,
                 WorkState.QUEUED.value,
                 run_id,
@@ -893,7 +987,8 @@ class EmbeddingCatalog:
     ) -> None:
         row = self.connection.execute(
             """
-            SELECT w.last_run_id, e.input_sha256, e.stored_vector_sha256
+            SELECT w.last_run_id, e.source_relative_path, e.input_sha256,
+                   e.stored_vector_sha256
             FROM embeddings AS e
             JOIN embedding_work_items AS w
               USING (article_id, modality, configuration_id)
@@ -904,11 +999,16 @@ class EmbeddingCatalog:
         ).fetchone()
         if row is None:
             return
-        generation_run_id, input_sha256, stored_vector_sha256 = row
+        (
+            generation_run_id,
+            source_relative_path,
+            input_sha256,
+            stored_vector_sha256,
+        ) = row
         self.connection.execute(
             """
             INSERT INTO embedding_generation_history
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
             ON CONFLICT (
                 article_id, modality, configuration_id, generation_run_id
             ) DO NOTHING
@@ -918,6 +1018,7 @@ class EmbeddingCatalog:
                 modality,
                 configuration_identifier,
                 generation_run_id,
+                source_relative_path,
                 input_sha256,
                 stored_vector_sha256,
                 run_id,
@@ -998,6 +1099,7 @@ class EmbeddingCatalog:
         article_id: str,
         modality: str,
         configuration_identifier: str,
+        source_relative_path: str | None,
         published_at_utc: object,
         publication_date_new_york: object,
         dimensions: int,
@@ -1010,9 +1112,10 @@ class EmbeddingCatalog:
         self.connection.execute(
             """
             INSERT INTO embeddings
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (article_id, modality, configuration_id)
             DO UPDATE SET
+                source_relative_path = excluded.source_relative_path,
                 published_at_utc = excluded.published_at_utc,
                 publication_date_new_york = excluded.publication_date_new_york,
                 dimensions = excluded.dimensions,
@@ -1024,6 +1127,7 @@ class EmbeddingCatalog:
                 article_id,
                 modality,
                 configuration_identifier,
+                source_relative_path,
                 published_at_utc,
                 publication_date_new_york,
                 dimensions,
@@ -1035,13 +1139,15 @@ class EmbeddingCatalog:
         self.connection.execute(
             """
             UPDATE embedding_work_items
-            SET state = ?, input_sha256 = ?, error_code = NULL,
+            SET state = ?, source_relative_path = ?, input_sha256 = ?,
+                error_code = NULL,
                 status_code = NULL, retry_after_seconds = NULL,
                 last_run_id = ?, updated_at = current_timestamp
             WHERE article_id = ? AND modality = ? AND configuration_id = ?
             """,
             [
                 WorkState.SUCCEEDED.value,
+                source_relative_path,
                 input_sha256,
                 run_id,
                 article_id,

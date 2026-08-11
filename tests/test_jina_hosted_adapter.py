@@ -139,6 +139,20 @@ def test_hosted_adapter_serializes_fixed_contract_and_maps_indexed_vectors():
     )
 
 
+def test_hosted_adapter_embeds_one_already_encoded_image_without_remote_url():
+    """Break caught: coordinator image calls use text or publish a remote URL."""
+
+    image_base64 = base64.b64encode(b"generated image bytes").decode("ascii")
+    transport = RecordingTransport(
+        _response([{"index": 0, "embedding": _embedding(0.0, 5.0)}])
+    )
+
+    vector = _adapter(transport).embed_image(image_base64)
+
+    assert vector[:2] == (0.0, 1.0)
+    assert json.loads(transport.calls[0][2])["input"] == [{"image": image_base64}]
+
+
 @pytest.mark.parametrize(
     ("data", "code"),
     [

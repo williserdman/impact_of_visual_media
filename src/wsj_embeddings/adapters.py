@@ -45,6 +45,8 @@ class EmbeddingAdapter(Protocol):
 
     def embed_text(self, text: str) -> tuple[float, ...]: ...
 
+    def embed_image(self, image_base64: str) -> tuple[float, ...]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class JinaEmbeddingInput:
@@ -197,7 +199,7 @@ class JinaEmbeddingAdapter:
         context_rules="complete-input-truncate-false-late-chunking-false-v1",
         long_text_aggregation="single-input-provider-pooling-v1",
         image_input_rules="base64-source-bytes-no-remote-v1",
-        image_transform="not-implemented-v1",
+        image_transform="source-bytes-no-transform-v1",
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
         client_configuration_version="wsj-embeddings-config-v1",
     )
@@ -223,6 +225,13 @@ class JinaEmbeddingAdapter:
         """Maintain the existing coordinator adapter seam for text-only callers."""
 
         return self.embed((JinaEmbeddingInput.text(text),)).vectors[0].stored_vector
+
+    def embed_image(self, image_base64: str) -> tuple[float, ...]:
+        """Embed source bytes already encoded by the trusted coordinator."""
+
+        return self.embed(
+            (JinaEmbeddingInput.image_base64(image_base64),)
+        ).vectors[0].stored_vector
 
     def embed(self, inputs: Sequence[JinaEmbeddingInput]) -> JinaEmbeddingResponse:
         """Embed text/image items and return vectors in caller input order."""
@@ -441,7 +450,7 @@ class FakeEmbeddingAdapter:
         context_rules="complete-input-truncate-false-late-chunking-false-v1",
         long_text_aggregation="single-input-provider-pooling-v1",
         image_input_rules="base64-source-bytes-no-remote-v1",
-        image_transform="not-implemented-v1",
+        image_transform="source-bytes-no-transform-v1",
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
         client_configuration_version="wsj-embeddings-config-v1",
     )
@@ -450,3 +459,12 @@ class FakeEmbeddingAdapter:
         if not text:
             raise ValueError("text input must not be empty")
         return (1.0, *(0.0 for _ in range(2047)))
+
+    def embed_image(self, image_base64: str) -> tuple[float, ...]:
+        try:
+            image_bytes = base64.b64decode(image_base64, validate=True)
+        except (TypeError, ValueError):
+            image_bytes = b""
+        if not image_bytes:
+            raise ValueError("image input must contain base64 source bytes")
+        return (0.0, 1.0, *(0.0 for _ in range(2046)))

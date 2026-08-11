@@ -32,6 +32,9 @@ def write_generated_cli_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     preprocessing_root = tmp_path / "preprocessed"
     embedding_root = tmp_path / "embeddings"
     source_root.mkdir()
+    header_path = source_root / "headers" / "a.jpg"
+    header_path.parent.mkdir()
+    header_path.write_bytes(b"generated CLI header image")
     article_rows = (
         ("wsj:B", "# Complete B\n\nSecond paragraph.\n", None),
         ("wsj:A", "# Complete A\n\nFirst paragraph.\n", "headers/a.jpg"),
@@ -196,13 +199,13 @@ def test_authorized_limited_run_embeds_complete_lexical_winner_with_fake(
     assert exit_code == 0
     assert json.loads(line) == {
         "articles": 1,
-        "attempted": 1,
+        "attempted": 2,
         "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
-        "embeddings": 1,
+        "embeddings": 2,
         "interrupted": 0,
         "retryable": 0,
         "reused": 0,
-        "succeeded": 1,
+        "succeeded": 2,
         "terminal": 0,
     }
     assert line == f"{json.dumps(json.loads(line), sort_keys=True)}\n"
@@ -210,16 +213,25 @@ def test_authorized_limited_run_embeds_complete_lexical_winner_with_fake(
     with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
         embedded = db.execute(
             """
-            SELECT article_id, published_at_utc, publication_date_new_york
+            SELECT article_id, modality, published_at_utc,
+                   publication_date_new_york
             FROM embeddings
+            ORDER BY modality
             """
         ).fetchall()
     assert embedded == [
         (
             "wsj:A",
+            "article_text",
             datetime(2024, 1, 3, 15, 30, tzinfo=UTC),
             date(2024, 1, 3),
-        )
+        ),
+        (
+            "wsj:A",
+            "header_image",
+            datetime(2024, 1, 3, 15, 30, tzinfo=UTC),
+            date(2024, 1, 3),
+        ),
     ]
 
 
@@ -267,13 +279,13 @@ def test_authorized_reprocess_flag_regenerates_only_the_limited_cli_scope(
         "embeddings": 1,
         "interrupted": 0,
         "retryable": 0,
-        "reused": 0,
+        "reused": 1,
         "succeeded": 1,
         "terminal": 0,
     }
     assert adapter.texts == ["# Complete A\n\nFirst paragraph.\n"]
     with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
-        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (2,)
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (3,)
         assert db.execute(
             "SELECT article_id FROM embedding_generation_history"
         ).fetchall() == [("wsj:A",)]
