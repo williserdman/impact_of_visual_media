@@ -127,10 +127,14 @@ def _encoded_png(target_size: int | None = None) -> str:
     png += _png_chunk(b"IEND", b"")
     png = b"\x89PNG\r\n\x1a\n" + png
     if target_size is not None:
-        padding_size = target_size - len(png) - 13
+        padding_size = target_size - len(png) - 14
         if padding_size < 0:
             raise ValueError("target_size is too small for a generated PNG")
-        png = png[:-12] + _png_chunk(b"tEXt", b"p" + (b"0" * padding_size)) + png[-12:]
+        png = (
+            png[:-12]
+            + _png_chunk(b"tEXt", b"p\x00" + (b"0" * padding_size))
+            + png[-12:]
+        )
     return base64.b64encode(png).decode("ascii")
 
 

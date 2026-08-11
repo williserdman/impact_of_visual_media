@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 
@@ -15,11 +17,24 @@ from wsj_embeddings.adapters import (
 from wsj_embeddings.pilot import run_jina_pilot
 from wsj_embeddings.smoke import run_embedding_smoke
 
+_OPTION_NAME = re.compile(r"(?<!\w)(--?[A-Za-z][A-Za-z0-9-]*)")
+
+
+class _ContentFreeArgumentParser(argparse.ArgumentParser):
+    """Reject invalid CLI input without echoing supplied text or paths."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        option = _OPTION_NAME.search(message)
+        if option is None:
+            self.exit(2, f"{self.prog}: error: invalid arguments\n")
+        self.exit(2, f"{self.prog}: error: invalid option {option.group(1)}\n")
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the embedding CLI parser without performing any I/O."""
 
-    parser = argparse.ArgumentParser(prog="wsj-embeddings")
+    parser = _ContentFreeArgumentParser(prog="wsj-embeddings")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("smoke")
     commands.add_parser("pilot")

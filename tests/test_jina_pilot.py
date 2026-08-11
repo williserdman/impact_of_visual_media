@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import base64
 import json
+import struct
+import zlib
 from collections.abc import Mapping
 
 import pytest
 
 from wsj_embeddings.adapters import JinaHttpResponse
 from wsj_embeddings.cli import build_parser, main
+from wsj_embeddings.pilot import _encoded_png
 
 
 class PilotTransport:
@@ -246,3 +249,69 @@ def test_pilot_stops_on_invalid_credential_without_creating_state(
     assert json.loads(output) == {"error": "authentication"}
     assert transport.calls == 1
     assert list(tmp_path.iterdir()) == []
+
+
+def test_near_limit_generated_pngs_are_structurally_valid() -> None:
+    """Break caught: padded image probes are base64 but not valid PNG streams."""
+
+    for target_size in (5_000_000, 8_000_000):
+        image = base64.b64decode(_encoded_png(target_size), validate=True)
+
+        assert len(image) == target_size
+        _assert_valid_png(image)
+
+
+@pytest.mark.parametrize(
+    ("argv", "option", "rejected_value"),
+    [
+        (
+            ["pilot", "--text", "generated-content-must-not-echo"],
+            "--text",
+            "generated-content-must-not-echo",
+        ),
+        (
+            ["pilot", "--source=/private/archive/path"],
+            "--source",
+            "/private/archive/path",
+        ),
+    ],
+)
+def test_pilot_parse_errors_redact_rejected_values(
+    argv: list[str], option: str, rejected_value: str, capsys
+) -> None:
+    """Break caught: argparse echoes rejected content or source paths to stderr."""
+
+    with pytest.raises(SystemExit) as raised:
+        main(argv)
+    captured = capsys.readouterr()
+
+    assert raised.value.code == 2
+    assert option in captured.err
+    assert rejected_value not in captured.out
+    assert rejected_value not in captured.err
+
+
+def _assert_valid_png(image: bytes) -> None:
+    """Validate PNG framing, CRCs, text grammar, and decompressed 1x1 pixels."""
+
+    assert image.startswith(b"\x89PNG\r\n\x1a\n")
+    position = 8
+    chunks: list[tuple[bytes, bytes]] = []
+    while position < len(image):
+        size = struct.unpack(">I", image[position : position + 4])[0]
+        kind = image[position + 4 : position + 8]
+        data_start = position + 8
+        data_end = data_start + size
+        value = image[data_start:data_end]
+        crc = struct.unpack(">I", image[data_end : data_end + 4])[0]
+        assert zlib.crc32(kind + value) & 0xFFFFFFFF == crc
+        chunks.append((kind, value))
+        position = data_end + 4
+
+    assert position == len(image)
+    assert [kind for kind, _ in chunks] == [b"IHDR", b"IDAT", b"tEXt", b"IEND"]
+    assert chunks[0][1] == struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    keyword, text = chunks[2][1].split(b"\x00", 1)
+    assert keyword == b"p"
+    assert text
+    assert zlib.decompress(chunks[1][1]) == b"\x00\x00\x00\x00"
