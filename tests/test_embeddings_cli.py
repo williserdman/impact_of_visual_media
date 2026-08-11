@@ -464,13 +464,18 @@ def test_run_reports_pipeline_failure_without_article_identity_or_path(
     assert not roots[2].exists()
 
 
-def test_run_does_not_swallow_programmer_errors(tmp_path: Path) -> None:
-    """Break caught: the operational mapping catches arbitrary programming bugs."""
+def test_run_does_not_swallow_programmer_error_from_constructed_adapter(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Break caught: adapter programming bugs become operational JSON errors."""
 
     roots = write_generated_cli_fixture(tmp_path)
 
-    def broken_factory():
-        raise AssertionError("programmer error remains visible")
+    class BrokenAdapter(FakeEmbeddingAdapter):
+        def embed_text(self, text: str) -> tuple[float, ...]:
+            del text
+            raise AssertionError("programmer error remains visible")
 
     with pytest.raises(AssertionError, match="programmer error remains visible"):
         main(
@@ -481,5 +486,8 @@ def test_run_does_not_swallow_programmer_errors(tmp_path: Path) -> None:
                 "1",
                 "--authorize-hosted-processing",
             ],
-            adapter_factory=broken_factory,
+            adapter_factory=BrokenAdapter,
         )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
