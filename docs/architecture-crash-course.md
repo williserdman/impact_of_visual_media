@@ -304,7 +304,10 @@ research modality. `long_text_part_generations` is append-only operational
 history, including exact character/UTF-8 byte spans and vector facts needed to
 audit an aggregate without retaining Markdown. A part success commits before
 the next hosted call, so a crash or retryable failure repurchases only unproven
-parts; retryable errors become terminal on the third committed attempt.
+parts. Retryable errors become terminal on the third committed attempt; the
+part, parent article work, and run counter transition atomically. Replay repairs
+a legacy split terminal or an interrupted attempt-three checkpoint without an
+additional hosted call.
 Explicit reprocess clears the current checkpoint but never a generation named
 by active or archived aggregate provenance. Aggregate provenance links the one
 research vector to each immutable part generation, content hash, token count,

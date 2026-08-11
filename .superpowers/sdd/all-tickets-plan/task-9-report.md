@@ -236,3 +236,78 @@ do not exercise that acquisition or a clean dependency install; ticket 15 owns
 the clean temporary-install check. The shared virtual environment intentionally
 does not contain `tokenizers` or `huggingface_hub`, so all tokenizer tests remain
 injected/offline and smoke/help use worktree source through `PYTHONPATH=src`.
+
+## Review-fix round 2
+
+The long-part attempt ceiling is now interruption-safe at both durable seams.
+The catalog performs the part-terminal, parent article-terminal, and run
+terminal-count updates in one coordinator transaction. A replay also checks
+durable part state before starting the parent attempt: a terminal part is
+mirrored without another hosted call, while a non-success part already at the
+configured attempt ceiling is repaired to `attempt_limit_exhausted` without
+buying an additional attempt. Earlier retryable checkpoints below the ceiling
+continue to resume normally.
+
+Two public, content-free failpoints cover the boundaries after a part-attempt
+checkpoint and after the atomic terminal transition. The terminal-transition
+fixture interrupts before outer exception handling, then proves the part,
+parent, and run count were already committed and replay makes zero text calls.
+The attempt-checkpoint fixture interrupts after attempt three is durable but
+before the adapter call, then proves replay makes zero text calls and repairs
+the parent and part consistently without incrementing their attempt counts.
+
+The version-eight refusal fixture now constructs the exact prior physical
+shape: current version nine without `long_text_part_generations`, the four
+source-span columns, and the two tokenizer/attempt-limit configuration fields,
+with metadata version eight. It asserts the complete table, column, type,
+nullability, primary-key, constraint, and index shape before exercising
+read-only refusal, and verifies the catalog bytes and logical shape are
+unchanged afterward. A separate fixture retains the malformed case where the
+current physical schema is merely relabeled as version eight.
+
+Round-2 red-green evidence:
+
+- both new failpoint fixtures initially failed at import because the public
+  failpoint API did not exist: `2 failed, 125 deselected in 7.08s`;
+- after the atomic transition and replay guard, both passed:
+  `2 passed, 125 deselected in 10.56s`;
+- the strengthened prior-version test failed against the weak relabel-only
+  setup because the version-nine generation table remained:
+  `1 failed in 1.90s`;
+- after constructing the exact version-eight shape and separating the malformed
+  label case: `2 passed, 126 deselected in 2.76s`; and
+- the exact prior-version constraint assertion passed independently:
+  `1 passed in 1.78s`.
+
+Focused round-2 regressions (no full suite):
+
+- retryable resume, bounded terminal behavior, and both interruption seams:
+  `4 passed, 124 deselected in 18.76s`;
+- direct-boundary, interruption, and fresh-schema behavior:
+  `4 passed, 124 deselected in 15.00s`; and
+- final retry/resume, both interruption seams, and both version-eight refusal
+  shapes: `5 passed, 123 deselected in 17.65s`;
+- changed-file Ruff: `All checks passed!`;
+- worktree-source smoke:
+  `{"articles": 1, "embeddings": 1, "validation_ok": true}`;
+- worktree-source `run --help` retained all three explicit roots, positive
+  `--limit`, `--reprocess`, and hosted authorization; and
+- `git diff --check` produced no output.
+
+Round-2 self-review:
+
+- A terminal part or a durable part at the configured ceiling is checked before
+  `start_attempt`, so replay cannot increment the parent or invoke the hosted
+  adapter.
+- The terminal transition increments the run terminal count only when the
+  parent was not already terminal, and outer error handling detects the
+  committed long-part terminal state rather than double-counting it.
+- A checkpoint interruption at attempt three preserves the durable count;
+  replay converts it to terminal without attempt four. Attempts one and two
+  retain the existing retryable-resume path.
+- Both failpoint callbacks receive only integer part/count metadata; no article
+  body or part text crosses the diagnostic seam.
+- The prior-version fixture derives its exact shape from the current schema by
+  removing only the reviewed version-nine additions, while the separately
+  malformed fixture prevents a relabeled current schema from masquerading as
+  historical output.

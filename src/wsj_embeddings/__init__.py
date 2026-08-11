@@ -9,6 +9,7 @@ from wsj_embeddings.models import (
     EmbeddingRunResult,
 )
 from wsj_embeddings.pipeline import (
+    EmbeddingPipelineFailpoints,
     HostedProcessingAuthorizationError,
     inventory_embedding_articles,
     run_embedding_pipeline,
@@ -25,6 +26,7 @@ __all__ = [
     "EmbeddingCatalogError",
     "EmbeddingInventoryResult",
     "EmbeddingPipelineConfig",
+    "EmbeddingPipelineFailpoints",
     "EmbeddingProfile",
     "EmbeddingRunResult",
     "EmbeddingSmokeResult",

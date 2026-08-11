@@ -9,7 +9,7 @@ import math
 import os
 import stat
 import struct
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +56,16 @@ class _PreparedHeaderImage:
 
 
 @dataclass(frozen=True, slots=True)
+class EmbeddingPipelineFailpoints:
+    """Content-free interruption hooks for durable-boundary verification."""
+
+    after_long_text_part_attempt_checkpoint: (
+        Callable[[int, int], None] | None
+    ) = None
+    after_long_text_terminal_transition: Callable[[int], None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _MissingHeaderImage:
     source_relative_path: str
 
@@ -83,6 +93,10 @@ class EmbeddingPipelineError(RuntimeError):
         self.code = code
         self.article_id = article_id
         super().__init__(f"[{code}] article_id={article_id}")
+
+
+class _LongTextTerminal(RuntimeError):
+    """Internal control flow after a durable terminal part transition."""
 
 
 class EmbeddingPipelineLockedError(RuntimeError):
@@ -217,6 +231,7 @@ def run_embedding_pipeline(
     *,
     limit: int,
     reprocess: bool = False,
+    failpoints: EmbeddingPipelineFailpoints | None = None,
 ) -> EmbeddingRunResult:
     """Publish source and derived vectors for a bounded canonical slice."""
 
@@ -229,6 +244,7 @@ def run_embedding_pipeline(
     config.validate()
     _ensure_source_root(config.source_root)
     profile = adapter.profile
+    active_failpoints = failpoints or EmbeddingPipelineFailpoints()
     if profile.dimensions != _VECTOR_DIMENSIONS:
         raise ValueError("adapter profile dimensions must be 2048")
     if profile.long_text_part_attempt_limit < 1:
@@ -286,6 +302,19 @@ def run_embedding_pipeline(
                     continue
                 if isinstance(prepared_image, _MissingHeaderImage):
                     continue
+                if modality == _ARTICLE_TEXT_MODALITY:
+                    with catalog.transaction():
+                        exhausted = catalog.terminalize_exhausted_long_text_work(
+                            run_id=run_id,
+                            article_id=article.article_id,
+                            configuration_identifier=configuration_identifier,
+                            article_input_sha256=(
+                                article.cleaned_markdown_sha256
+                            ),
+                            attempt_limit=profile.long_text_part_attempt_limit,
+                        )
+                    if exhausted:
+                        continue
                 with catalog.transaction():
                     catalog.start_attempt(
                         run_id=run_id,
@@ -304,7 +333,10 @@ def run_embedding_pipeline(
                         modality=modality,
                         prepared_image=prepared_image,
                         reprocess=reprocess,
+                        failpoints=active_failpoints,
                     )
+                except _LongTextTerminal:
+                    continue
                 except JinaHostedAdapterError as error:
                     with catalog.transaction():
                         attempt_count = catalog.attempt_count(
@@ -335,16 +367,17 @@ def run_embedding_pipeline(
                             )
                             else WorkState.TERMINAL
                         )
-                        catalog.record_failure(
-                            run_id=run_id,
-                            article_id=article.article_id,
-                            modality=modality,
-                            configuration_identifier=configuration_identifier,
-                            state=failure_state,
-                            error_code=error.code,
-                            status_code=error.status_code,
-                            retry_after_seconds=error.retry_after_seconds,
-                        )
+                        if not terminal_long_text:
+                            catalog.record_failure(
+                                run_id=run_id,
+                                article_id=article.article_id,
+                                modality=modality,
+                                configuration_identifier=configuration_identifier,
+                                state=failure_state,
+                                error_code=error.code,
+                                status_code=error.status_code,
+                                retry_after_seconds=error.retry_after_seconds,
+                            )
                         if modality == _HEADER_IMAGE_MODALITY:
                             catalog.increment_run(run_id, "header_failed")
                     if modality == _HEADER_IMAGE_MODALITY:
@@ -537,6 +570,7 @@ def _prepare_embedding(
     modality: str,
     prepared_image: _PreparedHeaderImage | _MissingHeaderImage | None,
     reprocess: bool,
+    failpoints: EmbeddingPipelineFailpoints,
 ) -> _PreparedEmbedding:
     if modality == _HEADER_IMAGE_MODALITY:
         assert isinstance(prepared_image, _PreparedHeaderImage)
@@ -594,6 +628,7 @@ def _prepare_embedding(
         article_input_sha256=input_sha256,
         parts=parts,
         reprocess=reprocess,
+        failpoints=failpoints,
     )
     aggregate = _long_text_vector(successful_parts, article.article_id)
     return _PreparedEmbedding(
@@ -614,6 +649,7 @@ def _embed_long_text_parts(
     article_input_sha256: str,
     parts: tuple[LongTextPart, ...],
     reprocess: bool,
+    failpoints: EmbeddingPipelineFailpoints,
 ) -> tuple[_SuccessfulLongTextPart, ...]:
     """Resume exact part checkpoints and purchase only unproven vectors."""
 
@@ -633,14 +669,40 @@ def _embed_long_text_parts(
         ) from error
     successful: list[_SuccessfulLongTextPart] = []
     for part, state in zip(parts, states, strict=True):
+        if state is WorkState.TERMINAL:
+            raise _LongTextTerminal
+        attempt_count = catalog.long_text_part_attempt_count(
+            article_id=article.article_id,
+            configuration_identifier=configuration_identifier,
+            article_input_sha256=article_input_sha256,
+            part_index=part.index,
+        )
+        if (
+            state is not WorkState.SUCCEEDED
+            and attempt_count >= adapter.profile.long_text_part_attempt_limit
+        ):
+            with catalog.transaction():
+                catalog.terminalize_exhausted_long_text_work(
+                    run_id=run_id,
+                    article_id=article.article_id,
+                    configuration_identifier=configuration_identifier,
+                    article_input_sha256=article_input_sha256,
+                    attempt_limit=adapter.profile.long_text_part_attempt_limit,
+                )
+            raise _LongTextTerminal
         if state is not WorkState.SUCCEEDED:
             with catalog.transaction():
-                catalog.start_long_text_part_attempt(
+                attempt_count = catalog.start_long_text_part_attempt(
                     run_id=run_id,
                     article_id=article.article_id,
                     configuration_identifier=configuration_identifier,
                     article_input_sha256=article_input_sha256,
                     part_index=part.index,
+                )
+            if failpoints.after_long_text_part_attempt_checkpoint is not None:
+                failpoints.after_long_text_part_attempt_checkpoint(
+                    part.index,
+                    attempt_count,
                 )
             try:
                 vector = _normalized_vector(
@@ -664,17 +726,34 @@ def _embed_long_text_parts(
                         )
                         else WorkState.TERMINAL
                     )
-                    catalog.record_long_text_part_failure(
-                        run_id=run_id,
-                        article_id=article.article_id,
-                        configuration_identifier=configuration_identifier,
-                        article_input_sha256=article_input_sha256,
-                        part_index=part.index,
-                        state=failure_state,
-                        error_code=error.code,
-                        status_code=error.status_code,
-                        retry_after_seconds=error.retry_after_seconds,
-                    )
+                    if failure_state is WorkState.TERMINAL:
+                        catalog.record_terminal_long_text_part_failure(
+                            run_id=run_id,
+                            article_id=article.article_id,
+                            configuration_identifier=configuration_identifier,
+                            article_input_sha256=article_input_sha256,
+                            part_index=part.index,
+                            error_code=error.code,
+                            status_code=error.status_code,
+                            retry_after_seconds=error.retry_after_seconds,
+                        )
+                    else:
+                        catalog.record_long_text_part_failure(
+                            run_id=run_id,
+                            article_id=article.article_id,
+                            configuration_identifier=configuration_identifier,
+                            article_input_sha256=article_input_sha256,
+                            part_index=part.index,
+                            state=failure_state,
+                            error_code=error.code,
+                            status_code=error.status_code,
+                            retry_after_seconds=error.retry_after_seconds,
+                        )
+                if (
+                    failure_state is WorkState.TERMINAL
+                    and failpoints.after_long_text_terminal_transition is not None
+                ):
+                    failpoints.after_long_text_terminal_transition(part.index)
                 raise
             vector_sha256 = _vector_hash(vector)
             with catalog.transaction():

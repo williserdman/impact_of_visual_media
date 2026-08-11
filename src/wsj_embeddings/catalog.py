@@ -1568,10 +1568,10 @@ class EmbeddingCatalog:
         configuration_identifier: str,
         article_input_sha256: str,
         part_index: int,
-    ) -> None:
+    ) -> int:
         """Checkpoint one part before its hosted request."""
 
-        self.connection.execute(
+        row = self.connection.execute(
             """
             UPDATE long_text_parts
             SET state = ?, attempt_count = attempt_count + 1,
@@ -1581,6 +1581,7 @@ class EmbeddingCatalog:
                 vector = NULL, updated_at = current_timestamp
             WHERE article_id = ? AND configuration_id = ?
               AND article_input_sha256 = ? AND part_index = ?
+            RETURNING attempt_count
             """,
             [
                 WorkState.IN_PROGRESS.value,
@@ -1590,7 +1591,10 @@ class EmbeddingCatalog:
                 article_input_sha256,
                 part_index,
             ],
-        )
+        ).fetchone()
+        if row is None:
+            raise ValueError("long-text part is not registered")
+        return int(row[0])
 
     def record_long_text_part_failure(
         self,
@@ -1631,6 +1635,121 @@ class EmbeddingCatalog:
                 part_index,
             ],
         )
+
+    def record_terminal_long_text_part_failure(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+        part_index: int,
+        error_code: str,
+        status_code: int | None,
+        retry_after_seconds: float | None,
+    ) -> None:
+        """Atomically terminalize one part, its parent work, and run count."""
+
+        parent = self.connection.execute(
+            """
+            SELECT state
+            FROM embedding_work_items
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                article_id,
+                EmbeddingModality.ARTICLE_TEXT.value,
+                configuration_identifier,
+            ],
+        ).fetchone()
+        if parent is None:
+            raise ValueError("article-text work is not registered")
+        self.record_long_text_part_failure(
+            run_id=run_id,
+            article_id=article_id,
+            configuration_identifier=configuration_identifier,
+            article_input_sha256=article_input_sha256,
+            part_index=part_index,
+            state=WorkState.TERMINAL,
+            error_code=error_code,
+            status_code=status_code,
+            retry_after_seconds=retry_after_seconds,
+        )
+        if WorkState(str(parent[0])) is WorkState.TERMINAL:
+            return
+        self.connection.execute(
+            """
+            UPDATE embedding_work_items
+            SET state = ?, error_code = ?, status_code = ?,
+                retry_after_seconds = ?, last_run_id = ?,
+                generation_run_id = NULL, updated_at = current_timestamp
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                WorkState.TERMINAL.value,
+                error_code,
+                status_code,
+                retry_after_seconds,
+                run_id,
+                article_id,
+                EmbeddingModality.ARTICLE_TEXT.value,
+                configuration_identifier,
+            ],
+        )
+        self.increment_run(run_id, "terminal")
+
+    def terminalize_exhausted_long_text_work(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+        attempt_limit: int,
+    ) -> bool:
+        """Repair durable terminal/exhausted parts before another hosted call."""
+
+        row = self.connection.execute(
+            """
+            SELECT part_index, state, error_code, status_code,
+                   retry_after_seconds
+            FROM long_text_parts
+            WHERE article_id = ? AND configuration_id = ?
+              AND article_input_sha256 = ?
+              AND (
+                  state = ?
+                  OR (state != ? AND attempt_count >= ?)
+              )
+            ORDER BY part_index
+            LIMIT 1
+            """,
+            [
+                article_id,
+                configuration_identifier,
+                article_input_sha256,
+                WorkState.TERMINAL.value,
+                WorkState.SUCCEEDED.value,
+                attempt_limit,
+            ],
+        ).fetchone()
+        if row is None:
+            return False
+        part_index, state, error_code, status_code, retry_after_seconds = row
+        if WorkState(str(state)) is not WorkState.TERMINAL:
+            error_code = "attempt_limit_exhausted"
+            status_code = None
+            retry_after_seconds = None
+        self.record_terminal_long_text_part_failure(
+            run_id=run_id,
+            article_id=article_id,
+            configuration_identifier=configuration_identifier,
+            article_input_sha256=article_input_sha256,
+            part_index=int(part_index),
+            error_code=str(error_code),
+            status_code=status_code,
+            retry_after_seconds=retry_after_seconds,
+        )
+        return True
 
     def publish_long_text_part_success(
         self,

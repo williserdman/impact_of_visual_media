@@ -344,7 +344,10 @@ context. Inputs through that ceiling receive one provider-pooled vector.
 Longer inputs commit each normalized operational part vector independently,
 then publish one canonical `article_text` vector as the float32 L2-normalized
 token-count-weighted mean. Retryable part requests become terminal after three
-committed attempts. Mutable checkpoints point to append-only part-generation
+committed attempts. The part, parent article work, and terminal run count change
+in one transaction. If attempt three was checkpointed before an interruption,
+replay terminalizes the work without another hosted call. Mutable checkpoints
+point to append-only part-generation
 rows; explicit reprocess clears only the checkpoint, never a generation named
 by active or archived aggregate provenance. Part vectors and their append-only
 aggregate linkage are audit/resume state, never additional research

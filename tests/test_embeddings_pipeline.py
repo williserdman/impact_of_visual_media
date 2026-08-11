@@ -20,6 +20,7 @@ import wsj_embeddings.source_image as source_image_module
 from wsj_embeddings import (
     EmbeddingCatalogError,
     EmbeddingPipelineConfig,
+    EmbeddingPipelineFailpoints,
     EmbeddingProfile,
     EmbeddingRunResult,
     EmbeddingValidationIssue,
@@ -1004,6 +1005,145 @@ def test_retryable_long_text_part_becomes_terminal_at_profile_attempt_limit(
         header_absent=1,
     )
     assert tuple(adapter.embedded_texts) == calls_before_replay
+
+
+def test_terminal_part_transition_survives_crash_before_outer_failure_handling(
+    tmp_path,
+):
+    """Break caught: replay repurchases a terminal part after a seam crash."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+
+    class AlwaysRetrySecondPartAdapter(StablePartVectorAdapter):
+        def embed_text(self, text: str) -> tuple[float, ...]:
+            if text.startswith("BBBB"):
+                self.embedded_texts.append(text)
+                raise JinaHostedAdapterError("rate_limit", retryable=True)
+            return super().embed_text(text)
+
+    adapter = AlwaysRetrySecondPartAdapter()
+    for _attempt in range(2):
+        with pytest.raises(JinaHostedAdapterError):
+            run_embedding_pipeline(config, adapter, limit=1)
+
+    def interrupt_after_terminal_transition(part_index: int) -> None:
+        assert part_index == 1
+        raise SyntheticInterruption
+
+    failpoints = EmbeddingPipelineFailpoints(
+        after_long_text_terminal_transition=interrupt_after_terminal_transition,
+    )
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(config, adapter, limit=1, failpoints=failpoints)
+
+    configuration_identifier = configuration_id(adapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count FROM long_text_parts
+            WHERE configuration_id = ? AND part_index = 1
+            """,
+            [configuration_identifier],
+        ).fetchone() == ("terminal", 3)
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code
+            FROM embedding_work_items
+            WHERE configuration_id = ? AND modality = 'article_text'
+            """,
+            [configuration_identifier],
+        ).fetchone() == ("terminal", 3, "rate_limit")
+        assert db.execute(
+            """
+            SELECT attempted, terminal, interrupted
+            FROM runs
+            WHERE run_id = (
+                SELECT last_run_id FROM embedding_work_items
+                WHERE configuration_id = ? AND modality = 'article_text'
+            )
+            """,
+            [configuration_identifier],
+        ).fetchone() == (1, 1, 0)
+
+    replay_adapter = StablePartVectorAdapter()
+    replay = run_embedding_pipeline(config, replay_adapter, limit=1)
+
+    assert replay == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        terminal=1,
+        header_absent=1,
+    )
+    assert replay_adapter.embedded_texts == []
+
+
+def test_attempt_limit_checkpoint_crash_replay_terminalizes_without_adapter_call(
+    tmp_path,
+):
+    """Break caught: replay buys attempt four after attempt three checkpointed."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+
+    class AlwaysRetrySecondPartAdapter(StablePartVectorAdapter):
+        def embed_text(self, text: str) -> tuple[float, ...]:
+            if text.startswith("BBBB"):
+                self.embedded_texts.append(text)
+                raise JinaHostedAdapterError("rate_limit", retryable=True)
+            return super().embed_text(text)
+
+    adapter = AlwaysRetrySecondPartAdapter()
+    for _attempt in range(2):
+        with pytest.raises(JinaHostedAdapterError):
+            run_embedding_pipeline(config, adapter, limit=1)
+    calls_before_checkpoint = tuple(adapter.embedded_texts)
+
+    def interrupt_after_attempt_checkpoint(
+        part_index: int,
+        attempt_count: int,
+    ) -> None:
+        if part_index == 1 and attempt_count == 3:
+            raise SyntheticInterruption
+
+    failpoints = EmbeddingPipelineFailpoints(
+        after_long_text_part_attempt_checkpoint=(
+            interrupt_after_attempt_checkpoint
+        ),
+    )
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(config, adapter, limit=1, failpoints=failpoints)
+    assert tuple(adapter.embedded_texts) == calls_before_checkpoint
+
+    replay_adapter = StablePartVectorAdapter()
+    replay = run_embedding_pipeline(config, replay_adapter, limit=1)
+
+    assert replay == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        terminal=1,
+        interrupted=1,
+        header_absent=1,
+    )
+    assert replay_adapter.embedded_texts == []
+    configuration_identifier = configuration_id(adapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code
+            FROM long_text_parts
+            WHERE configuration_id = ? AND part_index = 1
+            """,
+            [configuration_identifier],
+        ).fetchone() == ("terminal", 3, "attempt_limit_exhausted")
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code
+            FROM embedding_work_items
+            WHERE configuration_id = ? AND modality = 'article_text'
+            """,
+            [configuration_identifier],
+        ).fetchone() == ("terminal", 3, "attempt_limit_exhausted")
 
 
 def test_validator_requires_complete_long_text_aggregation_provenance(tmp_path):
@@ -3533,8 +3673,168 @@ def test_pipeline_refuses_version_seven_embedding_catalog_without_migration(tmp_
         }.isdisjoint({row[0] for row in db.execute("SHOW TABLES").fetchall()})
 
 
-def test_pipeline_refuses_version_eight_embedding_catalog_without_migration(tmp_path):
-    """Break caught: immutable long-part generations are added in place."""
+def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path):
+    """Break caught: the real prior-v8 shape is silently upgraded in place."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP TABLE long_text_part_generations")
+        for column in ("char_start", "char_end", "byte_start", "byte_end"):
+            db.execute(f"ALTER TABLE long_text_parts DROP COLUMN {column}")
+        for column in ("tokenizer_engine", "long_text_part_attempt_limit"):
+            db.execute(
+                f"ALTER TABLE embedding_configurations DROP COLUMN {column}"
+            )
+        expected_v8_columns = {
+            table: columns
+            for table, columns in EXPECTED_EMBEDDING_TABLE_COLUMNS.items()
+            if table != "long_text_part_generations"
+        }
+        expected_v8_columns["embedding_configurations"] = tuple(
+            column
+            for column in expected_v8_columns["embedding_configurations"]
+            if column[0]
+            not in {"tokenizer_engine", "long_text_part_attempt_limit"}
+        )
+        expected_v8_columns["long_text_parts"] = tuple(
+            column
+            for column in expected_v8_columns["long_text_parts"]
+            if column[0]
+            not in {"char_start", "char_end", "byte_start", "byte_end"}
+        )
+        assert {row[0] for row in db.execute("SHOW TABLES").fetchall()} == (
+            set(expected_v8_columns)
+        )
+        assert {
+            table: tuple(
+                (row[1], row[2], row[3], row[4], row[5])
+                for row in db.execute(f"PRAGMA table_info('{table}')").fetchall()
+            )
+            for table in expected_v8_columns
+        } == expected_v8_columns
+        assert [
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info('embedding_configurations')"
+            ).fetchall()
+        ] == [
+            "configuration_id",
+            "model",
+            "observed_model",
+            "observed_api_version",
+            "task",
+            "dimensions",
+            "output_type",
+            "normalization",
+            "tokenizer_revision",
+            "context_token_limit",
+            "context_rules",
+            "long_text_aggregation",
+            "image_input_rules",
+            "image_transform",
+            "multimodal_formula",
+            "client_configuration_version",
+        ]
+        assert [
+            row[1]
+            for row in db.execute("PRAGMA table_info('long_text_parts')").fetchall()
+        ] == [
+            "article_id",
+            "configuration_id",
+            "article_input_sha256",
+            "part_index",
+            "part_count",
+            "part_input_sha256",
+            "token_count",
+            "state",
+            "attempt_count",
+            "error_code",
+            "status_code",
+            "retry_after_seconds",
+            "last_run_id",
+            "generation_run_id",
+            "stored_vector_sha256",
+            "vector",
+            "updated_at",
+        ]
+        expected_v8_primary_keys = (
+            EXPECTED_EMBEDDING_PRIMARY_KEYS
+            - {
+                (
+                    "long_text_part_generations",
+                    (
+                        "article_id",
+                        "configuration_id",
+                        "article_input_sha256",
+                        "part_index",
+                        "generation_run_id",
+                    ),
+                )
+            }
+        )
+        expected_v8_constraints = Counter(
+            (table, "PRIMARY KEY", columns, None, None, ())
+            for table, columns in expected_v8_primary_keys
+        )
+        expected_v8_constraints.update(
+            (table, "NOT NULL", (name,), None, None, ())
+            for table, columns in expected_v8_columns.items()
+            for name, _data_type, not_null, _default, _primary_key in columns
+            if not_null
+        )
+        assert Counter(
+            (
+                row[0],
+                row[1],
+                tuple(row[2] or ()),
+                row[3],
+                row[4],
+                tuple(row[5] or ()),
+            )
+            for row in db.execute(
+                """
+                SELECT table_name, constraint_type, constraint_column_names,
+                       expression, referenced_table, referenced_column_names
+                FROM duckdb_constraints()
+                WHERE database_name = current_database()
+                  AND schema_name = 'main'
+                """
+            ).fetchall()
+        ) == expected_v8_constraints
+        assert db.execute("SELECT * FROM duckdb_indexes()").fetchall() == []
+        db.execute("UPDATE metadata SET value = '8' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("8",)
+        assert "long_text_part_generations" not in {
+            row[0] for row in db.execute("SHOW TABLES").fetchall()
+        }
+        assert {
+            row[1]
+            for row in db.execute("PRAGMA table_info('long_text_parts')").fetchall()
+        }.isdisjoint({"char_start", "char_end", "byte_start", "byte_end"})
+        assert {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info('embedding_configurations')"
+            ).fetchall()
+        }.isdisjoint({"tokenizer_engine", "long_text_part_attempt_limit"})
+
+
+def test_pipeline_refuses_malformed_current_schema_with_version_eight_label(
+    tmp_path,
+):
+    """Break caught: a false v8 label makes a malformed current shape acceptable."""
 
     config = write_generated_preprocessing_fixture(tmp_path)
     config.embedding_output_root.mkdir()
@@ -3548,6 +3848,13 @@ def test_pipeline_refuses_version_eight_embedding_catalog_without_migration(tmp_
         run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
 
     assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("8",)
+        assert "long_text_part_generations" in {
+            row[0] for row in db.execute("SHOW TABLES").fetchall()
+        }
 
 
 def test_validator_accepts_fresh_synthetic_embedding_output(tmp_path):
