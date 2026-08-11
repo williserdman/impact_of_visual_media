@@ -26,12 +26,13 @@ Production embeddings, entity extraction, knowledge graphs, market joins,
 labels, backtests, and remote-image retrieval remain downstream concerns; the
 shared preprocessing catalog does not own them.
 
-Ticket 01 now supplies one fixture-only downstream tracer for article text
-embeddings. It consumes a generated `articles` row and its canonical Markdown
-through the same public seam a future real job will use, injects a deterministic
-fake adapter, and publishes a separate embedding catalog. It does not expose a
-real-corpus run, Jina request, credential path, image embedding, or resume
-workflow.
+The fixture-only downstream tracer for article text embeddings consumes a
+generated `articles` row and its canonical Markdown through the same public
+seam a future real job will use, injects a deterministic fake adapter, and
+publishes a separate embedding catalog. A separate explicit pilot can send only
+fixed in-memory generated text and PNG bytes through the hosted Jina adapter to
+measure that contract. It does not expose a real-corpus run, configured input,
+or resume workflow.
 
 ```mermaid
 flowchart LR
@@ -117,19 +118,22 @@ are valid only with that scope. Configuration defaults to four workers.
 | Module | Owns | Does not own |
 |---|---|---|
 | `wsj_embeddings/config.py` | resolved source, preprocessing-output, and embedding-output roots; pairwise disjointness | CLI configuration loading |
-| `wsj_embeddings/adapters.py` | injected adapter protocol and deterministic fake adapter | Jina HTTP or credentials |
+| `wsj_embeddings/adapters.py` | injected adapter protocol, deterministic fake adapter, and fixed hosted Jina adapter | corpus selection or output mutation |
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
 | `wsj_embeddings/catalog.py` | separate schema version 1, exact read-only inspection, bounded publication transaction | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | bounded canonical-row selection, text encoding, normalization, hashes, run/vector publication | real-corpus CLI scope or network policy |
 | `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
-| `wsj_embeddings/cli.py` | the single `smoke` command and deterministic content-free JSON | `run`, Jina configuration, or preprocessing commands |
+| `wsj_embeddings/pilot.py` | fixed generated hosted text/image/boundary probes and content-free observations | corpus or filesystem input/output |
+| `wsj_embeddings/cli.py` | `smoke` and explicit hosted `pilot` commands with deterministic content-free JSON | `run`, Jina configuration, or preprocessing commands |
 
-The installed `wsj-embeddings` command currently accepts exactly `smoke`. It
+The installed `wsj-embeddings` command accepts `smoke` and `pilot`. `smoke`
 creates three disjoint temporary roots, publishes one fake 2,048-dimensional
 `article_text` vector, validates it, emits
 `{"articles": 1, "embeddings": 1, "validation_ok": true}`, and deletes the
-temporary fixture. The existing `wsj-pipeline` command surface is unchanged.
+temporary fixture. `pilot` has no selectors and, only with `JINA_API_KEY`, uses
+the hosted adapter for its fixed generated probes without creating a catalog or
+output root. The existing `wsj-pipeline` command surface is unchanged.
 
 ## 4. Cleaned Markdown contract
 
@@ -539,9 +543,10 @@ orphan cleanup, and full-only missing-source reconciliation.
   no-follow descriptors. Catalog and lock mutations remain relative to that
   anchor even if the pathname changes, and lock cleanup removes only the inode
   created by the current coordinator.
-- Real Jina calls, credentials, configured `wsj-embeddings run` scopes,
-  licensed-corpus access, retries, resume, invalidation, and full reconciliation
-  are not implemented in ticket 01.
+- The explicit `wsj-embeddings pilot` is the only real Jina call surface. It
+  uses generated inputs only; configured `wsj-embeddings run` scopes,
+  licensed-corpus access, retry policy, resume, invalidation, and full
+  reconciliation remain unimplemented.
 - A multimodal job may combine Markdown with the source-relative
   `header_image_path`. It may independently choose whether to retrieve remote
   `inline_image_urls`; this pipeline never does so.
@@ -561,8 +566,9 @@ test files. This order follows one source from discovery to research query.
 
 For the tracer slice, read `wsj_embeddings/config.py`, `models.py`, and
 `adapters.py`; then `canonical_markdown.py`, `catalog.py`, and `pipeline.py`;
-finish with `validate.py`, `smoke.py`, `cli.py`, and the two embedding test
-files. This follows one generated canonical article into the separate catalog.
+finish with `validate.py`, `smoke.py`, `pilot.py`, `cli.py`, and the embedding
+test files. This follows one generated canonical article into the separate
+catalog and the separate generated hosted probe.
 
 ## 15. Glossary
 

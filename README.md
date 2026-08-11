@@ -12,13 +12,15 @@ embed, summarize, classify, download remote images, fetch market data,
 construct graphs, label events, or run trading research. Those jobs belong
 downstream.
 
-The repository also contains the first downstream article text embedding
-slice: `wsj-embeddings smoke` creates one generated canonical article in a
-temporary directory, encodes it with a deterministic fake adapter, publishes a
+The repository also contains a downstream article-text embedding slice.
+`wsj-embeddings smoke` creates one generated canonical article in a temporary
+directory, encodes it with a deterministic fake adapter, publishes a
 2,048-dimensional normalized `article_text` vector to a separate four-table
 DuckDB catalog, validates it, and removes the fixture. It never reads the
-configured archive or calls a network service. There is no
-`wsj-embeddings run` command and no real Jina adapter yet.
+configured archive or calls a network service. `wsj-embeddings pilot` is a
+separate, explicit hosted Jina v4 measurement command: it sends only fixed
+internally generated text and PNG bytes, never reads the archive or creates
+catalog/output state. There is still no `wsj-embeddings run` command.
 
 For the data model and maintenance guide, read the
 [architecture crash course](docs/architecture-crash-course.md).
@@ -71,11 +73,11 @@ smoke                     run the complete workflow on generated temporary fixtu
 Argument parsing, configuration, lock, schema, or unexpected pipeline errors
 can exit before a JSON summary is produced.
 
-The separate `wsj-embeddings` CLI currently has exactly one fixture-safe
-subcommand:
+The separate `wsj-embeddings` CLI has these two subcommands:
 
 ```text
 smoke  publish and validate one generated article text embedding
+pilot  send fixed generated text/image probes to hosted Jina v4
 ```
 
 It prints this deterministic, content-free result on success:
@@ -83,6 +85,20 @@ It prints this deterministic, content-free result on success:
 ```json
 {"articles": 1, "embeddings": 1, "validation_ok": true}
 ```
+
+`pilot` accepts no source, output, article, text, or file selector. It requires
+`JINA_API_KEY` in its environment, calls the fixed hosted adapter with
+`truncate: false`, and emits one deterministic content-free JSON record. The
+record includes the recorded OpenAPI observation, per-probe returned model,
+dimensions, raw-vector norms, usage, safe rate-limit headers, retry count, and
+the observed outcomes for nominal 8,192/32,768-unit text and 5/8 MB PNG
+boundaries. It may report a boundary as rejected; that is a measurement, not a
+silent truncation. Missing or rejected credentials return only a classified
+content-free error and create no catalog, output, or log artifact.
+
+Run a successful credentialed pilot before authorizing any future real-corpus
+embedding run. Automated tests never call the hosted API: they inject simulated
+HTTP responses into the same pilot/adapter seam.
 
 `wsj-embeddings` does not accept the preprocessing TOML configuration and has
 no configured-output or real-corpus command yet.
@@ -99,6 +115,17 @@ First prove the installation without touching the licensed archive:
 Both commands use generated temporary fixtures. The embedding smoke command
 also snapshots its generated preprocessing inputs and fails if the downstream
 coordinator changes them.
+
+After smoke, an operator who has a valid Jina credential may measure the hosted
+contract without transmitting licensed content:
+
+```bash
+.venv/bin/wsj-embeddings pilot
+```
+
+Keep `JINA_API_KEY` out of shell history, configuration files, command output,
+and committed artifacts. Review the pilot's JSON result before allowing any
+future corpus scope; this repository does not yet expose such a scope.
 
 Then inventory the configured archive without changing either source or
 generated state:
