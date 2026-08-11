@@ -31,7 +31,8 @@ and Markdown through one coordinator seam and publishes a separate embedding
 catalog. Smoke injects a deterministic fake adapter, while an explicit pilot
 sends only fixed in-memory generated text and PNG bytes through hosted Jina.
 The production command exposes only an affirmatively authorized positive limit
-of lexical article IDs; resume and full-corpus workflows remain unavailable.
+of lexical article IDs. Durable per-article checkpoints resume unchanged
+article-text work; full-corpus workflows remain unavailable.
 
 ```mermaid
 flowchart LR
@@ -119,7 +120,7 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/config.py` | resolved disjoint roots and explicit hosted-processing authorization | CLI configuration loading |
 | `wsj_embeddings/adapters.py` | injected adapter protocol, deterministic fake adapter, and fixed hosted Jina adapter | corpus selection or output mutation |
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
-| `wsj_embeddings/catalog.py` | separate schema version 1, exact read-only inspection, bounded publication transaction | preprocessing catalog mutation |
+| `wsj_embeddings/catalog.py` | separate schema version 2, exact read-only inspection, bounded checkpoint transactions | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection, text encoding, hashes, and publication | hosted credential loading |
 | `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
@@ -246,31 +247,34 @@ ORDER BY published_at_utc, article_id;
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 1 has exactly four base tables, no views, and
-no indexes. Every column is non-null.
+catalog. Embedding schema version 2 has exactly five base tables, no views, and
+no indexes. Only classified failure-detail columns are nullable. Version 1 and
+malformed output are refused without migration.
 
 | Table | Ordered columns and DuckDB types | Primary key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
 | `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR` | `configuration_id` |
-| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
+| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
+| `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 
 `configuration_id` is the SHA-256 of compact, key-sorted JSON for every
 `EmbeddingProfile` field: `model`, `task`, `dimensions`, `output_type`, and
-`normalization`. The current fake profile is a contract fixture, not a claim
-that the real Jina integration exists. `input_sha256` covers the exact UTF-8
-canonical Markdown bytes. After finite/nonzero checks and L2 normalization,
-values are rounded to float32; `stored_vector_sha256` covers their concatenated
-little-endian float32 representation. Only the exact modality `article_text`
-and dimension 2,048 are supported.
+`normalization`. `input_sha256` covers the exact UTF-8 canonical Markdown
+bytes. After finite/nonzero checks and L2 normalization, values are rounded to
+float32; `stored_vector_sha256` covers their concatenated little-endian float32
+representation. Work state is one of `queued`, `in_progress`, `succeeded`,
+`retryable`, `terminal`, or `interrupted`. Only the exact modality
+`article_text` and dimension 2,048 are supported.
 
-One bounded coordinator transaction upserts its configuration and article text
-embedding rows, then inserts a content-free `runs` row. A run row therefore
-claims completed vector publication for its configuration. Ticket-01
-validation compares the greatest claimed `embeddings` count per valid
-configuration with the currently published rows, which catches a deleted sole
-vector without assuming later resume or full-reconciliation semantics.
+The coordinator first commits content-free run and queued/recovered work state,
+then commits `in_progress` before each request. A validated vector insert,
+successful work transition, and run-count update share one bounded transaction.
+An interruption before that commit leaves requeueable work; an interruption
+after it reuses the proven success. Earlier article checkpoints therefore
+survive a later retryable, terminal, or interrupted attempt. Failure rows retain
+only stable adapter codes, numeric status/retry metadata, and attempt counts.
 
 The research query seam is:
 
@@ -473,14 +477,15 @@ reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
-embeddings. It checks the exact four-table embedding schema first, opens the
+embeddings. It checks the exact five-table embedding schema first, opens the
 preprocessing catalog through its public exact-schema contract, and reports
-stable sorted issues for configuration identity/reference failures, missing
-vectors claimed by completed runs, unsupported modality/dimension, orphaned
-canonical identities, publication mismatch, unsafe or missing canonical
-Markdown, input-hash mismatch, non-finite/zero/non-unit vectors, and float32
-vector-hash mismatch. Messages never contain Markdown, vector values, or
-credentials. Ticket 01 does not attempt repair, resume, or corpus-wide coverage.
+stable sorted issues for configuration identity/reference failures, malformed
+work lifecycle/failure checkpoints, missing vectors claimed by successful work,
+unsupported modality/dimension, orphaned canonical identities, publication
+mismatch, unsafe or missing canonical Markdown, input-hash mismatch,
+non-finite/zero/non-unit vectors, and float32 vector-hash mismatch. Messages
+never contain Markdown, vector values, or credentials. Validation detects but
+does not repair state.
 
 ## 11. Test map
 
@@ -551,8 +556,10 @@ orphan cleanup, and full-only missing-source reconciliation.
 - The explicit `wsj-embeddings pilot` sends generated probes only. The separate
   `wsj-embeddings run` is the licensed-content Jina call surface and remains
   limited-only: affirmative hosted-processing authorization and a positive
-  lexical article limit are mandatory. Retry policy, resume, invalidation, and
-  full reconciliation remain unimplemented.
+  lexical article limit are mandatory. Unchanged successful article text is
+  reused; retryable/interrupted work resumes and terminal work is not retried
+  implicitly. Broader input/configuration invalidation and full reconciliation
+  remain later boundaries.
 - A multimodal job may combine Markdown with the source-relative
   `header_image_path`. It may independently choose whether to retrieve remote
   `inline_image_urls`; this pipeline never does so.

@@ -14,6 +14,7 @@ class CanonicalArticle:
     cleaned_markdown_path: str
     published_at_utc: datetime
     publication_date_new_york: date
+    cleaned_markdown_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,12 @@ class EmbeddingRunResult:
 
     articles: int
     embeddings: int
+    reused: int = 0
+    attempted: int = 0
+    succeeded: int = 0
+    retryable: int = 0
+    terminal: int = 0
+    interrupted: int = 0
 
 
 @dataclass(frozen=True, slots=True)

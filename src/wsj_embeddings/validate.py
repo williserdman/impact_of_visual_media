@@ -20,7 +20,12 @@ from wsj_embeddings.catalog import (
 )
 from wsj_embeddings.config import EmbeddingPipelineConfig
 from wsj_embeddings.models import CanonicalArticle, EmbeddingProfile
-from wsj_embeddings.pipeline import _ARTICLE_TEXT_MODALITY, _VECTOR_DIMENSIONS
+from wsj_embeddings.pipeline import (
+    _ARTICLE_TEXT_MODALITY,
+    _SUCCEEDED,
+    _VECTOR_DIMENSIONS,
+    _WORK_STATES,
+)
 from wsj_pipeline.catalog import Catalog, CatalogError
 
 
@@ -56,6 +61,7 @@ def validate_embedding_outputs(
             if articles is not None:
                 _validate_configurations(catalog.connection, issues)
                 _validate_run_coverage(catalog.connection, issues)
+                _validate_work_items(catalog.connection, issues)
                 _validate_embeddings(catalog.connection, config, articles, issues)
     except EmbeddingCatalogError:
         issues.append(
@@ -86,7 +92,7 @@ def _canonical_articles(
             rows = db.execute(
                 """
                 SELECT article_id, cleaned_markdown_path, published_at_utc,
-                       publication_date_new_york
+                       publication_date_new_york, cleaned_markdown_sha256
                 FROM articles
                 """
             ).fetchall()
@@ -165,6 +171,81 @@ def _validate_run_coverage(
             "missing_published_embedding",
             "successful embedding runs lack their published vectors",
         )
+
+
+def _validate_work_items(
+    connection: duckdb.DuckDBPyConnection,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    embeddings = set(
+        connection.execute(
+            """
+            SELECT article_id, modality, configuration_id, input_sha256
+            FROM embeddings
+            """
+        ).fetchall()
+    )
+    rows = connection.execute(
+        """
+        SELECT article_id, modality, configuration_id, input_sha256, state,
+               attempt_count, error_code, status_code, retry_after_seconds
+        FROM embedding_work_items
+        """
+    ).fetchall()
+    for row in rows:
+        (
+            article_id,
+            modality,
+            configuration_identifier,
+            input_sha256,
+            state,
+            attempt_count,
+            error_code,
+            status_code,
+            retry_after_seconds,
+        ) = row
+        if state not in _WORK_STATES:
+            _append(
+                issues,
+                "invalid_work_state",
+                "embedding work items use an unsupported lifecycle state",
+            )
+            continue
+        has_matching_embedding = (
+            article_id,
+            modality,
+            configuration_identifier,
+            input_sha256,
+        ) in embeddings
+        if state == _SUCCEEDED and not has_matching_embedding:
+            _append(
+                issues,
+                "missing_published_embedding",
+                "successful embedding runs lack their published vectors",
+            )
+        elif state != _SUCCEEDED and has_matching_embedding:
+            _append(
+                issues,
+                "embedding_without_success_checkpoint",
+                "embedding rows lack a matching successful work checkpoint",
+            )
+        failure_metadata_present = any(
+            value is not None
+            for value in (error_code, status_code, retry_after_seconds)
+        )
+        if state in {"retryable", "terminal"}:
+            if error_code is None or attempt_count < 1:
+                _append(
+                    issues,
+                    "invalid_failure_checkpoint",
+                    "failed embedding work items lack stable attempt metadata",
+                )
+        elif failure_metadata_present:
+            _append(
+                issues,
+                "invalid_failure_checkpoint",
+                "non-failed embedding work items retain failure metadata",
+            )
 
 
 def _validate_embeddings(

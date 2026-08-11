@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from wsj_embeddings import (
     run_embedding_pipeline,
     validate_embedding_outputs,
 )
+from wsj_embeddings.adapters import JinaHostedAdapterError
 from wsj_embeddings.catalog import EmbeddingCatalog
 from wsj_embeddings.config import EmbeddingConfigError
 from wsj_embeddings.pipeline import (
@@ -50,7 +52,26 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("configuration_id", "VARCHAR", True, None, False),
         ("articles", "INTEGER", True, None, False),
         ("embeddings", "INTEGER", True, None, False),
+        ("reused", "INTEGER", True, None, False),
+        ("attempted", "INTEGER", True, None, False),
+        ("succeeded", "INTEGER", True, None, False),
+        ("retryable", "INTEGER", True, None, False),
+        ("terminal", "INTEGER", True, None, False),
+        ("interrupted", "INTEGER", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
+    "embedding_work_items": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("modality", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("input_sha256", "VARCHAR", True, None, False),
+        ("state", "VARCHAR", True, None, False),
+        ("attempt_count", "INTEGER", True, None, False),
+        ("error_code", "VARCHAR", False, None, False),
+        ("status_code", "INTEGER", False, None, False),
+        ("retry_after_seconds", "DOUBLE", False, None, False),
+        ("last_run_id", "VARCHAR", True, None, False),
+        ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "embeddings": (
         ("article_id", "VARCHAR", True, None, True),
@@ -68,6 +89,10 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     ("metadata", ("key",)),
     ("embedding_configurations", ("configuration_id",)),
     ("runs", ("run_id",)),
+    (
+        "embedding_work_items",
+        ("article_id", "modality", "configuration_id"),
+    ),
     ("embeddings", ("article_id", "modality", "configuration_id")),
 }
 
@@ -116,6 +141,61 @@ def snapshot_fixture_inputs(config: EmbeddingPipelineConfig) -> dict[str, str]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def add_generated_embedding_article(
+    config: EmbeddingPipelineConfig,
+    *,
+    article_id: str,
+    markdown: str,
+) -> None:
+    markdown_path = config.preprocessing_output_root / "text" / f"{article_id[-1]}.md"
+    markdown_path.write_text(markdown, encoding="utf-8")
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.replace_article(
+            ArticleRecord(
+                article_id=article_id,
+                source_html_path=f"synthetic/{article_id[-1]}.html",
+                cleaned_markdown_path=markdown_path.relative_to(
+                    config.preprocessing_output_root
+                ).as_posix(),
+                header_image_path=None,
+                inline_image_urls=(),
+                published_at_utc=datetime(2024, 1, 3, 15, 30, tzinfo=UTC),
+                publication_date_new_york=date(2024, 1, 3),
+                cleaned_markdown_sha256=hashlib.sha256(markdown.encode()).hexdigest(),
+            )
+        )
+
+
+class SyntheticInterruption(BaseException):
+    """Simulate abrupt process loss without entering operational error handling."""
+
+
+class InterruptingAdapter(FakeEmbeddingAdapter):
+    def __init__(self, *, after_response: bool) -> None:
+        self.after_response = after_response
+        self.calls = 0
+        self.responded = False
+
+    def embed_text(self, text: str) -> tuple[float, ...]:
+        self.calls += 1
+        if self.after_response:
+            super().embed_text(text)
+            self.responded = True
+        raise SyntheticInterruption
+
+
+class RecordingAdapter(FakeEmbeddingAdapter):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.responded = False
+
+    def embed_text(self, text: str) -> tuple[float, ...]:
+        self.calls += 1
+        vector = super().embed_text(text)
+        self.responded = True
+        return vector
 
 
 def test_config_rejects_truthy_non_boolean_hosted_processing_authorization(
@@ -183,7 +263,12 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
 
     result = run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
 
-    assert result == EmbeddingRunResult(articles=1, embeddings=1)
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=1,
+        succeeded=1,
+    )
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         row = db.execute(
             """
@@ -204,6 +289,268 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
     assert vector_type == "FLOAT[2048]"
     assert row[7] == (1.0,) + (0.0,) * 2047
     assert snapshot_fixture_inputs(config) == before
+
+
+def test_replaying_unchanged_success_reuses_checkpoint_without_adapter_call(tmp_path):
+    """Break caught: a limited replay purchases an already committed vector again."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    first_adapter = RecordingAdapter()
+    first = run_embedding_pipeline(config, first_adapter, limit=1)
+    replay_adapter = RecordingAdapter()
+
+    replay = run_embedding_pipeline(config, replay_adapter, limit=1)
+
+    assert first == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        reused=0,
+        attempted=1,
+        succeeded=1,
+        retryable=0,
+        terminal=0,
+        interrupted=0,
+    )
+    assert replay == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        reused=1,
+        attempted=0,
+        succeeded=0,
+        retryable=0,
+        terminal=0,
+        interrupted=0,
+    )
+    assert first_adapter.calls == 1
+    assert replay_adapter.calls == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (1,)
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code, status_code,
+                   retry_after_seconds
+            FROM embedding_work_items
+            """
+        ).fetchone() == ("succeeded", 1, None, None, None)
+
+
+@pytest.mark.parametrize(
+    "after_response",
+    (False, True),
+    ids=("before-request", "after-response"),
+)
+def test_restart_recovers_in_progress_work_after_adapter_interruption(
+    tmp_path,
+    after_response,
+):
+    """Break caught: interrupted in-progress work is lost or considered successful."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    interrupted_adapter = InterruptingAdapter(after_response=after_response)
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(config, interrupted_adapter, limit=1)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT state, attempt_count FROM embedding_work_items"
+        ).fetchone() == ("in_progress", 1)
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+
+    resumed_adapter = RecordingAdapter()
+    resumed = run_embedding_pipeline(config, resumed_adapter, limit=1)
+
+    assert resumed == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        reused=0,
+        attempted=1,
+        succeeded=1,
+        retryable=0,
+        terminal=0,
+        interrupted=1,
+    )
+    assert interrupted_adapter.calls == 1
+    assert resumed_adapter.calls == 1
+
+
+@pytest.mark.parametrize(
+    "commit_side",
+    ("before", "after"),
+    ids=("before-catalog-commit", "after-catalog-commit"),
+)
+def test_success_checkpoint_survives_interruptions_around_catalog_commit(
+    tmp_path,
+    monkeypatch,
+    commit_side,
+):
+    """Break caught: commit ordering loses a vector or marks success prematurely."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    adapter = RecordingAdapter()
+    real_transaction = EmbeddingCatalog.transaction
+    interrupted = False
+
+    @contextmanager
+    def interrupt_around_success_commit(catalog):
+        nonlocal interrupted
+        if commit_side == "before":
+            with real_transaction(catalog):
+                yield
+                if adapter.responded and not interrupted:
+                    interrupted = True
+                    raise SyntheticInterruption
+        else:
+            with real_transaction(catalog):
+                yield
+            if adapter.responded and not interrupted:
+                interrupted = True
+                raise SyntheticInterruption
+
+    monkeypatch.setattr(
+        EmbeddingCatalog,
+        "transaction",
+        interrupt_around_success_commit,
+    )
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(config, adapter, limit=1)
+    monkeypatch.setattr(EmbeddingCatalog, "transaction", real_transaction)
+
+    replay_adapter = RecordingAdapter()
+    resumed = run_embedding_pipeline(config, replay_adapter, limit=1)
+
+    assert interrupted
+    assert adapter.calls == 1
+    expected_reused = 1 if commit_side == "after" else 0
+    assert replay_adapter.calls == 1 - expected_reused
+    assert resumed.reused == expected_reused
+    assert resumed.succeeded == 1 - expected_reused
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (1,)
+        assert db.execute(
+            "SELECT state, attempt_count FROM embedding_work_items"
+        ).fetchone() == ("succeeded", 1 if commit_side == "after" else 2)
+
+
+def test_retryable_failure_can_succeed_after_an_earlier_checkpoint(tmp_path):
+    """Break caught: a later failure rolls back an earlier successful vector."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+
+    class FailSecondAdapter(RecordingAdapter):
+        def embed_text(self, text: str) -> tuple[float, ...]:
+            if self.calls == 0:
+                return super().embed_text(text)
+            self.calls += 1
+            raise JinaHostedAdapterError(
+                "rate_limit",
+                retryable=True,
+                status_code=429,
+                retry_after_seconds=2.0,
+            )
+
+    first_adapter = FailSecondAdapter()
+    with pytest.raises(JinaHostedAdapterError, match="rate_limit"):
+        run_embedding_pipeline(config, first_adapter, limit=2)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT article_id FROM embeddings ORDER BY article_id"
+        ).fetchall() == [("wsj:SYNTHETIC-EMBEDDING",)]
+        assert db.execute(
+            """
+            SELECT article_id, state, attempt_count, error_code, status_code,
+                   retry_after_seconds
+            FROM embedding_work_items
+            ORDER BY article_id
+            """
+        ).fetchall() == [
+            (
+                "wsj:SYNTHETIC-EMBEDDING",
+                "succeeded",
+                1,
+                None,
+                None,
+                None,
+            ),
+            (
+                "wsj:ZZZ-SYNTHETIC-EMBEDDING",
+                "retryable",
+                1,
+                "rate_limit",
+                429,
+                2.0,
+            ),
+        ]
+        assert db.execute(
+            """
+            SELECT articles, embeddings, reused, attempted, succeeded,
+                   retryable, terminal, interrupted
+            FROM runs
+            """
+        ).fetchone() == (2, 1, 0, 2, 1, 1, 0, 0)
+
+    resumed_adapter = RecordingAdapter()
+    resumed = run_embedding_pipeline(config, resumed_adapter, limit=2)
+
+    assert resumed == EmbeddingRunResult(
+        articles=2,
+        embeddings=1,
+        reused=1,
+        attempted=1,
+        succeeded=1,
+        retryable=0,
+        terminal=0,
+        interrupted=0,
+    )
+    assert resumed_adapter.calls == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (2,)
+
+
+def test_terminal_failure_is_visible_and_not_retried_implicitly(tmp_path):
+    """Break caught: a deterministic hosted rejection is silently retried."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class TerminalAdapter(FakeEmbeddingAdapter):
+        def embed_text(self, text: str) -> tuple[float, ...]:
+            raise JinaHostedAdapterError(
+                "deterministic_request",
+                retryable=False,
+                status_code=413,
+            )
+
+    with pytest.raises(JinaHostedAdapterError, match="deterministic_request"):
+        run_embedding_pipeline(config, TerminalAdapter(), limit=1)
+
+    replay_adapter = RecordingAdapter()
+    replay = run_embedding_pipeline(config, replay_adapter, limit=1)
+
+    assert replay == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        reused=0,
+        attempted=0,
+        succeeded=0,
+        retryable=0,
+        terminal=1,
+        interrupted=0,
+    )
+    assert replay_adapter.calls == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code, status_code,
+                   retry_after_seconds
+            FROM embedding_work_items
+            """
+        ).fetchone() == ("terminal", 1, "deterministic_request", 413, None)
 
 
 def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_path):
@@ -238,7 +585,11 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
 
     result = run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
 
-    assert result == EmbeddingRunResult(articles=1, embeddings=1)
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        reused=1,
+    )
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         article_ids = db.execute(
             "SELECT article_id FROM embeddings ORDER BY article_id"
@@ -249,7 +600,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_one_schema(tmp_path):
+def test_embedding_catalog_has_exact_version_two_checkpoint_schema(tmp_path):
     database_path = tmp_path / "catalog.duckdb"
 
     with EmbeddingCatalog.open(database_path):
@@ -317,6 +668,7 @@ def test_embedding_catalog_has_exact_version_one_schema(tmp_path):
     )
     assert table_types == {
         "embedding_configurations": "BASE TABLE",
+        "embedding_work_items": "BASE TABLE",
         "embeddings": "BASE TABLE",
         "metadata": "BASE TABLE",
         "runs": "BASE TABLE",
@@ -324,7 +676,30 @@ def test_embedding_catalog_has_exact_version_one_schema(tmp_path):
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "1")]
+    assert metadata == [("schema_version", "2")]
+
+
+def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
+    """Break caught: opening old derived output silently upgrades it in place."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "CREATE TABLE metadata (key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL)"
+        )
+        db.execute("INSERT INTO metadata VALUES ('schema_version', '1')")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SHOW TABLES").fetchall() == [("metadata",)]
+        assert db.execute("SELECT * FROM metadata").fetchall() == [
+            ("schema_version", "1")
+        ]
 
 
 def test_validator_accepts_fresh_synthetic_embedding_output(tmp_path):
@@ -346,6 +721,26 @@ def test_validator_reports_missing_vector_claimed_by_successful_run(tmp_path):
             EmbeddingValidationIssue(
                 "missing_published_embedding",
                 "successful embedding runs lack their published vectors",
+            ),
+        )
+    )
+
+
+def test_validator_reports_invalid_durable_work_state(tmp_path):
+    """Break caught: corrupted checkpoint state is accepted as valid output."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(
+            "UPDATE embedding_work_items SET state = 'synthetic_invalid'"
+        )
+
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "invalid_work_state",
+                "embedding work items use an unsupported lifecycle state",
             ),
         )
     )
@@ -812,9 +1207,13 @@ def test_validator_checks_intrinsic_properties_for_orphaned_embedding_rows(tmp_p
                 "invalid_modality",
                 "embedding rows use an unsupported modality",
             ),
-            EmbeddingValidationIssue(
-                "missing_canonical_article",
-                "embedding rows lack a canonical article",
-            ),
+                EmbeddingValidationIssue(
+                    "missing_canonical_article",
+                    "embedding rows lack a canonical article",
+                ),
+                EmbeddingValidationIssue(
+                    "missing_published_embedding",
+                    "successful embedding runs lack their published vectors",
+                ),
+            )
         )
-    )

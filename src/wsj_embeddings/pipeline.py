@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import duckdb
 
-from wsj_embeddings.adapters import EmbeddingAdapter
+from wsj_embeddings.adapters import EmbeddingAdapter, JinaHostedAdapterError
 from wsj_embeddings.canonical_markdown import (
     CanonicalMarkdownError,
     read_canonical_markdown,
@@ -24,12 +24,35 @@ from wsj_embeddings.config import EmbeddingPipelineConfig
 from wsj_embeddings.models import (
     CanonicalArticle,
     EmbeddingInventoryResult,
+    EmbeddingProfile,
     EmbeddingRunResult,
 )
 from wsj_pipeline.catalog import Catalog, CatalogError
 
 _ARTICLE_TEXT_MODALITY = "article_text"
 _VECTOR_DIMENSIONS = 2048
+_QUEUED = "queued"
+_IN_PROGRESS = "in_progress"
+_SUCCEEDED = "succeeded"
+_RETRYABLE = "retryable"
+_TERMINAL = "terminal"
+_INTERRUPTED = "interrupted"
+_WORK_STATES = {
+    _QUEUED,
+    _IN_PROGRESS,
+    _SUCCEEDED,
+    _RETRYABLE,
+    _TERMINAL,
+    _INTERRUPTED,
+}
+_RUN_COUNT_COLUMNS = {
+    "reused",
+    "attempted",
+    "succeeded",
+    "retryable",
+    "terminal",
+    "interrupted",
+}
 
 
 class EmbeddingPipelineError(RuntimeError):
@@ -173,70 +196,293 @@ def run_embedding_pipeline(
     if profile.dimensions != _VECTOR_DIMENSIONS:
         raise ValueError("adapter profile dimensions must be 2048")
     articles = _read_articles(config, limit)
-    prepared = tuple(
-        _prepare_embedding(config, adapter, article) for article in articles
-    )
     configuration_identifier = configuration_id(profile)
+    run_id = str(uuid4())
     with (
         embedding_pipeline_lock(config.embedding_lock_path) as output_descriptor,
         EmbeddingCatalog.open_in(output_descriptor) as catalog,
-        catalog.transaction(),
     ):
-        if not prepared:
-            return EmbeddingRunResult(articles=0, embeddings=0)
-        catalog.connection.execute(
-            """
-            INSERT INTO embedding_configurations
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT (configuration_id) DO NOTHING
-            """,
-            [
+        with catalog.transaction():
+            _begin_run(
+                catalog,
+                run_id,
                 configuration_identifier,
-                profile.model,
-                profile.task,
-                profile.dimensions,
-                profile.output_type,
-                profile.normalization,
-            ],
-        )
-        for article, input_sha256, vector_hash, vector in prepared:
-            catalog.connection.execute(
-                """
-                INSERT INTO embeddings
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (article_id, modality, configuration_id)
-                DO UPDATE SET
-                    published_at_utc = excluded.published_at_utc,
-                    publication_date_new_york = excluded.publication_date_new_york,
-                    dimensions = excluded.dimensions,
-                    input_sha256 = excluded.input_sha256,
-                    stored_vector_sha256 = excluded.stored_vector_sha256,
-                    vector = excluded.vector
-                """,
-                [
-                    article.article_id,
-                    _ARTICLE_TEXT_MODALITY,
-                    configuration_identifier,
-                    article.published_at_utc,
-                    article.publication_date_new_york,
-                    profile.dimensions,
-                    input_sha256,
-                    vector_hash,
-                    list(vector),
-                ],
+                profile,
+                articles,
             )
+        for article in articles:
+            state = _work_state(catalog, article, configuration_identifier)
+            if state == _SUCCEEDED:
+                with catalog.transaction():
+                    _increment_run(catalog, run_id, "reused")
+                continue
+            if state == _TERMINAL:
+                with catalog.transaction():
+                    _increment_run(catalog, run_id, "terminal")
+                continue
+            with catalog.transaction():
+                catalog.connection.execute(
+                    """
+                    UPDATE embedding_work_items
+                    SET state = ?, attempt_count = attempt_count + 1,
+                        error_code = NULL, status_code = NULL,
+                        retry_after_seconds = NULL, last_run_id = ?,
+                        updated_at = current_timestamp
+                    WHERE article_id = ? AND modality = ?
+                      AND configuration_id = ?
+                    """,
+                    [
+                        _IN_PROGRESS,
+                        run_id,
+                        article.article_id,
+                        _ARTICLE_TEXT_MODALITY,
+                        configuration_identifier,
+                    ],
+                )
+                _increment_run(catalog, run_id, "attempted")
+            try:
+                input_sha256, vector_hash, vector = _prepare_embedding(
+                    config,
+                    adapter,
+                    article,
+                )
+            except JinaHostedAdapterError as error:
+                failure_state = _RETRYABLE if error.retryable else _TERMINAL
+                with catalog.transaction():
+                    catalog.connection.execute(
+                        """
+                        UPDATE embedding_work_items
+                        SET state = ?, error_code = ?, status_code = ?,
+                            retry_after_seconds = ?, last_run_id = ?,
+                            updated_at = current_timestamp
+                        WHERE article_id = ? AND modality = ?
+                          AND configuration_id = ?
+                        """,
+                        [
+                            failure_state,
+                            error.code,
+                            error.status_code,
+                            error.retry_after_seconds,
+                            run_id,
+                            article.article_id,
+                            _ARTICLE_TEXT_MODALITY,
+                            configuration_identifier,
+                        ],
+                    )
+                    _increment_run(catalog, run_id, failure_state)
+                raise
+            with catalog.transaction():
+                catalog.connection.execute(
+                    """
+                    INSERT INTO embeddings
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (article_id, modality, configuration_id)
+                    DO UPDATE SET
+                        published_at_utc = excluded.published_at_utc,
+                        publication_date_new_york =
+                            excluded.publication_date_new_york,
+                        dimensions = excluded.dimensions,
+                        input_sha256 = excluded.input_sha256,
+                        stored_vector_sha256 = excluded.stored_vector_sha256,
+                        vector = excluded.vector
+                    """,
+                    [
+                        article.article_id,
+                        _ARTICLE_TEXT_MODALITY,
+                        configuration_identifier,
+                        article.published_at_utc,
+                        article.publication_date_new_york,
+                        profile.dimensions,
+                        input_sha256,
+                        vector_hash,
+                        list(vector),
+                    ],
+                )
+                catalog.connection.execute(
+                    """
+                    UPDATE embedding_work_items
+                    SET state = ?, input_sha256 = ?, error_code = NULL,
+                        status_code = NULL, retry_after_seconds = NULL,
+                        last_run_id = ?, updated_at = current_timestamp
+                    WHERE article_id = ? AND modality = ?
+                      AND configuration_id = ?
+                    """,
+                    [
+                        _SUCCEEDED,
+                        input_sha256,
+                        run_id,
+                        article.article_id,
+                        _ARTICLE_TEXT_MODALITY,
+                        configuration_identifier,
+                    ],
+                )
+                catalog.connection.execute(
+                    """
+                    UPDATE runs
+                    SET embeddings = embeddings + 1,
+                        succeeded = succeeded + 1
+                    WHERE run_id = ?
+                    """,
+                    [run_id],
+                )
+        row = catalog.connection.execute(
+            """
+            SELECT articles, embeddings, reused, attempted, succeeded,
+                   retryable, terminal, interrupted
+            FROM runs
+            WHERE run_id = ?
+            """,
+            [run_id],
+        ).fetchone()
+    assert row is not None
+    return EmbeddingRunResult(*(int(value) for value in row))
+
+
+def _begin_run(
+    catalog: EmbeddingCatalog,
+    run_id: str,
+    configuration_identifier: str,
+    profile: EmbeddingProfile,
+    articles: tuple[CanonicalArticle, ...],
+) -> None:
+    catalog.connection.execute(
+        """
+        INSERT INTO embedding_configurations
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (configuration_id) DO NOTHING
+        """,
+        [
+            configuration_identifier,
+            profile.model,
+            profile.task,
+            profile.dimensions,
+            profile.output_type,
+            profile.normalization,
+        ],
+    )
+    catalog.connection.execute(
+        """
+        INSERT INTO runs (
+            run_id, configuration_id, articles, embeddings, reused,
+            attempted, succeeded, retryable, terminal, interrupted, started_at
+        )
+        VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, current_timestamp)
+        """,
+        [run_id, configuration_identifier, len(articles)],
+    )
+    for article in articles:
+        _register_work(catalog, run_id, configuration_identifier, article)
+
+
+def _register_work(
+    catalog: EmbeddingCatalog,
+    run_id: str,
+    configuration_identifier: str,
+    article: CanonicalArticle,
+) -> None:
+    row = catalog.connection.execute(
+        """
+        SELECT state, input_sha256
+        FROM embedding_work_items
+        WHERE article_id = ? AND modality = ? AND configuration_id = ?
+        """,
+        [article.article_id, _ARTICLE_TEXT_MODALITY, configuration_identifier],
+    ).fetchone()
+    if row is None:
         catalog.connection.execute(
             """
-            INSERT INTO runs VALUES (?, ?, ?, ?, current_timestamp)
+            INSERT INTO embedding_work_items
+            VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, current_timestamp)
             """,
             [
-                str(uuid4()),
+                article.article_id,
+                _ARTICLE_TEXT_MODALITY,
                 configuration_identifier,
-                len(prepared),
-                len(prepared),
+                article.cleaned_markdown_sha256,
+                _QUEUED,
+                run_id,
             ],
         )
-    return EmbeddingRunResult(articles=len(prepared), embeddings=len(prepared))
+        return
+    state, input_sha256 = row
+    if state not in _WORK_STATES:
+        raise EmbeddingPipelineError("invalid_work_state", article.article_id)
+    if input_sha256 != article.cleaned_markdown_sha256:
+        catalog.connection.execute(
+            """
+            UPDATE embedding_work_items
+            SET input_sha256 = ?, state = ?, attempt_count = 0,
+                error_code = NULL, status_code = NULL,
+                retry_after_seconds = NULL, last_run_id = ?,
+                updated_at = current_timestamp
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                article.cleaned_markdown_sha256,
+                _QUEUED,
+                run_id,
+                article.article_id,
+                _ARTICLE_TEXT_MODALITY,
+                configuration_identifier,
+            ],
+        )
+        return
+    proven_success = state == _SUCCEEDED and catalog.connection.execute(
+        """
+        SELECT count(*)
+        FROM embeddings
+        WHERE article_id = ? AND modality = ? AND configuration_id = ?
+          AND input_sha256 = ?
+        """,
+        [
+            article.article_id,
+            _ARTICLE_TEXT_MODALITY,
+            configuration_identifier,
+            article.cleaned_markdown_sha256,
+        ],
+    ).fetchone()[0]
+    if state == _IN_PROGRESS or (state == _SUCCEEDED and not proven_success):
+        catalog.connection.execute(
+            """
+            UPDATE embedding_work_items
+            SET state = ?, last_run_id = ?, updated_at = current_timestamp
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+            """,
+            [
+                _INTERRUPTED,
+                run_id,
+                article.article_id,
+                _ARTICLE_TEXT_MODALITY,
+                configuration_identifier,
+            ],
+        )
+        _increment_run(catalog, run_id, "interrupted")
+
+
+def _work_state(
+    catalog: EmbeddingCatalog,
+    article: CanonicalArticle,
+    configuration_identifier: str,
+) -> str:
+    row = catalog.connection.execute(
+        """
+        SELECT state
+        FROM embedding_work_items
+        WHERE article_id = ? AND modality = ? AND configuration_id = ?
+        """,
+        [article.article_id, _ARTICLE_TEXT_MODALITY, configuration_identifier],
+    ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+def _increment_run(catalog: EmbeddingCatalog, run_id: str, column: str) -> None:
+    if column not in _RUN_COUNT_COLUMNS:
+        raise AssertionError("unsupported run count")
+    catalog.connection.execute(
+        f"UPDATE runs SET {column} = {column} + 1 WHERE run_id = ?",
+        [run_id],
+    )
 
 
 def inventory_embedding_articles(
@@ -273,7 +519,7 @@ def _read_articles(
             rows = db.execute(
                 """
                 SELECT article_id, cleaned_markdown_path, published_at_utc,
-                       publication_date_new_york
+                       publication_date_new_york, cleaned_markdown_sha256
                 FROM articles
                 ORDER BY article_id
                 LIMIT ?
@@ -289,7 +535,7 @@ def _prepare_embedding(
     config: EmbeddingPipelineConfig,
     adapter: EmbeddingAdapter,
     article: CanonicalArticle,
-) -> tuple[CanonicalArticle, str, str, tuple[float, ...]]:
+) -> tuple[str, str, tuple[float, ...]]:
     try:
         markdown_bytes = read_canonical_markdown(
             config.preprocessing_output_root,
@@ -305,9 +551,13 @@ def _prepare_embedding(
     embedded = adapter.embed_text(markdown)
     vector = _normalized_vector(embedded, article.article_id)
     packed = b"".join(struct.pack("<f", value) for value in vector)
-    return article, hashlib.sha256(markdown_bytes).hexdigest(), hashlib.sha256(
-        packed
-    ).hexdigest(), vector
+    return (
+        hashlib.sha256(markdown_bytes).hexdigest(),
+        hashlib.sha256(packed).hexdigest(),
+        vector,
+    )
+
+
 def _normalized_vector(
     values: tuple[float, ...],
     article_id: str,

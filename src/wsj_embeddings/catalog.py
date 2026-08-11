@@ -17,10 +17,11 @@ import duckdb
 
 from wsj_embeddings.models import EmbeddingProfile
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "1"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "2"
 
 _EMBEDDING_CATALOG_TABLES = {
     "embedding_configurations",
+    "embedding_work_items",
     "embeddings",
     "metadata",
     "runs",
@@ -43,7 +44,26 @@ _TABLE_COLUMNS = {
         ("configuration_id", "VARCHAR", True, None, False),
         ("articles", "INTEGER", True, None, False),
         ("embeddings", "INTEGER", True, None, False),
+        ("reused", "INTEGER", True, None, False),
+        ("attempted", "INTEGER", True, None, False),
+        ("succeeded", "INTEGER", True, None, False),
+        ("retryable", "INTEGER", True, None, False),
+        ("terminal", "INTEGER", True, None, False),
+        ("interrupted", "INTEGER", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
+    "embedding_work_items": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("modality", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("input_sha256", "VARCHAR", True, None, False),
+        ("state", "VARCHAR", True, None, False),
+        ("attempt_count", "INTEGER", True, None, False),
+        ("error_code", "VARCHAR", False, None, False),
+        ("status_code", "INTEGER", False, None, False),
+        ("retry_after_seconds", "DOUBLE", False, None, False),
+        ("last_run_id", "VARCHAR", True, None, False),
+        ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "embeddings": (
         ("article_id", "VARCHAR", True, None, True),
@@ -61,6 +81,11 @@ _KEY_CONSTRAINTS = {
     ("metadata", "PRIMARY KEY", ("key",)),
     ("embedding_configurations", "PRIMARY KEY", ("configuration_id",)),
     ("runs", "PRIMARY KEY", ("run_id",)),
+    (
+        "embedding_work_items",
+        "PRIMARY KEY",
+        ("article_id", "modality", "configuration_id"),
+    ),
     (
         "embeddings",
         "PRIMARY KEY",
@@ -455,7 +480,31 @@ class EmbeddingCatalog:
                     configuration_id VARCHAR NOT NULL,
                     articles INTEGER NOT NULL,
                     embeddings INTEGER NOT NULL,
+                    reused INTEGER NOT NULL,
+                    attempted INTEGER NOT NULL,
+                    succeeded INTEGER NOT NULL,
+                    retryable INTEGER NOT NULL,
+                    terminal INTEGER NOT NULL,
+                    interrupted INTEGER NOT NULL,
                     started_at TIMESTAMP WITH TIME ZONE NOT NULL
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embedding_work_items (
+                    article_id VARCHAR NOT NULL,
+                    modality VARCHAR NOT NULL,
+                    configuration_id VARCHAR NOT NULL,
+                    input_sha256 VARCHAR NOT NULL,
+                    state VARCHAR NOT NULL,
+                    attempt_count INTEGER NOT NULL,
+                    error_code VARCHAR,
+                    status_code INTEGER,
+                    retry_after_seconds DOUBLE,
+                    last_run_id VARCHAR NOT NULL,
+                    updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    PRIMARY KEY (article_id, modality, configuration_id)
                 )
                 """
             )

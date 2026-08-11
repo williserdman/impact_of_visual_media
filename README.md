@@ -15,7 +15,7 @@ downstream.
 The repository also contains a downstream article-text embedding slice.
 `wsj-embeddings smoke` creates one generated canonical article in a temporary
 directory, encodes it with a deterministic fake adapter, publishes a
-2,048-dimensional normalized `article_text` vector to a separate four-table
+2,048-dimensional normalized `article_text` vector to a separate five-table
 DuckDB catalog, validates it, and removes the fixture. It never reads the
 configured archive or calls a network service. `wsj-embeddings pilot` is a
 separate, explicit hosted Jina v4 measurement command: it sends only fixed
@@ -157,8 +157,13 @@ limit and the separate `--authorize-hosted-processing` assertion. A configured
 ```
 
 The run sends each selected canonical Markdown artifact in full with hosted
-truncation disabled. Limited runs upsert only selected article-text embeddings
-and never infer removal outside the selected scope.
+truncation disabled. Each validated vector and its successful work checkpoint
+commit before the next article is attempted. Replaying the same limit reuses
+unchanged successes without another hosted request; retryable failures and
+interrupted in-progress work are attempted again, while terminal failures stay
+visible and are not retried implicitly. Limited runs never infer removal
+outside the selected scope. Success JSON includes content-free `reused`,
+`attempted`, `succeeded`, `retryable`, `terminal`, and `interrupted` counts.
 
 Then inventory the configured archive without changing either source or
 generated state:
@@ -250,25 +255,32 @@ references only; the pipeline never downloads them.
 
 ## Article text embedding catalog contract
 
-The downstream catalog is a separate schema-version-1 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-2 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted, limit-only production CLI.
+Version 1 output is refused without migration; move reproducible derived output
+aside or choose a fresh embedding output root.
 
-The catalog has exactly four base tables and no indexes:
+The catalog has exactly five base tables and no indexes:
 
 | Table | Ordered columns | Key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
 | `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR` | `configuration_id` |
-| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
+| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
+| `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 
-Every column is non-null. `configuration_id` is the SHA-256 of canonical JSON
-covering every adapter-profile field. `input_sha256` hashes the exact canonical
-Markdown bytes. `stored_vector_sha256` hashes the normalized vector encoded as
-little-endian float32 values. The current modality is exactly `article_text`;
-vectors must be finite, nonzero, L2-normalized, and exactly 2,048-dimensional.
+Only the three failure-detail columns are nullable; they retain classified
+codes and numeric response/retry metadata, never exception text or editorial
+content. Work states are `queued`, `in_progress`, `succeeded`, `retryable`,
+`terminal`, and `interrupted`. `configuration_id` is the SHA-256 of canonical
+JSON covering every adapter-profile field. `input_sha256` hashes the exact
+canonical Markdown bytes. `stored_vector_sha256` hashes the normalized vector
+encoded as little-endian float32 values. The current modality is exactly
+`article_text`; vectors must be finite, nonzero, L2-normalized, and exactly
+2,048-dimensional.
 
 A retained catalog can be queried without joining back to article bodies:
 

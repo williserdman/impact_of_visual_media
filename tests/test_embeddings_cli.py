@@ -193,7 +193,16 @@ def test_authorized_limited_run_embeds_complete_lexical_winner_with_fake(
     line = capsys.readouterr().out
 
     assert exit_code == 0
-    assert json.loads(line) == {"articles": 1, "embeddings": 1}
+    assert json.loads(line) == {
+        "articles": 1,
+        "attempted": 1,
+        "embeddings": 1,
+        "interrupted": 0,
+        "retryable": 0,
+        "reused": 0,
+        "succeeded": 1,
+        "terminal": 0,
+    }
     assert line == f"{json.dumps(json.loads(line), sort_keys=True)}\n"
     assert adapter.texts == ["# Complete A\n\nFirst paragraph.\n"]
     with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
@@ -336,7 +345,27 @@ def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
         "Complete A",
     ):
         assert forbidden not in captured.out
-    assert not roots[2].exists()
+    expected_state = "retryable" if failure in {"timeout", "rate"} else "terminal"
+    expected_status = (
+        None if failure == "timeout" else (429 if failure == "rate" else 413)
+    )
+    with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code, status_code
+            FROM embedding_work_items
+            """
+        ).fetchone() == (expected_state, 1, expected_code, expected_status)
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+    assert not (roots[2] / "pipeline.lock").exists()
+    catalog_bytes = (roots[2] / "catalog.duckdb").read_bytes()
+    for forbidden in (
+        b"credential-secret",
+        b"transport-secret",
+        b"response-body-secret",
+        b"Complete A",
+    ):
+        assert forbidden not in catalog_bytes
 
 
 def test_run_reports_existing_lock_without_removing_or_disclosing_it(
@@ -461,7 +490,12 @@ def test_run_reports_pipeline_failure_without_article_identity_or_path(
     assert captured.err == ""
     for forbidden in (str(tmp_path), "wsj:A", "article-1.md", "Complete A"):
         assert forbidden not in captured.out
-    assert not roots[2].exists()
+    with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
+        assert db.execute(
+            "SELECT state, attempt_count FROM embedding_work_items"
+        ).fetchone() == ("in_progress", 1)
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+    assert not (roots[2] / "pipeline.lock").exists()
 
 
 def test_run_does_not_swallow_programmer_error_from_constructed_adapter(
