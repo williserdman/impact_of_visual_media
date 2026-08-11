@@ -175,7 +175,9 @@ hosted request; when input changes, the mismatched vector is removed atomically
 with checkpoint invalidation before replacement is attempted. Any existing
 same-article/configuration multimodal dependent is archived, removed, and
 requeued in that transaction; the other source modality, other articles, and
-other configurations remain unchanged. A missing declared local header records
+other configurations remain unchanged. A successful source checkpoint whose
+active vector is missing likewise invalidates its composite before recovery is
+attempted. A missing declared local header records
 a retryable, content-free image disposition without failing or regenerating
 successful text. Provider/transport retryable failures and interrupted image
 work are attempted again. Deterministic image-request rejection is attempted at
@@ -360,8 +362,11 @@ Embedding validation opens both catalogs read-only, checks exact schemas before
 data, links each vector to a canonical `articles` row, rehashes canonical
 Markdown and local header images through no-follow descriptors, checks
 publication metadata and both hashes, and verifies that successful run counts
-still have active or superseded generations. It resolves immutable composite
-source linkage and recomputes each active equal-weight normalized midpoint.
+exactly match the active or superseded generations that name that run as their
+immutable generator. It requires provenance for every active and superseded
+composite, re-derives its content-free input identity, resolves both source
+links, and recomputes each active equal-weight normalized midpoint. An
+impossible midpoint is reported rather than skipped.
 It emits stable issues without article text or vector values, including
 distinct missing, queued, in-progress, interrupted, retryable, and terminal
 header-image dispositions; a true no-header `not_applicable` row is valid and

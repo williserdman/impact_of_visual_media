@@ -564,18 +564,13 @@ def _publish_multimodal_article(
         article.article_id,
     )
     vector = _multimodal_vector(text_vector, image_vector, article.article_id)
-    provenance_payload = json.dumps(
-        {
-            "formula_version": formula_version,
-            "header_image_generation_run_id": str(image_generation_run_id),
-            "header_image_stored_vector_sha256": str(image_vector_sha256),
-            "text_generation_run_id": str(text_generation_run_id),
-            "text_stored_vector_sha256": str(text_vector_sha256),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()
-    input_sha256 = hashlib.sha256(provenance_payload).hexdigest()
+    input_sha256 = _multimodal_input_sha256(
+        formula_version=formula_version,
+        text_generation_run_id=str(text_generation_run_id),
+        text_stored_vector_sha256=str(text_vector_sha256),
+        header_image_generation_run_id=str(image_generation_run_id),
+        header_image_stored_vector_sha256=str(image_vector_sha256),
+    )
     try:
         state = catalog.register_work(
             run_id=run_id,
@@ -636,6 +631,32 @@ def _publish_multimodal_article(
         header_image_stored_vector_sha256=str(image_vector_sha256),
         formula_version=formula_version,
     )
+
+
+def _multimodal_input_sha256(
+    *,
+    formula_version: str,
+    text_generation_run_id: str,
+    text_stored_vector_sha256: str,
+    header_image_generation_run_id: str,
+    header_image_stored_vector_sha256: str,
+) -> str:
+    """Hash the complete content-free identity for one derived generation."""
+
+    provenance_payload = json.dumps(
+        {
+            "formula_version": formula_version,
+            "header_image_generation_run_id": header_image_generation_run_id,
+            "header_image_stored_vector_sha256": (
+                header_image_stored_vector_sha256
+            ),
+            "text_generation_run_id": text_generation_run_id,
+            "text_stored_vector_sha256": text_stored_vector_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(provenance_payload).hexdigest()
 
 
 def _verified_source_vector(

@@ -134,3 +134,99 @@ full-corpus operation was used. No full repository test suite was run.
 None. The shared virtual environment's installed console script is not linked
 to this worktree, so smoke and live help were verified against worktree source
 with `PYTHONPATH=src`. No machine configuration changed.
+
+## Fix round 1: exact run ownership and complete composite validation
+
+### Review findings addressed
+
+- Run publication coverage is now exact per `(configuration_id, run_id)`.
+  Every run's `embeddings` claim must equal the surviving active plus archived
+  generations whose immutable `generation_run_id` names that run; another run's
+  generations cannot hide deletion.
+- Validation inventories every active and archived multimodal generation first,
+  then requires exactly keyed provenance. It recomputes the content-free input
+  SHA-256 from formula, source generation IDs, and source vector hashes for both
+  active and historical composites. Retargeting provenance to a real same-hash
+  generation is therefore detected.
+- Registration of a successful source checkpoint with no matching active vector
+  archives/removes its dependent composite before marking the source interrupted
+  and attempting regeneration. A later retryable source failure cannot leave
+  the old composite queryable.
+- An invalid source vector or impossible normalized midpoint now emits stable
+  `multimodal_recomputation_failed` validation instead of being silently
+  skipped.
+- Schema remains version 7: no table, column, type, constraint, or index changed.
+
+### RED and GREEN
+
+The five focused generated fixtures covered the four findings, with provenance
+split into missing-history and same-hash-retarget cases:
+
+```bash
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_pipeline.py \
+  -k 'another_runs_generation or archived_composite_generation or archived_composite_input_identity or missing_source_vector_invalidates or antipodal_multimodal'
+```
+
+Observed RED: `5 failed, 102 deselected in 25.24s`. Configuration-level totals
+masked a lost first-run generation; deleted historical provenance was invisible;
+retargeted same-hash provenance retained valid forward links; failed source
+recovery left the composite active; and antipodal sources were silently skipped.
+
+After the four narrow implementation changes, the identical selection observed
+GREEN: `5 passed, 102 deselected in 24.82s`.
+
+The affected prior multimodal, supersession, configuration, run-coverage, and
+history fixtures then observed `16 passed, 91 deselected in 99.31s`.
+
+### Fix-round final verification
+
+```bash
+/home/willis/projects/finance_wsj/.venv/bin/python -m pytest -q \
+  tests/test_embeddings_pipeline.py \
+  -k 'another_runs_generation or archived_composite_generation or archived_composite_input_identity or missing_source_vector_invalidates or antipodal_multimodal or all_three_modalities or composite_only_recovery or recomputes_composite_and_checks or changed_header_bytes or removed_canonical_header or text_supersession or missing_vector_claimed or validator_accepts_fresh or malformed_generation or explicit_reprocess or changed_configuration'
+/home/willis/projects/finance_wsj/.venv/bin/ruff check \
+  src/wsj_embeddings/catalog.py src/wsj_embeddings/pipeline.py \
+  src/wsj_embeddings/validate.py tests/test_embeddings_pipeline.py
+PYTHONPATH=src /home/willis/projects/finance_wsj/.venv/bin/python \
+  -m wsj_embeddings smoke
+PYTHONPATH=src /home/willis/projects/finance_wsj/.venv/bin/python \
+  -m wsj_embeddings run --help
+git diff --check
+git ls-files | rg '^(data|artifacts|outputs)/'
+```
+
+Observed:
+
+- combined affected selection: `21 passed, 86 deselected in 162.94s`;
+- changed Python Ruff: `All checks passed!`;
+- generated smoke:
+  `{"articles": 1, "embeddings": 1, "validation_ok": true}`;
+- live help retained explicit roots, positive limit, bounded reprocess, and
+  explicit hosted-processing authorization;
+- `git diff --check` produced no output; and
+- the tracked generated-artifact and stale-current-schema searches produced no
+  matches (expected `rg` exit 1).
+
+No broad/full suite, licensed archive, network request, credential, real
+embedding output, or full-corpus operation was used in this fix round.
+
+### Fix-round self-review
+
+- Generation ownership comes only from immutable active-work
+  `generation_run_id` or history `generation_run_id`; observation run IDs never
+  participate. Exact equality catches both missing and excess generation claims.
+- Reverse provenance coverage is driven by the union of active composites and
+  composite history, so deleting provenance cannot delete the evidence that it
+  is required. Orphan provenance retains its existing forward validation.
+- The shared input-identity helper is the same compact key-sorted JSON contract
+  originally used at publication. Literal fixture construction independently
+  proves the antipodal case and the original high-level fixture still proves the
+  exact orthogonal result.
+- Missing-source recovery invalidates only the same-article/configuration
+  composite. Its surviving sibling source, other articles, and other
+  configurations remain outside the transaction's target.
+- Recalculation failure remains content-free: validation reports only a stable
+  code/message and never persists or exposes source or composite values.
+
+Fix-round concerns: none.

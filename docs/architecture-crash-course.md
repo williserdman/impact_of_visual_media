@@ -314,7 +314,9 @@ transaction removes only the same-configuration mismatched vector before
 replacement work begins. It also archives, removes, and requeues an existing
 same-article/configuration multimodal dependent while preserving the other
 source modality, other articles, and other configurations. It then
-commits `in_progress` before each request. A validated vector insert, successful
+commits `in_progress` before each request. A source checkpoint missing its
+claimed active vector invalidates its composite before recovery begins. A
+validated vector insert, successful
 work transition, and run-count update share one bounded transaction. An
 interruption before that commit leaves requeueable work; an interruption after
 it reuses the proven success. Earlier registration and article checkpoints
@@ -332,8 +334,11 @@ both the header generation and its multimodal dependent before persisting
 articles with article-text work and reconciles the latest run's absent/failed
 claims against durable header states, so deleting a checkpoint cannot erase a
 coverage gap. It also resolves active and historical multimodal source links and
-recomputes every active composite, so a self-consistent altered vector or wrong
-source reference is still reported without mutation.
+requires provenance for every active and historical composite. It recomputes
+each content-free input identity and every active composite, so a
+self-consistent altered vector, retargeted source reference, missing provenance,
+or impossible midpoint is reported without mutation. Run coverage is exact per
+immutable generating run; generations from another run cannot mask deletion.
 
 The research query seam is:
 

@@ -901,6 +901,19 @@ class EmbeddingCatalog:
             )
             return WorkState.SUCCEEDED
         if state is WorkState.IN_PROGRESS or state.is_reusable_success:
+            if state.is_reusable_success and modality in {
+                EmbeddingModality.ARTICLE_TEXT.value,
+                EmbeddingModality.HEADER_IMAGE.value,
+            }:
+                self._invalidate_work_generation(
+                    run_id=run_id,
+                    article_id=article_id,
+                    modality=EmbeddingModality.MULTIMODAL_ARTICLE.value,
+                    configuration_identifier=configuration_identifier,
+                    reason=SupersessionReason.INPUT_CHANGED,
+                    replacement_source_relative_path=None,
+                    replacement_input_sha256=None,
+                )
             self.connection.execute(
                 """
                 UPDATE embedding_work_items

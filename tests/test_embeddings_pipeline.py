@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import struct
 from collections import Counter
 from contextlib import contextmanager
@@ -736,6 +737,224 @@ def test_validator_recomputes_composite_and_checks_immutable_linkage(
     codes = {issue.code for issue in validate_embedding_outputs(config).issues}
 
     assert expected_code in codes
+
+
+def test_run_coverage_cannot_use_another_runs_generation_to_mask_deletion(
+    tmp_path,
+):
+    """Break caught: configuration totals hide one generating run's loss."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generation\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=2)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        assert db.execute(
+            "SELECT embeddings FROM runs ORDER BY started_at"
+        ).fetchall() == [(1,), (1,)]
+        db.execute(
+            """
+            DELETE FROM embeddings
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+              AND modality = 'article_text'
+            """
+        )
+        db.execute(
+            """
+            DELETE FROM embedding_work_items
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+              AND modality = 'article_text'
+            """
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "missing_published_embedding" in codes
+
+
+def test_validator_requires_provenance_for_archived_composite_generation(tmp_path):
+    """Break caught: deleting archived composite provenance is invisible."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    relative_path = attach_generated_header_image(config, b"first source image")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        archived_generation = db.execute(
+            """
+            SELECT generation_run_id
+            FROM embedding_work_items
+            WHERE modality = 'multimodal_article'
+            """
+        ).fetchone()[0]
+    (config.source_root / relative_path).write_bytes(b"second source image")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            DELETE FROM multimodal_embedding_provenance
+            WHERE generation_run_id = ?
+            """,
+            [archived_generation],
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "missing_multimodal_provenance" in codes
+
+
+def test_validator_recomputes_archived_composite_input_identity(tmp_path):
+    """Break caught: archived provenance can retarget a same-hash generation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated identity image")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        archived_composite_generation = db.execute(
+            """
+            SELECT generation_run_id
+            FROM embedding_work_items
+            WHERE modality = 'multimodal_article'
+            """
+        ).fetchone()[0]
+        original_text_hash = db.execute(
+            """
+            SELECT stored_vector_sha256
+            FROM embeddings
+            WHERE modality = 'article_text'
+            """
+        ).fetchone()[0]
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1, reprocess=True)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        active_text_generation, active_text_hash = db.execute(
+            """
+            SELECT w.generation_run_id, e.stored_vector_sha256
+            FROM embedding_work_items AS w
+            JOIN embeddings AS e USING (article_id, modality, configuration_id)
+            WHERE w.modality = 'article_text'
+            """
+        ).fetchone()
+        assert active_text_hash == original_text_hash
+        db.execute(
+            """
+            UPDATE multimodal_embedding_provenance
+            SET text_generation_run_id = ?
+            WHERE generation_run_id = ?
+            """,
+            [active_text_generation, archived_composite_generation],
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "multimodal_input_identity_mismatch" in codes
+
+
+def test_missing_source_vector_invalidates_composite_before_failed_regeneration(
+    tmp_path,
+):
+    """Break caught: source recovery failure leaves the old composite active."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated missing source vector")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DELETE FROM embeddings WHERE modality = 'header_image'")
+
+    class FailingImageAdapter(RecordingMultimodalAdapter):
+        def embed_image(self, image_base64: str) -> tuple[float, ...]:
+            raise JinaHostedAdapterError("rate_limit", retryable=True)
+
+    result = run_embedding_pipeline(config, FailingImageAdapter(), limit=1)
+
+    assert result.retryable == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [("article_text",)]
+        assert db.execute(
+            """
+            SELECT modality, superseded_reason
+            FROM embedding_generation_history
+            WHERE modality = 'multimodal_article'
+            """
+        ).fetchone() == ("multimodal_article", "input_changed")
+
+
+def test_validator_reports_antipodal_multimodal_recomputation_failure(tmp_path):
+    """Break caught: an impossible normalized midpoint is silently skipped."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated antipodal image")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    antipodal = [-1.0, *([0.0] * 2047)]
+    antipodal_hash = hashlib.sha256(
+        b"".join(struct.pack("<f", value) for value in antipodal)
+    ).hexdigest()
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        (
+            formula_version,
+            text_generation,
+            text_hash,
+            image_generation,
+        ) = db.execute(
+            """
+            SELECT p.formula_version, p.text_generation_run_id,
+                   p.text_stored_vector_sha256,
+                   p.header_image_generation_run_id
+            FROM multimodal_embedding_provenance AS p
+            """
+        ).fetchone()
+        identity = hashlib.sha256(
+            json.dumps(
+                {
+                    "formula_version": formula_version,
+                    "header_image_generation_run_id": image_generation,
+                    "header_image_stored_vector_sha256": antipodal_hash,
+                    "text_generation_run_id": text_generation,
+                    "text_stored_vector_sha256": text_hash,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        db.execute(
+            """
+            UPDATE embeddings
+            SET vector = ?, stored_vector_sha256 = ?
+            WHERE modality = 'header_image'
+            """,
+            [antipodal, antipodal_hash],
+        )
+        db.execute(
+            """
+            UPDATE multimodal_embedding_provenance
+            SET header_image_stored_vector_sha256 = ?
+            """,
+            [antipodal_hash],
+        )
+        db.execute(
+            """
+            UPDATE embeddings
+            SET input_sha256 = ?
+            WHERE modality = 'multimodal_article'
+            """,
+            [identity],
+        )
+        db.execute(
+            """
+            UPDATE embedding_work_items
+            SET input_sha256 = ?
+            WHERE modality = 'multimodal_article'
+            """,
+            [identity],
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "multimodal_recomputation_failed" in codes
 
 
 def test_absent_then_added_header_image_does_not_regenerate_successful_text(tmp_path):

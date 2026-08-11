@@ -27,6 +27,7 @@ from wsj_embeddings.pipeline import (
     _MULTIMODAL_FORMULA,
     _VECTOR_DIMENSIONS,
     EmbeddingPipelineError,
+    _multimodal_input_sha256,
     _multimodal_vector,
     _vector_hash,
     _verified_source_vector,
@@ -247,31 +248,30 @@ def _validate_run_coverage(
     missing = connection.execute(
         """
         WITH run_claims AS (
-            SELECT runs.configuration_id,
-                   max(runs.embeddings) AS expected_embeddings
+            SELECT runs.run_id, runs.configuration_id,
+                   runs.embeddings AS expected_embeddings
             FROM runs
             JOIN embedding_configurations USING (configuration_id)
             WHERE runs.configuration_id = ?
-            GROUP BY runs.configuration_id
         ), all_generations AS (
-            SELECT e.configuration_id, w.generation_run_id
+            SELECT e.configuration_id, w.generation_run_id AS run_id
             FROM embeddings AS e
             JOIN embedding_work_items AS w
               USING (article_id, modality, configuration_id)
             WHERE e.configuration_id = ?
             UNION ALL
-            SELECT configuration_id, generation_run_id
+            SELECT configuration_id, generation_run_id AS run_id
             FROM embedding_generation_history
             WHERE configuration_id = ?
-        ), vector_counts AS (
-            SELECT configuration_id, count(*) AS published_embeddings
+        ), generation_counts AS (
+            SELECT run_id, configuration_id, count(*) AS published_embeddings
             FROM all_generations
-            GROUP BY configuration_id
+            GROUP BY run_id, configuration_id
         )
         SELECT count(*)
         FROM run_claims
-        LEFT JOIN vector_counts USING (configuration_id)
-        WHERE coalesce(published_embeddings, 0) < expected_embeddings
+        LEFT JOIN generation_counts USING (run_id, configuration_id)
+        WHERE coalesce(published_embeddings, 0) != expected_embeddings
         """,
         [configuration_id, configuration_id, configuration_id],
     ).fetchone()[0]
@@ -711,6 +711,51 @@ def _validate_multimodal_provenance(
     provenance_by_generation = {
         (str(row[0]), str(row[1])): tuple(row[2:]) for row in provenance_rows
     }
+    composite_generations = connection.execute(
+        """
+        SELECT e.article_id, w.generation_run_id, e.input_sha256
+        FROM embeddings AS e
+        JOIN embedding_work_items AS w
+          USING (article_id, modality, configuration_id)
+        WHERE e.configuration_id = ? AND e.modality = 'multimodal_article'
+        UNION ALL
+        SELECT article_id, generation_run_id, input_sha256
+        FROM embedding_generation_history
+        WHERE configuration_id = ? AND modality = 'multimodal_article'
+        """,
+        [configuration_id, configuration_id],
+    ).fetchall()
+    for article_id, generation_run_id, input_sha256 in composite_generations:
+        provenance = provenance_by_generation.get(
+            (str(article_id), str(generation_run_id))
+        )
+        if provenance is None:
+            _append(
+                issues,
+                "missing_multimodal_provenance",
+                "multimodal generations lack immutable source provenance",
+            )
+            continue
+        (
+            text_generation_run_id,
+            text_vector_sha256,
+            image_generation_run_id,
+            image_vector_sha256,
+            formula_version,
+        ) = provenance
+        expected_input_sha256 = _multimodal_input_sha256(
+            formula_version=str(formula_version),
+            text_generation_run_id=str(text_generation_run_id),
+            text_stored_vector_sha256=str(text_vector_sha256),
+            header_image_generation_run_id=str(image_generation_run_id),
+            header_image_stored_vector_sha256=str(image_vector_sha256),
+        )
+        if input_sha256 != expected_input_sha256:
+            _append(
+                issues,
+                "multimodal_input_identity_mismatch",
+                "multimodal input identity differs from immutable provenance",
+            )
     for row in provenance_rows:
         (
             article_id,
@@ -863,6 +908,11 @@ def _validate_multimodal_provenance(
                 str(article_id),
             )
         except EmbeddingPipelineError:
+            _append(
+                issues,
+                "multimodal_recomputation_failed",
+                "multimodal vector cannot be recomputed from its sources",
+            )
             continue
         if (
             tuple(composite_values) != expected_vector
