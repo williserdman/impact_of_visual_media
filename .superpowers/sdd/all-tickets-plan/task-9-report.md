@@ -2,7 +2,7 @@
 
 ## Delivered
 
-Canonical Markdown at or below the conservative 8,192-token ceiling retains
+Canonical Markdown at or below the conservative 8,000-token input ceiling retains
 the existing one-input hosted path with `truncate=false`. Longer Markdown is
 tokenized locally with the official `jinaai/jina-embeddings-v4`
 `tokenizer.json` at immutable revision
@@ -37,18 +37,66 @@ replacement.
 
 ## Schema and refusal contract
 
-- Bumped `EMBEDDING_CATALOG_SCHEMA_VERSION` from `7` to `8`.
+- Bumped `EMBEDDING_CATALOG_SCHEMA_VERSION` from `7` to `8`, then to `9`
+  for the immutable-generation and exact-span review fixes.
 - Added operational `long_text_parts`, keyed by article, configuration,
   complete article input hash, and part index.
 - Added append-only `article_text_aggregation_provenance`, keyed by article,
   configuration, aggregate generation, and part index.
-- The catalog now has exactly nine base tables, exact columns/constraints, and
+- Added append-only operational `long_text_part_generations`; current part
+  checkpoints point to these immutable vector generations.
+- Added exact character and UTF-8 byte spans to current and immutable part rows.
+- Added tokenizer-engine and bounded-part-attempt configuration identity.
+- The catalog now has exactly ten base tables, exact columns/constraints, and
   no indexes.
-- Added an exact prior-v7 refusal fixture by removing only the two long-text
+- Added exact prior-v7 and prior-v8 refusal fixtures. The v7 fixture removes the
+  original two long-text
   tables and pinning metadata to version 7. It is refused without migration or
   mutation; versions 1 through 6 remain refused.
 - No new relation contains Markdown, excerpts, image bytes, credentials,
   request bodies, adapter responses, or error text.
+
+## Review-fix round 1
+
+Explicit reprocess no longer destroys the part generation named by an archived
+aggregate. Each successful part is inserted into append-only
+`long_text_part_generations` before the mutable checkpoint points at it.
+Aggregate provenance resolves against that immutable relation for both active
+article-text vectors and superseded article-text history. Validation recomputes
+every active or archived aggregate hash and also compares the active vector.
+
+Each planned part now records content-free `[char_start, char_end)` and
+`[byte_start, byte_end)` spans. When an aggregate input is still canonical,
+validation reopens the Markdown through the safe descriptor path and proves
+the ordered spans are gapless, non-overlapping, cover all characters and UTF-8
+bytes, and hash to the recorded part identity. Older input-changed generations
+cannot be reopened because bodies are intentionally not retained; their spans
+must still be ordered/gapless and all immutable vector/hash links must resolve.
+
+Retryable part requests become terminal at the profile limit of three committed
+attempts. The parent article-text work item mirrors that terminal disposition,
+so later replay does not purchase the part again. The profile and catalog store
+the limit as configuration identity.
+
+The production input ceiling is now 8,000 tokens, leaving 192 tokens of framing
+headroom below the confirmed 8,192-token model context. The tokenizer engine is
+pinned exactly as `tokenizers-0.21.4` in both dependency declaration and
+configuration identity. After immutable-revision acquisition, checksum-verified
+UTF-8 tokenizer bytes are passed directly to `Tokenizer.from_str`; the verified
+path is never reopened for loading.
+
+Review-fix RED/GREEN evidence:
+
+- schema v9 and prior-v8 refusal: `2 failed, 117 deselected`, then
+  `2 passed, 117 deselected`;
+- immutable reprocess initially failed on the old mutable insert, then passed;
+  archived-generation deletion was independently RED (`1 failed`) before the
+  active/archive resolver and GREEN together with retention (`2 passed`);
+- canonical gap/overlap/reorder coverage mutation check: `3 failed`, then
+  `3 passed` with the slice gate restored;
+- bounded retry: `1 failed` with attempt three still retryable, then `1 passed`;
+- 8,000/engine identity plus in-memory tokenizer loading: `2 failed`, then
+  `2 passed`.
 
 ## Red-green evidence
 
@@ -116,6 +164,27 @@ No licensed archive, credential, hosted request, tokenizer download, real
 embedding output, machine configuration change, or full-corpus operation was
 used.
 
+Review-fix focused evidence (no full suite):
+
+- direct boundary, oversized block, byte-fallback spans, and interruption:
+  `5 passed, 120 deselected in 27.54s`;
+- failure, bounded retry, missing provenance, and aggregate recomputation:
+  `4 passed, 121 deselected in 26.62s`;
+- immutable reprocess/archive resolution and gap/overlap/reorder coverage:
+  `5 passed, 120 deselected in 47.48s`;
+- changed input/configuration plus schema/configuration identity:
+  `5 passed, 120 deselected in 32.71s`;
+- direct publication and fresh cross-catalog validation:
+  `3 passed, 122 deselected in 7.46s`;
+- complete injected hosted-adapter module: `25 passed in 0.70s`;
+- changed-file Ruff: `All checks passed!`;
+- worktree-source smoke:
+  `{"articles": 1, "embeddings": 1, "validation_ok": true}`;
+- worktree-source `run --help` retained all three explicit roots, positive
+  `--limit`, `--reprocess`, and hosted authorization;
+- `git diff --check`, current-doc stale-claim audit, and tracked generated
+  artifact audit produced no findings; both operator-doc link sets resolved.
+
 ## Self-review
 
 - The direct/split decision uses the same configured tokenizer and inclusive
@@ -143,6 +212,19 @@ used.
 - Existing registration remains the single invalidation seam, so text changes
   archive/remove both the old text aggregate and its dependent multimodal
   vector while preserving header image, siblings, and other configurations.
+- Reprocess invalidates the research aggregate through the existing archive
+  seam, but only clears mutable part checkpoints. Immutable part generations
+  remain addressable by the archived aggregate's append-only provenance.
+- Character and UTF-8 byte positions are derived cumulatively from the exact
+  planned substrings. Validation trusts neither the checkpoint nor immutable
+  row alone: for current canonical input it reopens the file and hashes both
+  recorded slices.
+- The three-attempt ceiling is committed configuration identity. The inner part
+  failure becomes terminal first; the outer article-text failure reads that
+  state in the same coordinator path and mirrors it, preventing replay.
+- The 8,000-token ceiling reserves 192 tokens beneath the measured 8,192 model
+  context while retaining `truncate=false`. Tokenizer engine/version and
+  artifact identity both participate in `configuration_id`.
 
 ## Concerns
 
@@ -150,6 +232,7 @@ The first real authorized run may need to acquire the pinned tokenizer artifact
 into the Hugging Face cache before local token accounting; acquisition is by
 immutable revision and checksum-verified, but it is still a separate network
 dependency from hosted embedding inference. Automated and smoke verification
-do not exercise that acquisition. The shared virtual environment's installed
-console script is not linked to this worktree, so smoke/help use
-`PYTHONPATH=src`.
+do not exercise that acquisition or a clean dependency install; ticket 15 owns
+the clean temporary-install check. The shared virtual environment intentionally
+does not contain `tokenizers` or `huggingface_hub`, so all tokenizer tests remain
+injected/offline and smoke/help use worktree source through `PYTHONPATH=src`.

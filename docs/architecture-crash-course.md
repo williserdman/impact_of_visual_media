@@ -120,11 +120,11 @@ are valid only with that scope. Configuration defaults to four workers.
 |---|---|---|
 | `wsj_embeddings/config.py` | resolved disjoint roots and explicit hosted-processing authorization | CLI configuration loading |
 | `wsj_embeddings/adapters.py` | injected adapter protocol, deterministic fake adapter, and fixed hosted Jina adapter | corpus selection or output mutation |
-| `wsj_embeddings/tokenizer.py` | immutable official v4 tokenizer revision, artifact checksum verification, and lazy local loading | hosted inference or model self-hosting |
+| `wsj_embeddings/tokenizer.py` | immutable official v4 tokenizer revision, artifact checksum verification, and lazy in-memory loading with pinned `tokenizers-0.21.4` | hosted inference or model self-hosting |
 | `wsj_embeddings/long_text.py` | exact token accounting, deterministic Markdown block packing, and reversible oversized-block partitioning | API calls or checkpoint mutation |
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
-| `wsj_embeddings/catalog.py` | separate schema version 8, exact read-only inspection, bounded lifecycle/generation/part transactions | preprocessing catalog mutation |
+| `wsj_embeddings/catalog.py` | separate schema version 9, exact read-only inspection, bounded lifecycle/generation/part transactions | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection, text/image encoding, composite derivation, hashes, and publication | hosted credential loading |
 | `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
@@ -254,33 +254,37 @@ ORDER BY published_at_utc, article_id;
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 8 has exactly nine base tables, no views,
-and no indexes. Versions 1 through 7 and malformed output are refused without
+catalog. Embedding schema version 9 has exactly ten base tables, no views,
+and no indexes. Versions 1 through 8 and malformed output are refused without
 migration.
 
 | Table | Ordered columns and DuckDB types | Primary key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
-| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
+| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `started_at TIMESTAMPTZ` | `run_id` |
 | `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 | `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
-| `long_text_parts` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `part_count INTEGER`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `updated_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index)` |
+| `long_text_parts` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `updated_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index)` |
+| `long_text_part_generations` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `generation_run_id VARCHAR`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index, generation_run_id)` |
 | `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
 
 `configuration_id` is the SHA-256 of compact, key-sorted JSON for every
 `EmbeddingProfile` field: model alias and observed hosted model/API metadata,
-task, dimensions, output type, normalization, tokenizer/context rules,
-long-text aggregation, image rules/transform, multimodal formula, and client
-configuration version. The official local tokenizer artifact is
+task, dimensions, output type, normalization, tokenizer artifact/engine,
+context rules/ceiling, long-text aggregation/attempt limit, image
+rules/transform, multimodal formula, and client configuration version. The
+tokenizer engine is pinned as `tokenizers-0.21.4`. The official local tokenizer artifact is
 `jinaai/jina-embeddings-v4/tokenizer.json` at immutable revision
 `d1e5d70b7b34d927a8cddac458583c4fbe50a914`, accepted only when its bytes match
 SHA-256 `9c5ae00e602b8860cbd784ba82a8aa14e8feecec692e7076590d014d7b7fdafa`.
-This pins token boundaries without self-hosting the model. The conservative
-context ceiling is 8,192 tokens. Inputs at or below it keep one hosted request
-with `truncate=false`. Longer Markdown is greedily packed at complete
+Verified UTF-8 bytes are loaded directly from memory rather than reopening the
+resolved path. This pins token boundaries without self-hosting the model. The
+conservative input ceiling is 8,000 tokens, leaving 192 tokens of framing
+headroom below the confirmed 8,192-token model context. Inputs at or below it
+keep one hosted request with `truncate=false`. Longer Markdown is greedily packed at complete
 blank-line block separators, with one oversized block partitioned only on safe
 token offsets. Every part is an exact, ordered, non-overlapping substring.
 The current long-text identity is
@@ -295,11 +299,16 @@ representation. Work state is one of `queued`, `in_progress`, `succeeded`,
 `retryable`, `terminal`, `interrupted`, or `not_applicable`. The supported
 vector modalities are `article_text`, `header_image`, and `multimodal_article`,
 all dimension 2,048.
-`long_text_parts` is operational checkpoint/vector state, not a fourth research
-modality. A part success commits before the next hosted call, so a crash or
-retryable failure repurchases only unproven parts. Aggregate provenance links
-the one research vector to each part generation, content hash, token count, and
-stored-vector hash without retaining Markdown. Changed Markdown selects a new
+`long_text_parts` is mutable operational checkpoint/vector state, not a fourth
+research modality. `long_text_part_generations` is append-only operational
+history, including exact character/UTF-8 byte spans and vector facts needed to
+audit an aggregate without retaining Markdown. A part success commits before
+the next hosted call, so a crash or retryable failure repurchases only unproven
+parts; retryable errors become terminal on the third committed attempt.
+Explicit reprocess clears the current checkpoint but never a generation named
+by active or archived aggregate provenance. Aggregate provenance links the one
+research vector to each immutable part generation, content hash, token count,
+and stored-vector hash. Changed Markdown selects a new
 article input identity; changed tokenizer, ceiling, boundary rule, or formula
 selects a new `configuration_id`. In both cases stale parts cannot satisfy the
 new aggregate, and normal source invalidation also archives/removes the dependent
@@ -569,7 +578,7 @@ reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
-and local header-image embeddings. It checks the exact nine-table embedding
+and local header-image embeddings. It checks the exact ten-table embedding
 schema first, opens the
 preprocessing catalog through its public exact-schema contract, and reports
 stable sorted issues for configuration identity/reference failures, malformed
@@ -578,8 +587,11 @@ vectors claimed by successful work,
 unsupported modality/dimension, orphaned canonical identities, publication
 mismatch, unsafe or missing canonical Markdown/header images, input-hash
 mismatch, non-finite/zero/non-unit vectors, and float32 vector-hash mismatch.
-It also checks long-text part lifecycle/vector state, complete aggregate
-provenance, and exact token-weighted recomputation. Messages
+It also checks bounded long-text lifecycle/vector state and resolves complete
+active and archived aggregate provenance to immutable part generations. It
+recomputes every aggregate hash, compares active vectors, and reopens current
+canonical Markdown to verify exact ordered, gapless, non-overlapping character
+and UTF-8 byte spans plus slice hashes. Messages
 never contain Markdown, vector values, or credentials. When configurations
 coexist, validation requires one explicit configuration identity and never
 mixes generations. Validation detects but does not repair state.

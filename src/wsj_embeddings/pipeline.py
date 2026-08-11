@@ -231,6 +231,8 @@ def run_embedding_pipeline(
     profile = adapter.profile
     if profile.dimensions != _VECTOR_DIMENSIONS:
         raise ValueError("adapter profile dimensions must be 2048")
+    if profile.long_text_part_attempt_limit < 1:
+        raise ValueError("long-text part attempt limit must be positive")
     articles = _read_articles(config, limit)
     prepared_images = {
         article.article_id: _prepare_header_image(config, article)
@@ -315,9 +317,22 @@ def run_embedding_pipeline(
                             and error.code == "deterministic_request"
                             and attempt_count < _DETERMINISTIC_IMAGE_ATTEMPT_LIMIT
                         )
+                        terminal_long_text = (
+                            modality == _ARTICLE_TEXT_MODALITY
+                            and catalog.has_terminal_long_text_part(
+                                article_id=article.article_id,
+                                configuration_identifier=configuration_identifier,
+                                article_input_sha256=(
+                                    article.cleaned_markdown_sha256
+                                ),
+                            )
+                        )
                         failure_state = (
                             WorkState.RETRYABLE
-                            if error.retryable or bounded_deterministic_image
+                            if (
+                                not terminal_long_text
+                                and (error.retryable or bounded_deterministic_image)
+                            )
                             else WorkState.TERMINAL
                         )
                         catalog.record_failure(
@@ -633,10 +648,22 @@ def _embed_long_text_parts(
                     article.article_id,
                 )
             except JinaHostedAdapterError as error:
-                failure_state = (
-                    WorkState.RETRYABLE if error.retryable else WorkState.TERMINAL
-                )
                 with catalog.transaction():
+                    attempt_count = catalog.long_text_part_attempt_count(
+                        article_id=article.article_id,
+                        configuration_identifier=configuration_identifier,
+                        article_input_sha256=article_input_sha256,
+                        part_index=part.index,
+                    )
+                    failure_state = (
+                        WorkState.RETRYABLE
+                        if (
+                            error.retryable
+                            and attempt_count
+                            < adapter.profile.long_text_part_attempt_limit
+                        )
+                        else WorkState.TERMINAL
+                    )
                     catalog.record_long_text_part_failure(
                         run_id=run_id,
                         article_id=article.article_id,

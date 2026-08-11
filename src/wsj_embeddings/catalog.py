@@ -24,7 +24,7 @@ from wsj_embeddings.models import (
     WorkState,
 )
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "8"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "9"
 
 _EMBEDDING_CATALOG_TABLES = {
     "article_text_aggregation_provenance",
@@ -33,6 +33,7 @@ _EMBEDDING_CATALOG_TABLES = {
     "embedding_work_items",
     "embeddings",
     "long_text_parts",
+    "long_text_part_generations",
     "metadata",
     "multimodal_embedding_provenance",
     "runs",
@@ -52,9 +53,11 @@ _TABLE_COLUMNS = {
         ("output_type", "VARCHAR", True, None, False),
         ("normalization", "VARCHAR", True, None, False),
         ("tokenizer_revision", "VARCHAR", True, None, False),
+        ("tokenizer_engine", "VARCHAR", True, None, False),
         ("context_token_limit", "INTEGER", True, None, False),
         ("context_rules", "VARCHAR", True, None, False),
         ("long_text_aggregation", "VARCHAR", True, None, False),
+        ("long_text_part_attempt_limit", "INTEGER", True, None, False),
         ("image_input_rules", "VARCHAR", True, None, False),
         ("image_transform", "VARCHAR", True, None, False),
         ("multimodal_formula", "VARCHAR", True, None, False),
@@ -131,6 +134,10 @@ _TABLE_COLUMNS = {
         ("article_input_sha256", "VARCHAR", True, None, True),
         ("part_index", "INTEGER", True, None, True),
         ("part_count", "INTEGER", True, None, False),
+        ("char_start", "BIGINT", True, None, False),
+        ("char_end", "BIGINT", True, None, False),
+        ("byte_start", "BIGINT", True, None, False),
+        ("byte_end", "BIGINT", True, None, False),
         ("part_input_sha256", "VARCHAR", True, None, False),
         ("token_count", "INTEGER", True, None, False),
         ("state", "VARCHAR", True, None, False),
@@ -143,6 +150,23 @@ _TABLE_COLUMNS = {
         ("stored_vector_sha256", "VARCHAR", False, None, False),
         ("vector", "FLOAT[2048]", False, None, False),
         ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
+    "long_text_part_generations": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("article_input_sha256", "VARCHAR", True, None, True),
+        ("part_index", "INTEGER", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("part_count", "INTEGER", True, None, False),
+        ("char_start", "BIGINT", True, None, False),
+        ("char_end", "BIGINT", True, None, False),
+        ("byte_start", "BIGINT", True, None, False),
+        ("byte_end", "BIGINT", True, None, False),
+        ("part_input_sha256", "VARCHAR", True, None, False),
+        ("token_count", "INTEGER", True, None, False),
+        ("stored_vector_sha256", "VARCHAR", True, None, False),
+        ("vector", "FLOAT[2048]", True, None, False),
+        ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "article_text_aggregation_provenance": (
         ("article_id", "VARCHAR", True, None, True),
@@ -191,6 +215,17 @@ _KEY_CONSTRAINTS = {
             "configuration_id",
             "article_input_sha256",
             "part_index",
+        ),
+    ),
+    (
+        "long_text_part_generations",
+        "PRIMARY KEY",
+        (
+            "article_id",
+            "configuration_id",
+            "article_input_sha256",
+            "part_index",
+            "generation_run_id",
         ),
     ),
     (
@@ -592,9 +627,11 @@ class EmbeddingCatalog:
                     output_type VARCHAR NOT NULL,
                     normalization VARCHAR NOT NULL,
                     tokenizer_revision VARCHAR NOT NULL,
+                    tokenizer_engine VARCHAR NOT NULL,
                     context_token_limit INTEGER NOT NULL,
                     context_rules VARCHAR NOT NULL,
                     long_text_aggregation VARCHAR NOT NULL,
+                    long_text_part_attempt_limit INTEGER NOT NULL,
                     image_input_rules VARCHAR NOT NULL,
                     image_transform VARCHAR NOT NULL,
                     multimodal_formula VARCHAR NOT NULL,
@@ -703,6 +740,10 @@ class EmbeddingCatalog:
                     article_input_sha256 VARCHAR NOT NULL,
                     part_index INTEGER NOT NULL,
                     part_count INTEGER NOT NULL,
+                    char_start BIGINT NOT NULL,
+                    char_end BIGINT NOT NULL,
+                    byte_start BIGINT NOT NULL,
+                    byte_end BIGINT NOT NULL,
                     part_input_sha256 VARCHAR NOT NULL,
                     token_count INTEGER NOT NULL,
                     state VARCHAR NOT NULL,
@@ -718,6 +759,31 @@ class EmbeddingCatalog:
                     PRIMARY KEY (
                         article_id, configuration_id, article_input_sha256,
                         part_index
+                    )
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS long_text_part_generations (
+                    article_id VARCHAR NOT NULL,
+                    configuration_id VARCHAR NOT NULL,
+                    article_input_sha256 VARCHAR NOT NULL,
+                    part_index INTEGER NOT NULL,
+                    generation_run_id VARCHAR NOT NULL,
+                    part_count INTEGER NOT NULL,
+                    char_start BIGINT NOT NULL,
+                    char_end BIGINT NOT NULL,
+                    byte_start BIGINT NOT NULL,
+                    byte_end BIGINT NOT NULL,
+                    part_input_sha256 VARCHAR NOT NULL,
+                    token_count INTEGER NOT NULL,
+                    stored_vector_sha256 VARCHAR NOT NULL,
+                    vector FLOAT[2048] NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    PRIMARY KEY (
+                        article_id, configuration_id, article_input_sha256,
+                        part_index, generation_run_id
                     )
                 )
                 """
@@ -846,11 +912,12 @@ class EmbeddingCatalog:
             INSERT INTO embedding_configurations (
                 configuration_id, model, observed_model, observed_api_version,
                 task, dimensions, output_type, normalization,
-                tokenizer_revision, context_token_limit, context_rules,
-                long_text_aggregation, image_input_rules, image_transform,
+                tokenizer_revision, tokenizer_engine, context_token_limit,
+                context_rules, long_text_aggregation,
+                long_text_part_attempt_limit, image_input_rules, image_transform,
                 multimodal_formula, client_configuration_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (configuration_id) DO NOTHING
             """,
             [
@@ -863,9 +930,11 @@ class EmbeddingCatalog:
                 profile.output_type,
                 profile.normalization,
                 profile.tokenizer_revision,
+                profile.tokenizer_engine,
                 profile.context_token_limit,
                 profile.context_rules,
                 profile.long_text_aggregation,
+                profile.long_text_part_attempt_limit,
                 profile.image_input_rules,
                 profile.image_transform,
                 profile.multimodal_formula,
@@ -1349,8 +1418,9 @@ class EmbeddingCatalog:
         for part in parts:
             row = self.connection.execute(
                 """
-                SELECT part_count, part_input_sha256, token_count, state,
-                       generation_run_id, stored_vector_sha256, vector
+                SELECT part_count, char_start, char_end, byte_start, byte_end,
+                       part_input_sha256, token_count, state, generation_run_id,
+                       stored_vector_sha256, vector
                 FROM long_text_parts
                 WHERE article_id = ? AND configuration_id = ?
                   AND article_input_sha256 = ? AND part_index = ?
@@ -1365,9 +1435,15 @@ class EmbeddingCatalog:
             if row is None:
                 self.connection.execute(
                     """
-                    INSERT INTO long_text_parts
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?,
-                            NULL, NULL, NULL, current_timestamp)
+                    INSERT INTO long_text_parts (
+                        article_id, configuration_id, article_input_sha256,
+                        part_index, part_count, char_start, char_end,
+                        byte_start, byte_end, part_input_sha256, token_count,
+                        state, attempt_count, error_code, status_code,
+                        retry_after_seconds, last_run_id, generation_run_id,
+                        stored_vector_sha256, vector, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL,
+                              NULL, NULL, ?, NULL, NULL, NULL, current_timestamp)
                     """,
                     [
                         article_id,
@@ -1375,6 +1451,10 @@ class EmbeddingCatalog:
                         article_input_sha256,
                         part.index,
                         part_count,
+                        part.char_start,
+                        part.char_end,
+                        part.byte_start,
+                        part.byte_end,
                         part.input_sha256,
                         part.token_count,
                         WorkState.QUEUED.value,
@@ -1383,13 +1463,17 @@ class EmbeddingCatalog:
                 )
                 states.append(WorkState.QUEUED)
                 continue
-            if tuple(row[:3]) != (
+            if tuple(row[:7]) != (
                 part_count,
+                part.char_start,
+                part.char_end,
+                part.byte_start,
+                part.byte_end,
                 part.input_sha256,
                 part.token_count,
             ):
                 raise ValueError("long-text part identity changed within configuration")
-            state = WorkState(str(row[3]))
+            state = WorkState(str(row[7]))
             if reprocess:
                 self.connection.execute(
                     """
@@ -1415,9 +1499,9 @@ class EmbeddingCatalog:
                 continue
             proven_success = (
                 state is WorkState.SUCCEEDED
-                and row[4] is not None
-                and row[5] is not None
-                and row[6] is not None
+                and row[8] is not None
+                and row[9] is not None
+                and row[10] is not None
             )
             if proven_success:
                 self.connection.execute(
@@ -1563,6 +1647,27 @@ class EmbeddingCatalog:
 
         self.connection.execute(
             """
+            INSERT INTO long_text_part_generations
+            SELECT article_id, configuration_id, article_input_sha256,
+                   part_index, ?, part_count, char_start, char_end,
+                   byte_start, byte_end, part_input_sha256, token_count,
+                   ?, ?, current_timestamp
+            FROM long_text_parts
+            WHERE article_id = ? AND configuration_id = ?
+              AND article_input_sha256 = ? AND part_index = ?
+            """,
+            [
+                run_id,
+                stored_vector_sha256,
+                list(vector),
+                article_id,
+                configuration_identifier,
+                article_input_sha256,
+                part_index,
+            ],
+        )
+        self.connection.execute(
+            """
             UPDATE long_text_parts
             SET state = ?, error_code = NULL, status_code = NULL,
                 retry_after_seconds = NULL, last_run_id = ?,
@@ -1596,11 +1701,14 @@ class EmbeddingCatalog:
 
         row = self.connection.execute(
             """
-            SELECT generation_run_id, stored_vector_sha256, vector
-            FROM long_text_parts
-            WHERE article_id = ? AND configuration_id = ?
-              AND article_input_sha256 = ? AND part_index = ?
-              AND state = ?
+            SELECT g.generation_run_id, g.stored_vector_sha256, g.vector
+            FROM long_text_parts AS p
+            JOIN long_text_part_generations AS g
+              USING (article_id, configuration_id, article_input_sha256,
+                     part_index, generation_run_id)
+            WHERE p.article_id = ? AND p.configuration_id = ?
+              AND p.article_input_sha256 = ? AND p.part_index = ?
+              AND p.state = ?
             """,
             [
                 article_id,
@@ -1613,6 +1721,60 @@ class EmbeddingCatalog:
         if row is None or any(value is None for value in row):
             raise ValueError("long-text part lacks a proven generation")
         return tuple(row)
+
+    def long_text_part_attempt_count(
+        self,
+        *,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+        part_index: int,
+    ) -> int:
+        """Return the committed request count for one exact operational part."""
+
+        row = self.connection.execute(
+            """
+            SELECT attempt_count
+            FROM long_text_parts
+            WHERE article_id = ? AND configuration_id = ?
+              AND article_input_sha256 = ? AND part_index = ?
+            """,
+            [
+                article_id,
+                configuration_identifier,
+                article_input_sha256,
+                part_index,
+            ],
+        ).fetchone()
+        if row is None:
+            raise ValueError("long-text part is not registered")
+        return int(row[0])
+
+    def has_terminal_long_text_part(
+        self,
+        *,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+    ) -> bool:
+        """Return whether an exact article has a terminal operational part."""
+
+        return bool(
+            self.connection.execute(
+                """
+                SELECT count(*)
+                FROM long_text_parts
+                WHERE article_id = ? AND configuration_id = ?
+                  AND article_input_sha256 = ? AND state = ?
+                """,
+                [
+                    article_id,
+                    configuration_identifier,
+                    article_input_sha256,
+                    WorkState.TERMINAL.value,
+                ],
+            ).fetchone()[0]
+        )
 
     def record_failure(
         self,

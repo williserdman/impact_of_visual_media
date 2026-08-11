@@ -20,6 +20,10 @@ class LongTextPart:
 
     index: int
     text: str
+    char_start: int
+    char_end: int
+    byte_start: int
+    byte_end: int
     input_sha256: str
     token_count: int
 
@@ -75,18 +79,31 @@ def plan_long_text_parts(
 
     if "".join(planned_text) != markdown or any(not part for part in planned_text):
         raise LongTextPlanningError("long-text plan does not cover canonical Markdown")
-    parts = tuple(
-        LongTextPart(
-            index=index,
-            text=part,
-            input_sha256=hashlib.sha256(part.encode("utf-8")).hexdigest(),
-            token_count=token_count(part, tokenizer),
+    parts: list[LongTextPart] = []
+    char_start = 0
+    byte_start = 0
+    for index, part in enumerate(planned_text):
+        part_bytes = part.encode("utf-8")
+        char_end = char_start + len(part)
+        byte_end = byte_start + len(part_bytes)
+        parts.append(
+            LongTextPart(
+                index=index,
+                text=part,
+                char_start=char_start,
+                char_end=char_end,
+                byte_start=byte_start,
+                byte_end=byte_end,
+                input_sha256=hashlib.sha256(part_bytes).hexdigest(),
+                token_count=token_count(part, tokenizer),
+            )
         )
-        for index, part in enumerate(planned_text)
-    )
-    if any(part.token_count > token_limit for part in parts):
+        char_start = char_end
+        byte_start = byte_end
+    planned_parts = tuple(parts)
+    if any(part.token_count > token_limit for part in planned_parts):
         raise LongTextPlanningError("long-text part exceeds configured token ceiling")
-    return parts
+    return planned_parts
 
 
 def _markdown_blocks(markdown: str) -> tuple[str, ...]:

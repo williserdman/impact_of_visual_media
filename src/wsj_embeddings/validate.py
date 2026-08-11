@@ -103,6 +103,8 @@ def validate_embedding_outputs(
                     )
                     _validate_long_text_parts(
                         catalog.connection,
+                        config,
+                        articles,
                         selected_configuration_id,
                         issues,
                     )
@@ -168,9 +170,11 @@ def _validate_configurations(
         """
         SELECT configuration_id, model, observed_model, observed_api_version,
                task, dimensions, output_type, normalization,
-               tokenizer_revision, context_token_limit, context_rules,
-               long_text_aggregation, image_input_rules, image_transform,
-               multimodal_formula, client_configuration_version
+               tokenizer_revision, tokenizer_engine, context_token_limit,
+               context_rules, long_text_aggregation,
+               long_text_part_attempt_limit, image_input_rules,
+               image_transform, multimodal_formula,
+               client_configuration_version
         FROM embedding_configurations
         """
     ).fetchall()
@@ -185,13 +189,15 @@ def _validate_configurations(
             output_type=row[6],
             normalization=row[7],
             tokenizer_revision=row[8],
-            context_token_limit=row[9],
-            context_rules=row[10],
-            long_text_aggregation=row[11],
-            image_input_rules=row[12],
-            image_transform=row[13],
-            multimodal_formula=row[14],
-            client_configuration_version=row[15],
+            tokenizer_engine=row[9],
+            context_token_limit=row[10],
+            context_rules=row[11],
+            long_text_aggregation=row[12],
+            long_text_part_attempt_limit=row[13],
+            image_input_rules=row[14],
+            image_transform=row[15],
+            multimodal_formula=row[16],
+            client_configuration_version=row[17],
         )
         if row[0] != profile_configuration_id(profile):
             invalid = True
@@ -932,14 +938,17 @@ def _validate_multimodal_provenance(
 
 def _validate_long_text_parts(
     connection: duckdb.DuckDBPyConnection,
+    config: EmbeddingPipelineConfig,
+    articles: dict[str, CanonicalArticle],
     configuration_id: str,
     issues: list[EmbeddingValidationIssue],
 ) -> None:
-    """Verify operational parts and recompute active token-weighted aggregates."""
+    """Verify current checkpoints and every active or archived aggregate."""
 
     configuration = connection.execute(
         """
-        SELECT context_token_limit, long_text_aggregation
+        SELECT context_token_limit, long_text_aggregation,
+               long_text_part_attempt_limit
         FROM embedding_configurations
         WHERE configuration_id = ?
         """,
@@ -947,7 +956,7 @@ def _validate_long_text_parts(
     ).fetchone()
     if configuration is None:
         return
-    token_limit, configured_aggregation = configuration
+    token_limit, configured_aggregation, attempt_limit = configuration
     run_ids = {
         row[0]
         for row in connection.execute(
@@ -958,22 +967,27 @@ def _validate_long_text_parts(
     part_rows = connection.execute(
         """
         SELECT article_id, article_input_sha256, part_index, part_count,
-               part_input_sha256, token_count, state, attempt_count,
-               error_code, status_code, retry_after_seconds, last_run_id,
-               generation_run_id, stored_vector_sha256, vector
+               char_start, char_end, byte_start, byte_end, part_input_sha256,
+               token_count, state, attempt_count, error_code, status_code,
+               retry_after_seconds, last_run_id, generation_run_id,
+               stored_vector_sha256, vector
         FROM long_text_parts
         WHERE configuration_id = ?
         ORDER BY article_id, article_input_sha256, part_index
         """,
         [configuration_id],
     ).fetchall()
-    parts_by_key: dict[tuple[str, str, int], tuple[object, ...]] = {}
+    current_parts: dict[tuple[str, str, int], tuple[object, ...]] = {}
     for row in part_rows:
         (
             article_id,
             article_input_sha256,
             part_index,
             part_count,
+            char_start,
+            char_end,
+            byte_start,
+            byte_end,
             part_input_sha256,
             part_token_count,
             raw_state,
@@ -998,8 +1012,11 @@ def _validate_long_text_parts(
             and isinstance(part_count, int)
             and 0 <= part_index < part_count
             and part_count > 1
+            and _valid_part_span(char_start, char_end, byte_start, byte_end)
             and isinstance(part_token_count, int)
             and 0 < part_token_count <= token_limit
+            and isinstance(attempt_count, int)
+            and 0 <= attempt_count <= attempt_limit
             and last_run_id in run_ids
             and state is not None
             and state is not WorkState.NOT_APPLICABLE
@@ -1027,6 +1044,10 @@ def _validate_long_text_parts(
                     or (attempt_count >= 1 and error_code is not None)
                 )
                 and (
+                    state is not WorkState.RETRYABLE
+                    or attempt_count < attempt_limit
+                )
+                and (
                     state is None
                     or state.is_failure
                     or not any(value is not None for value in failure_metadata)
@@ -1038,8 +1059,12 @@ def _validate_long_text_parts(
                 "invalid_long_text_part",
                 "long-text part checkpoints are incomplete or inconsistent",
             )
-        parts_by_key[(str(article_id), str(article_input_sha256), int(part_index))] = (
+        current_parts[(str(article_id), str(article_input_sha256), int(part_index))] = (
             part_count,
+            char_start,
+            char_end,
+            byte_start,
+            byte_end,
             part_input_sha256,
             part_token_count,
             state,
@@ -1048,28 +1073,140 @@ def _validate_long_text_parts(
             vector,
         )
 
+    generation_rows = connection.execute(
+        """
+        SELECT article_id, article_input_sha256, part_index, generation_run_id,
+               part_count, char_start, char_end, byte_start, byte_end,
+               part_input_sha256, token_count, stored_vector_sha256, vector
+        FROM long_text_part_generations
+        WHERE configuration_id = ?
+        ORDER BY article_id, article_input_sha256, part_index, generation_run_id
+        """,
+        [configuration_id],
+    ).fetchall()
+    generations: dict[tuple[str, str, int, str], tuple[object, ...]] = {}
+    for row in generation_rows:
+        (
+            article_id,
+            article_input_sha256,
+            part_index,
+            generation_run_id,
+            part_count,
+            char_start,
+            char_end,
+            byte_start,
+            byte_end,
+            part_input_sha256,
+            part_token_count,
+            vector_sha256,
+            vector,
+        ) = row
+        valid = (
+            _is_sha256(article_input_sha256)
+            and _is_sha256(part_input_sha256)
+            and isinstance(part_index, int)
+            and isinstance(part_count, int)
+            and 0 <= part_index < part_count
+            and part_count > 1
+            and _valid_part_span(char_start, char_end, byte_start, byte_end)
+            and isinstance(part_token_count, int)
+            and 0 < part_token_count <= token_limit
+            and generation_run_id in run_ids
+            and _is_sha256(vector_sha256)
+            and vector is not None
+        )
+        if valid:
+            issue_count = len(issues)
+            _validate_vector(vector, vector_sha256, issues)
+            valid = len(issues) == issue_count
+        if not valid:
+            _append(
+                issues,
+                "invalid_long_text_part_generation",
+                "long-text part generation history is incomplete or inconsistent",
+            )
+        generations[
+            (
+                str(article_id),
+                str(article_input_sha256),
+                int(part_index),
+                str(generation_run_id),
+            )
+        ] = (
+            part_count,
+            char_start,
+            char_end,
+            byte_start,
+            byte_end,
+            part_input_sha256,
+            part_token_count,
+            vector_sha256,
+            vector,
+        )
+
+    for key, current in current_parts.items():
+        (
+            part_count,
+            char_start,
+            char_end,
+            byte_start,
+            byte_end,
+            part_input_sha256,
+            part_token_count,
+            state,
+            generation_run_id,
+            vector_sha256,
+            vector,
+        ) = current
+        if state is not WorkState.SUCCEEDED:
+            continue
+        generation = generations.get((*key, str(generation_run_id)))
+        if generation != (
+            part_count,
+            char_start,
+            char_end,
+            byte_start,
+            byte_end,
+            part_input_sha256,
+            part_token_count,
+            vector_sha256,
+            vector,
+        ):
+            _append(
+                issues,
+                "invalid_long_text_part",
+                "long-text part checkpoints are incomplete or inconsistent",
+            )
+
     aggregates = connection.execute(
         """
         SELECT e.article_id, e.input_sha256, e.vector,
-               e.stored_vector_sha256, w.generation_run_id
+               e.stored_vector_sha256, w.generation_run_id, true AS active
         FROM embeddings AS e
         JOIN embedding_work_items AS w
           USING (article_id, modality, configuration_id)
         WHERE e.configuration_id = ? AND e.modality = 'article_text'
           AND w.state = 'succeeded'
+        UNION ALL
+        SELECT article_id, input_sha256, NULL AS vector,
+               stored_vector_sha256, generation_run_id, false AS active
+        FROM embedding_generation_history
+        WHERE configuration_id = ? AND modality = 'article_text'
         """,
-        [configuration_id],
+        [configuration_id, configuration_id],
     ).fetchall()
+    canonical_cache: dict[str, tuple[str, bytes] | None] = {}
     for (
         article_id,
         article_input_sha256,
         aggregate_vector,
         aggregate_vector_sha256,
         generation_run_id,
+        active,
     ) in aggregates:
-        matching_part_count = sum(
+        has_part_generations = any(
             key[:2] == (str(article_id), str(article_input_sha256))
-            for key in parts_by_key
+            for key in generations
         )
         provenance = connection.execute(
             """
@@ -1084,7 +1221,7 @@ def _validate_long_text_parts(
             [article_id, configuration_id, generation_run_id],
         ).fetchall()
         if not provenance:
-            if matching_part_count:
+            if has_part_generations:
                 _append(
                     issues,
                     "missing_long_text_provenance",
@@ -1094,7 +1231,6 @@ def _validate_long_text_parts(
         expected_count = provenance[0][2]
         if (
             not isinstance(expected_count, int)
-            or matching_part_count != expected_count
             or len(provenance) != expected_count
             or [row[0] for row in provenance] != list(range(expected_count))
         ):
@@ -1105,6 +1241,7 @@ def _validate_long_text_parts(
             )
             continue
         weighted_parts: list[tuple[int, tuple[float, ...]]] = []
+        linked_parts: list[tuple[object, ...]] = []
         linkage_valid = True
         for row in provenance:
             (
@@ -1117,32 +1254,37 @@ def _validate_long_text_parts(
                 part_vector_sha256,
                 aggregation_version,
             ) = row
-            part = parts_by_key.get(
-                (str(article_id), str(article_input_sha256), int(part_index))
+            part = generations.get(
+                (
+                    str(article_id),
+                    str(article_input_sha256),
+                    int(part_index),
+                    str(part_generation_run_id),
+                )
             )
             if part is None:
                 linkage_valid = False
                 continue
             (
                 current_count,
+                char_start,
+                char_end,
+                byte_start,
+                byte_end,
                 current_input_sha256,
                 current_token_count,
-                current_state,
-                current_generation_run_id,
                 current_vector_sha256,
                 current_vector,
             ) = part
             current_link_valid = (
                 provenance_article_sha256 == article_input_sha256
                 and part_count == expected_count == current_count
-                and part_generation_run_id == current_generation_run_id
                 and part_input_sha256 == current_input_sha256
                 and part_token_count == current_token_count
                 and part_vector_sha256 == current_vector_sha256
                 and aggregation_version
                 == configured_aggregation
                 == "l2-token-count-weighted-mean-float32-v1"
-                and current_state is WorkState.SUCCEEDED
                 and current_vector is not None
             )
             if not current_link_valid:
@@ -1152,6 +1294,15 @@ def _validate_long_text_parts(
                 (
                     int(part_token_count),
                     tuple(float(value) for value in current_vector),
+                )
+            )
+            linked_parts.append(
+                (
+                    char_start,
+                    char_end,
+                    byte_start,
+                    byte_end,
+                    current_input_sha256,
                 )
             )
         if not linkage_valid or len(weighted_parts) != expected_count:
@@ -1171,14 +1322,91 @@ def _validate_long_text_parts(
             )
             continue
         if (
-            tuple(aggregate_vector) != expected_vector
-            or aggregate_vector_sha256 != _vector_hash(expected_vector)
+            aggregate_vector_sha256 != _vector_hash(expected_vector)
+            or (active and tuple(aggregate_vector) != expected_vector)
         ):
             _append(
                 issues,
                 "long_text_vector_mismatch",
                 "long-text vector differs from its token-weighted parts",
             )
+        article = articles.get(str(article_id))
+        if article is None or article.cleaned_markdown_sha256 != article_input_sha256:
+            if not _spans_are_ordered(linked_parts):
+                _append(
+                    issues,
+                    "invalid_long_text_source_coverage",
+                    "long-text part spans are not ordered and gapless",
+                )
+            continue
+        canonical = canonical_cache.get(str(article_id))
+        if str(article_id) not in canonical_cache:
+            try:
+                markdown_bytes = read_canonical_markdown(
+                    config.preprocessing_output_root,
+                    article.cleaned_markdown_path,
+                )
+                markdown = markdown_bytes.decode("utf-8", errors="strict")
+            except (CanonicalMarkdownError, UnicodeDecodeError):
+                canonical = None
+            else:
+                canonical = (markdown, markdown_bytes)
+            canonical_cache[str(article_id)] = canonical
+        if canonical is not None and not _spans_cover_canonical(
+            linked_parts,
+            canonical[0],
+            canonical[1],
+        ):
+            _append(
+                issues,
+                "invalid_long_text_source_coverage",
+                "long-text part spans do not cover canonical Markdown exactly",
+            )
+
+
+def _valid_part_span(
+    char_start: object,
+    char_end: object,
+    byte_start: object,
+    byte_end: object,
+) -> bool:
+    return (
+        isinstance(char_start, int)
+        and isinstance(char_end, int)
+        and isinstance(byte_start, int)
+        and isinstance(byte_end, int)
+        and 0 <= char_start < char_end
+        and 0 <= byte_start < byte_end
+    )
+
+
+def _spans_are_ordered(parts: list[tuple[object, ...]]) -> bool:
+    char_position = 0
+    byte_position = 0
+    for char_start, char_end, byte_start, byte_end, _part_sha256 in parts:
+        if char_start != char_position or byte_start != byte_position:
+            return False
+        char_position = int(char_end)
+        byte_position = int(byte_end)
+    return bool(parts)
+
+
+def _spans_cover_canonical(
+    parts: list[tuple[object, ...]],
+    markdown: str,
+    markdown_bytes: bytes,
+) -> bool:
+    if not _spans_are_ordered(parts):
+        return False
+    for char_start, char_end, byte_start, byte_end, part_sha256 in parts:
+        char_slice = markdown[int(char_start) : int(char_end)].encode("utf-8")
+        byte_slice = markdown_bytes[int(byte_start) : int(byte_end)]
+        if (
+            char_slice != byte_slice
+            or hashlib.sha256(byte_slice).hexdigest() != part_sha256
+        ):
+            return False
+    return parts[-1][1] == len(markdown) and parts[-1][3] == len(markdown_bytes)
 
 
 def _weighted_long_text_vector(

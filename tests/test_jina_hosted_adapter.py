@@ -93,13 +93,21 @@ def test_verified_pinned_tokenizer_exposes_exact_offsets_without_network(tmp_pat
     artifact_bytes = b"generated tokenizer fixture"
     artifact.write_bytes(artifact_bytes)
     loaded = SyntheticLoadedTokenizer()
+    loaded_serialized: list[str] = []
+
+    def load_verified(serialized: str) -> SyntheticLoadedTokenizer:
+        loaded_serialized.append(serialized)
+        artifact.write_bytes(b"generated replacement after verification")
+        return loaded
+
     tokenizer = PinnedJinaV4Tokenizer(
         resolver=lambda _repo, _filename, _revision: artifact,
-        loader=lambda path: loaded if path == artifact else None,
+        loader=load_verified,
         expected_sha256=hashlib.sha256(artifact_bytes).hexdigest(),
     )
 
     assert tokenizer.token_offsets("abc") == ((0, 1), (1, 2), (2, 3))
+    assert loaded_serialized == [artifact_bytes.decode("utf-8")]
 
 
 def test_hosted_adapter_uses_injected_local_tokenizer_without_transport():

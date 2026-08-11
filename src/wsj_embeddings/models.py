@@ -70,9 +70,11 @@ class EmbeddingProfile:
         "d1e5d70b7b34d927a8cddac458583c4fbe50a914:tokenizer.json"
         "#sha256=9c5ae00e602b8860cbd784ba82a8aa14e8feecec692e7076590d014d7b7fdafa"
     )
-    context_token_limit: int = 8_192
+    tokenizer_engine: str = "tokenizers-0.21.4"
+    context_token_limit: int = 8_000
     context_rules: str = "markdown-block-greedy-no-overlap-truncate-false-v1"
     long_text_aggregation: str = "l2-token-count-weighted-mean-float32-v1"
+    long_text_part_attempt_limit: int = 3
     image_input_rules: str = "base64-source-bytes-no-remote-v1"
     image_transform: str = "source-bytes-no-transform-v1"
     multimodal_formula: str = "l2-normalize-0.5-text-0.5-image-v1"

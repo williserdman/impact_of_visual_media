@@ -54,9 +54,11 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("output_type", "VARCHAR", True, None, False),
         ("normalization", "VARCHAR", True, None, False),
         ("tokenizer_revision", "VARCHAR", True, None, False),
+        ("tokenizer_engine", "VARCHAR", True, None, False),
         ("context_token_limit", "INTEGER", True, None, False),
         ("context_rules", "VARCHAR", True, None, False),
         ("long_text_aggregation", "VARCHAR", True, None, False),
+        ("long_text_part_attempt_limit", "INTEGER", True, None, False),
         ("image_input_rules", "VARCHAR", True, None, False),
         ("image_transform", "VARCHAR", True, None, False),
         ("multimodal_formula", "VARCHAR", True, None, False),
@@ -133,6 +135,10 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("article_input_sha256", "VARCHAR", True, None, True),
         ("part_index", "INTEGER", True, None, True),
         ("part_count", "INTEGER", True, None, False),
+        ("char_start", "BIGINT", True, None, False),
+        ("char_end", "BIGINT", True, None, False),
+        ("byte_start", "BIGINT", True, None, False),
+        ("byte_end", "BIGINT", True, None, False),
         ("part_input_sha256", "VARCHAR", True, None, False),
         ("token_count", "INTEGER", True, None, False),
         ("state", "VARCHAR", True, None, False),
@@ -145,6 +151,23 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("stored_vector_sha256", "VARCHAR", False, None, False),
         ("vector", "FLOAT[2048]", False, None, False),
         ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
+    "long_text_part_generations": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("article_input_sha256", "VARCHAR", True, None, True),
+        ("part_index", "INTEGER", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("part_count", "INTEGER", True, None, False),
+        ("char_start", "BIGINT", True, None, False),
+        ("char_end", "BIGINT", True, None, False),
+        ("byte_start", "BIGINT", True, None, False),
+        ("byte_end", "BIGINT", True, None, False),
+        ("part_input_sha256", "VARCHAR", True, None, False),
+        ("token_count", "INTEGER", True, None, False),
+        ("stored_vector_sha256", "VARCHAR", True, None, False),
+        ("vector", "FLOAT[2048]", True, None, False),
+        ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "article_text_aggregation_provenance": (
         ("article_id", "VARCHAR", True, None, True),
@@ -185,6 +208,16 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
             "configuration_id",
             "article_input_sha256",
             "part_index",
+        ),
+    ),
+    (
+        "long_text_part_generations",
+        (
+            "article_id",
+            "configuration_id",
+            "article_input_sha256",
+            "part_index",
+            "generation_run_id",
         ),
     ),
     (
@@ -429,7 +462,10 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
         JinaEmbeddingAdapter.profile.long_text_aggregation
         == "l2-token-count-weighted-mean-float32-v1"
     )
-    assert JinaEmbeddingAdapter.profile.context_token_limit == 8_192
+    assert JinaEmbeddingAdapter.profile.context_token_limit == 8_000
+    assert 8_192 - JinaEmbeddingAdapter.profile.context_token_limit == 192
+    assert JinaEmbeddingAdapter.profile.tokenizer_engine == "tokenizers-0.21.4"
+    assert JinaEmbeddingAdapter.profile.long_text_part_attempt_limit == 3
     assert "d1e5d70b7b34d927a8cddac458583c4fbe50a914" in (
         JinaEmbeddingAdapter.profile.tokenizer_revision
     )
@@ -450,9 +486,11 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
         "output_type": "changed-output-type",
         "normalization": "changed-normalization",
         "tokenizer_revision": "changed-tokenizer",
+        "tokenizer_engine": "changed-tokenizer-engine",
         "context_token_limit": 4096,
         "context_rules": "changed-context-rules",
         "long_text_aggregation": "changed-aggregation",
+        "long_text_part_attempt_limit": 4,
         "image_input_rules": "changed-image-rules",
         "image_transform": "changed-image-transform",
         "multimodal_formula": "changed-multimodal-formula",
@@ -757,6 +795,26 @@ def test_oversized_block_respects_overlapping_byte_fallback_token_offsets(tmp_pa
 
     assert adapter.embedded_texts == ["a", "😊", "b"]
     assert "".join(adapter.embedded_texts) == markdown
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        expected_spans = [
+            (0, 0, 1, 0, 1),
+            (1, 1, 2, 1, 5),
+            (2, 2, 3, 5, 6),
+        ]
+        assert db.execute(
+            """
+            SELECT part_index, char_start, char_end, byte_start, byte_end
+            FROM long_text_parts
+            ORDER BY part_index
+            """
+        ).fetchall() == expected_spans
+        assert db.execute(
+            """
+            SELECT part_index, char_start, char_end, byte_start, byte_end
+            FROM long_text_part_generations
+            ORDER BY part_index
+            """
+        ).fetchall() == expected_spans
 
 
 class StablePartVectorAdapter(CharacterTokenLongTextAdapter):
@@ -888,6 +946,66 @@ def test_failed_long_text_part_is_content_free_and_resumes_remaining_parts(tmp_p
     assert resumed_adapter.embedded_texts == ["BBBB\n\n", "CCCC"]
 
 
+def test_retryable_long_text_part_becomes_terminal_at_profile_attempt_limit(
+    tmp_path,
+):
+    """Break caught: a retryable part is repurchased forever across replays."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    article_input_sha256 = replace_generated_embedding_markdown(
+        config,
+        "AAAA\n\nBBBB\n\nCCCC",
+    )
+
+    class AlwaysRetrySecondPartAdapter(StablePartVectorAdapter):
+        def embed_text(self, text: str) -> tuple[float, ...]:
+            if text.startswith("BBBB"):
+                self.embedded_texts.append(text)
+                raise JinaHostedAdapterError(
+                    "rate_limit",
+                    retryable=True,
+                    status_code=429,
+                    retry_after_seconds=2.0,
+                )
+            return super().embed_text(text)
+
+    adapter = AlwaysRetrySecondPartAdapter()
+    for _attempt in range(adapter.profile.long_text_part_attempt_limit):
+        with pytest.raises(JinaHostedAdapterError):
+            run_embedding_pipeline(config, adapter, limit=1)
+
+    configuration_identifier = configuration_id(adapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code
+            FROM long_text_parts
+            WHERE configuration_id = ? AND article_input_sha256 = ?
+              AND part_index = 1
+            """,
+            [configuration_identifier, article_input_sha256],
+        ).fetchone() == ("terminal", 3, "rate_limit")
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code
+            FROM embedding_work_items
+            WHERE configuration_id = ? AND modality = 'article_text'
+            """,
+            [configuration_identifier],
+        ).fetchone() == ("terminal", 3, "rate_limit")
+
+    calls_before_replay = tuple(adapter.embedded_texts)
+    replay = run_embedding_pipeline(config, adapter, limit=1)
+
+    assert replay == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        terminal=1,
+        header_absent=1,
+    )
+    assert tuple(adapter.embedded_texts) == calls_before_replay
+
+
 def test_validator_requires_complete_long_text_aggregation_provenance(tmp_path):
     """Break caught: deleting part linkage leaves an aggregate looking complete."""
 
@@ -928,6 +1046,14 @@ def test_validator_recomputes_long_text_aggregate_from_all_weighted_parts(tmp_pa
         )
         db.execute(
             """
+            UPDATE long_text_part_generations
+            SET vector = ?, stored_vector_sha256 = ?
+            WHERE part_index = 0
+            """,
+            [replacement_vector, replacement_hash],
+        )
+        db.execute(
+            """
             UPDATE article_text_aggregation_provenance
             SET part_stored_vector_sha256 = ?
             WHERE part_index = 0
@@ -938,6 +1064,180 @@ def test_validator_recomputes_long_text_aggregate_from_all_weighted_parts(tmp_pa
     codes = {issue.code for issue in validate_embedding_outputs(config).issues}
 
     assert "long_text_vector_mismatch" in codes
+
+
+def test_long_text_reprocess_preserves_every_provenance_linked_part_generation(
+    tmp_path,
+):
+    """Break caught: reprocess erases parts named by archived aggregate provenance."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+    run_embedding_pipeline(config, StablePartVectorAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        first_aggregate_run = db.execute(
+            """
+            SELECT generation_run_id FROM embedding_work_items
+            WHERE modality = 'article_text'
+            """
+        ).fetchone()[0]
+        first_part_generations = db.execute(
+            """
+            SELECT p.part_index, p.part_generation_run_id,
+                   g.part_input_sha256, g.token_count,
+                   g.stored_vector_sha256, g.vector
+            FROM article_text_aggregation_provenance AS p
+            JOIN long_text_part_generations AS g
+              ON g.article_id = p.article_id
+             AND g.configuration_id = p.configuration_id
+             AND g.article_input_sha256 = p.article_input_sha256
+             AND g.part_index = p.part_index
+             AND g.generation_run_id = p.part_generation_run_id
+            WHERE p.generation_run_id = ?
+            ORDER BY p.part_index
+            """,
+            [first_aggregate_run],
+        ).fetchall()
+
+    run_embedding_pipeline(
+        config,
+        StablePartVectorAdapter(),
+        limit=1,
+        reprocess=True,
+    )
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT count(*)
+            FROM embedding_generation_history
+            WHERE modality = 'article_text'
+              AND generation_run_id = ?
+              AND superseded_reason = 'explicit_reprocess'
+            """,
+            [first_aggregate_run],
+        ).fetchone() == (1,)
+        assert db.execute(
+            """
+            SELECT p.part_index, p.part_generation_run_id,
+                   g.part_input_sha256, g.token_count,
+                   g.stored_vector_sha256, g.vector
+            FROM article_text_aggregation_provenance AS p
+            JOIN long_text_part_generations AS g
+              ON g.article_id = p.article_id
+             AND g.configuration_id = p.configuration_id
+             AND g.article_input_sha256 = p.article_input_sha256
+             AND g.part_index = p.part_index
+             AND g.generation_run_id = p.part_generation_run_id
+            WHERE p.generation_run_id = ?
+            ORDER BY p.part_index
+            """,
+            [first_aggregate_run],
+        ).fetchall() == first_part_generations
+        assert db.execute(
+            "SELECT count(*) FROM long_text_part_generations"
+        ).fetchone() == (6,)
+    assert validate_embedding_outputs(config).ok
+
+
+def test_validator_resolves_archived_aggregate_part_generations(tmp_path):
+    """Break caught: archived aggregate provenance points to a missing part."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+    run_embedding_pipeline(config, StablePartVectorAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        first_aggregate_run = db.execute(
+            """
+            SELECT generation_run_id FROM embedding_work_items
+            WHERE modality = 'article_text'
+            """
+        ).fetchone()[0]
+    run_embedding_pipeline(
+        config,
+        StablePartVectorAdapter(),
+        limit=1,
+        reprocess=True,
+    )
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            DELETE FROM long_text_part_generations
+            WHERE generation_run_id = (
+                SELECT part_generation_run_id
+                FROM article_text_aggregation_provenance
+                WHERE generation_run_id = ? AND part_index = 1
+            ) AND part_index = 1
+            """,
+            [first_aggregate_run],
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_long_text_provenance" in codes
+
+
+@pytest.mark.parametrize(
+    "spans",
+    (
+        ((0, 5), (6, 12), (12, 16)),
+        ((0, 7), (6, 12), (12, 16)),
+        ((6, 12), (0, 6), (12, 16)),
+    ),
+    ids=("gap", "overlap", "reorder"),
+)
+def test_validator_reopens_canonical_markdown_for_exact_part_span_coverage(
+    tmp_path,
+    spans,
+):
+    """Break caught: self-consistent part spans do not cover canonical Markdown."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    markdown = "AAAA\n\nBBBB\n\nCCCC"
+    replace_generated_embedding_markdown(config, markdown)
+    run_embedding_pipeline(config, StablePartVectorAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        for part_index, (start, end) in enumerate(spans):
+            part_sha256 = hashlib.sha256(markdown[start:end].encode()).hexdigest()
+            parameters = [
+                start,
+                end,
+                start,
+                end,
+                part_sha256,
+                end - start,
+                part_index,
+            ]
+            db.execute(
+                """
+                UPDATE long_text_parts
+                SET char_start = ?, char_end = ?, byte_start = ?, byte_end = ?,
+                    part_input_sha256 = ?, token_count = ?
+                WHERE part_index = ?
+                """,
+                parameters,
+            )
+            db.execute(
+                """
+                UPDATE long_text_part_generations
+                SET char_start = ?, char_end = ?, byte_start = ?, byte_end = ?,
+                    part_input_sha256 = ?, token_count = ?
+                WHERE part_index = ?
+                """,
+                parameters,
+            )
+            db.execute(
+                """
+                UPDATE article_text_aggregation_provenance
+                SET part_input_sha256 = ?, token_count = ?
+                WHERE part_index = ?
+                """,
+                [part_sha256, end - start, part_index],
+            )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_long_text_source_coverage" in codes
 
 
 def test_changed_long_markdown_replaces_aggregate_and_multimodal_not_old_parts(
@@ -2969,7 +3269,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_eight_long_text_schema(
+def test_embedding_catalog_has_exact_version_nine_long_text_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -3043,6 +3343,7 @@ def test_embedding_catalog_has_exact_version_eight_long_text_schema(
         "embedding_generation_history": "BASE TABLE",
         "embedding_work_items": "BASE TABLE",
         "embeddings": "BASE TABLE",
+        "long_text_part_generations": "BASE TABLE",
         "long_text_parts": "BASE TABLE",
         "metadata": "BASE TABLE",
         "multimodal_embedding_provenance": "BASE TABLE",
@@ -3051,7 +3352,7 @@ def test_embedding_catalog_has_exact_version_eight_long_text_schema(
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "8")]
+    assert metadata == [("schema_version", "9")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -3230,6 +3531,23 @@ def test_pipeline_refuses_version_seven_embedding_catalog_without_migration(tmp_
             "article_text_aggregation_provenance",
             "long_text_parts",
         }.isdisjoint({row[0] for row in db.execute("SHOW TABLES").fetchall()})
+
+
+def test_pipeline_refuses_version_eight_embedding_catalog_without_migration(tmp_path):
+    """Break caught: immutable long-part generations are added in place."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("UPDATE metadata SET value = '8' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
 
 
 def test_validator_accepts_fresh_synthetic_embedding_output(tmp_path):

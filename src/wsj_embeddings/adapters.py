@@ -26,7 +26,7 @@ _JINA_EMBEDDINGS_URL = "https://api.jina.ai/v1/embeddings"
 _JINA_MODEL = "jina-embeddings-v4"
 _JINA_TASK = "retrieval.passage"
 _JINA_DIMENSIONS = 2048
-_CONSERVATIVE_CONTEXT_TOKEN_LIMIT = 8_192
+_CONSERVATIVE_CONTEXT_TOKEN_LIMIT = 8_000
 _TOKENIZER_IDENTITY = (
     "jinaai/jina-embeddings-v4@"
     f"{JINA_V4_TOKENIZER_REVISION}:tokenizer.json#sha256={JINA_V4_TOKENIZER_SHA256}"
@@ -466,7 +466,8 @@ class FakeEmbeddingAdapter:
         observed_model="fake-jina-embeddings-v4",
         observed_api_version="synthetic-v1",
         tokenizer_revision="synthetic-jina-v4-tokenizer-v1",
-        context_token_limit=8_192,
+        tokenizer_engine="synthetic-codepoint-tokenizer-v1",
+        context_token_limit=8_000,
         context_rules="markdown-block-greedy-no-overlap-truncate-false-v1",
         long_text_aggregation="l2-token-count-weighted-mean-float32-v1",
         image_input_rules="base64-source-bytes-no-remote-v1",

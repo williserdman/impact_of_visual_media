@@ -28,7 +28,7 @@ class PinnedTokenizerError(RuntimeError):
 
 
 TokenizerResolver = Callable[[str, str, str], Path]
-TokenizerLoader = Callable[[Path], _LoadedTokenizer]
+TokenizerLoader = Callable[[str], _LoadedTokenizer]
 
 
 class PinnedJinaV4Tokenizer:
@@ -80,8 +80,9 @@ class PinnedJinaV4Tokenizer:
                 "pinned tokenizer artifact checksum does not match"
             )
         try:
-            return self._loader(artifact_path)
-        except (OSError, RuntimeError, TypeError, ValueError):
+            serialized = artifact_bytes.decode("utf-8", errors="strict")
+            return self._loader(serialized)
+        except (OSError, RuntimeError, TypeError, UnicodeError, ValueError):
             raise PinnedTokenizerError(
                 "pinned tokenizer artifact could not be loaded"
             ) from None
@@ -99,7 +100,7 @@ def _resolve_tokenizer(repo_id: str, filename: str, revision: str) -> Path:
     )
 
 
-def _load_tokenizer(path: Path) -> _LoadedTokenizer:
+def _load_tokenizer(serialized: str) -> _LoadedTokenizer:
     from tokenizers import Tokenizer
 
-    return Tokenizer.from_file(str(path))
+    return Tokenizer.from_str(serialized)
