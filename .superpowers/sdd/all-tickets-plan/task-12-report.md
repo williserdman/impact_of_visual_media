@@ -102,3 +102,57 @@ The durable inventory is intentionally retained as content-free run audit
 state. It grows with completed and interrupted full runs; retention/compaction
 policy is outside this ticket and should be designed explicitly rather than
 silently deleting recovery evidence.
+
+## Correction round: atomic visibility and bounded cleanup
+
+Review found that version-13 reconciliation committed physical removals page by
+page. An interruption on page two therefore leaked page-one removals despite
+the run remaining incomplete. Version 14 replaces that protocol with exact
+run-scoped actions, private physical storage, and canonical public
+`embeddings`/`embedding_work_items` views. Each bounded action row binds its
+expected source path, input hash, state, generation run ID, and vector hash.
+Staging is invisible; one run-marker commit exposes the complete overlay;
+bounded compaction archives and materializes exact action rows without changing
+the public result. Failed/interrupted invisible actions are discarded in
+bounded pages before later work. The validator rejects action/base divergence
+and treats visible uncompacted generations as logical run history.
+
+The page-two regression first failed because the first article disappeared
+from the public query (`1 failed in 8.99s`), then passed with atomic views (`1
+passed in 5.20s`). Marker-before-compaction and compaction interruption/resume
+passed `2 passed in 9.80s`. Exact schema-v14 and byte-preserving prior-v13
+refusal passed `2 passed in 2.42s`. The action mismatch validator first lacked
+the stable issue, then passed `1 passed in 3.25s`.
+
+Header reconciliation now stages exact configuration/modality actions rather
+than grouping by article. Generated `NULL`-to-new, path-A-to-path-B, and
+new-to-`NULL` coexistence fixtures prove that the just-processed matching
+configuration remains current while mismatched prior header/dependent
+multimodal work becomes content-free `stale_input` or `not_applicable`.
+Action staging and compaction callbacks both prove a page size of one even when
+an article has multiple modalities/configurations. The stale-input validator
+fixture first reported applicable-input hash/path errors, then passed `1 passed
+in 4.59s` after adding its explicit generation-free disposition.
+
+Rendition cleanup no longer calls `fetchall` or builds a set of every historical
+path. It descriptor-scans one verified candidate at a time and asks the catalog
+an exact `LIMIT 1` current/historical provenance question. The incremental
+candidate fixture preserves a historical reference and removes only the orphan
+(`1 passed in 1.48s`); the existing post-commit interruption/resume fixture also
+remains green.
+
+This correction used generated temporary catalogs and images only. It did not
+read the licensed archive, call a hosted API, run a real full corpus, mutate
+preprocessing output, or update an external issue/ledger.
+
+Final correction verification passed the atomic staging, marker, compaction,
+and expected-identity validator selection (`4 passed in 22.00s`); all header
+association transitions (`3 passed in 22.55s`); schema/refusal, stale-input,
+and cleanup selection (`5 passed in 11.13s`); and a final cross-slice selection
+after binding vector source/input identity (`5 passed in 28.65s`). Changed-file
+Ruff and `git diff --check` passed. The generated embedding smoke returned
+`{"articles": 1, "embeddings": 1, "validation_ok": true}`, and live run help
+showed the required `(--limit LIMIT | --full)` scope.
+Pending visible article-text, header-image, and multimodal generations are also
+treated as logical history until compaction; the generated multimodal marker
+fixture validated cleanly (`1 passed in 6.29s`).

@@ -99,6 +99,8 @@ class EmbeddingPipelineFailpoints:
     after_full_discovery_page: Callable[[int], None] | None = None
     after_full_processing_page: Callable[[int], None] | None = None
     during_full_reconciliation_page: Callable[[int], None] | None = None
+    after_full_reconciliation_visibility: Callable[[], None] | None = None
+    during_full_reconciliation_compaction_page: Callable[[int], None] | None = None
     before_full_rendition_cleanup: Callable[[], None] | None = None
 
 
@@ -365,6 +367,20 @@ def run_embedding_pipeline(
         embedding_pipeline_lock(config.embedding_lock_path) as output_descriptor,
         EmbeddingCatalog.open_in(output_descriptor) as catalog,
     ):
+        while True:
+            with catalog.transaction():
+                discarded = catalog.discard_invisible_reconciliation_page(
+                    page_size=page_size
+                )
+            if not discarded:
+                break
+        while True:
+            with catalog.transaction():
+                compacted = catalog.compact_reconciliation_page(
+                    page_size=page_size
+                )
+            if not compacted:
+                break
         if active_image_codec is not None:
             prepared_images = {
                 article_id: _prepare_image_input(
@@ -710,6 +726,20 @@ def _run_full_embedding_pipeline(
         embedding_pipeline_lock(config.embedding_lock_path) as output_descriptor,
         EmbeddingCatalog.open_in(output_descriptor) as catalog,
     ):
+        while True:
+            with catalog.transaction():
+                discarded = catalog.discard_invisible_reconciliation_page(
+                    page_size=page_size
+                )
+            if not discarded:
+                break
+        while True:
+            with catalog.transaction():
+                compacted = catalog.compact_reconciliation_page(
+                    page_size=page_size
+                )
+            if not compacted:
+                break
         with catalog.transaction():
             catalog.begin_run(
                 run_id,
@@ -786,7 +816,7 @@ def _run_full_embedding_pipeline(
 
             while True:
                 with catalog.transaction():
-                    reconciled = catalog.reconcile_full_page(
+                    reconciled = catalog.stage_reconciliation_page(
                         run_id,
                         page_size=page_size,
                         before_commit=(
@@ -795,15 +825,6 @@ def _run_full_embedding_pipeline(
                     )
                 if not reconciled:
                     break
-            referenced_renditions = {
-                str(row[0])
-                for row in catalog.connection.execute(
-                    """
-                    SELECT rendition_relative_path FROM image_input_provenance
-                    WHERE rendition_relative_path IS NOT NULL
-                    """
-                ).fetchall()
-            }
             with catalog.transaction():
                 catalog.finish_run_metrics(
                     run_id,
@@ -813,14 +834,26 @@ def _run_full_embedding_pipeline(
                     throttles=int(totals["throttles"]),
                     elapsed_seconds=max(0.0, run_clock() - run_started_at),
                 )
-                catalog.finish_run(run_id, reconciled=True)
+                catalog.commit_reconciliation_visibility(run_id)
             result = catalog.run_result(run_id)
+            if failpoints.after_full_reconciliation_visibility is not None:
+                failpoints.after_full_reconciliation_visibility()
+            while True:
+                with catalog.transaction():
+                    compacted = catalog.compact_reconciliation_page(
+                        page_size=page_size,
+                        before_commit=(
+                            failpoints.during_full_reconciliation_compaction_page
+                        ),
+                    )
+                if not compacted:
+                    break
             if failpoints.before_full_rendition_cleanup is not None:
                 failpoints.before_full_rendition_cleanup()
             try:
                 cleanup_orphan_image_renditions(
                     output_descriptor,
-                    referenced_renditions,
+                    catalog.rendition_is_referenced,
                 )
             except ImageCodecError as error:
                 raise EmbeddingPipelineError(

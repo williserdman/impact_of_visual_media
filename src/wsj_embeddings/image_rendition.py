@@ -465,10 +465,10 @@ def verify_image_rendition(
 
 def cleanup_orphan_image_renditions(
     output_descriptor: int,
-    referenced_paths: set[str],
+    is_referenced: Callable[[str], bool],
     *,
     after_unlink: Callable[[str], None] | None = None,
-) -> tuple[str, ...]:
+) -> int:
     """Delete only safe unreferenced final renditions from anchored namespaces."""
 
     try:
@@ -476,10 +476,10 @@ def cleanup_orphan_image_renditions(
             "renditions", _DIRECTORY_FLAGS, dir_fd=output_descriptor
         )
     except FileNotFoundError:
-        return ()
+        return 0
     except OSError as error:
         raise ImageCodecError("unsafe_rendition_output") from error
-    removed: list[str] = []
+    removed = 0
     try:
         with os.scandir(rendition_descriptor) as namespaces:
             for namespace in namespaces:
@@ -510,7 +510,7 @@ def cleanup_orphan_image_renditions(
                             relative_path = (
                                 f"renditions/{namespace.name}/{entry.name}"
                             )
-                            if relative_path in referenced_paths:
+                            if is_referenced(relative_path):
                                 continue
                             before = entry.stat(follow_symlinks=False)
                             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -527,7 +527,7 @@ def cleanup_orphan_image_renditions(
                                 continue
                             os.unlink(entry.name, dir_fd=namespace_descriptor)
                             os.fsync(namespace_descriptor)
-                            removed.append(relative_path)
+                            removed += 1
                             if after_unlink is not None:
                                 after_unlink(relative_path)
                 finally:
@@ -536,7 +536,7 @@ def cleanup_orphan_image_renditions(
         raise ImageCodecError("unsafe_rendition_output") from error
     finally:
         os.close(rendition_descriptor)
-    return tuple(removed)
+    return removed
 
 
 def _open_or_create_directory(parent_descriptor: int, name: str) -> int:

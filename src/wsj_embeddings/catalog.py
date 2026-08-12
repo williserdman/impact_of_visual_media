@@ -26,21 +26,28 @@ from wsj_embeddings.models import (
 )
 from wsj_embeddings.run_metrics import normalize_safe_usage
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "13"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "14"
 
-_EMBEDDING_CATALOG_TABLES = {
+_EMBEDDING_CATALOG_TYPES = {
     "article_text_aggregation_provenance",
     "embedding_configurations",
     "embedding_generation_history",
-    "embedding_work_items",
-    "embeddings",
+    "embedding_work_storage",
+    "embedding_storage",
     "full_run_articles",
     "image_input_provenance",
     "long_text_parts",
     "long_text_part_generations",
     "metadata",
     "multimodal_embedding_provenance",
+    "reconciliation_actions",
     "runs",
+}
+_EMBEDDING_CATALOG_TYPES = {
+    name: "BASE TABLE" for name in _EMBEDDING_CATALOG_TYPES
+} | {
+    "embedding_work_items": "VIEW",
+    "embeddings": "VIEW",
 }
 _TABLE_COLUMNS = {
     "metadata": (
@@ -104,7 +111,7 @@ _TABLE_COLUMNS = {
         ("article_id", "VARCHAR", True, None, True),
         ("header_image_path", "VARCHAR", False, None, False),
     ),
-    "embedding_work_items": (
+    "embedding_work_storage": (
         ("article_id", "VARCHAR", True, None, True),
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
@@ -119,7 +126,7 @@ _TABLE_COLUMNS = {
         ("generation_run_id", "VARCHAR", False, None, False),
         ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
-    "embeddings": (
+    "embedding_storage": (
         ("article_id", "VARCHAR", True, None, True),
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
@@ -130,6 +137,22 @@ _TABLE_COLUMNS = {
         ("input_sha256", "VARCHAR", True, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("vector", "FLOAT[2048]", True, None, False),
+    ),
+    "reconciliation_actions": (
+        ("run_id", "VARCHAR", True, None, True),
+        ("article_id", "VARCHAR", True, None, True),
+        ("modality", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("target_source_relative_path", "VARCHAR", False, None, False),
+        ("target_state", "VARCHAR", True, None, False),
+        ("expected_source_relative_path", "VARCHAR", False, None, False),
+        ("expected_input_sha256", "VARCHAR", False, None, False),
+        ("expected_state", "VARCHAR", True, None, False),
+        ("expected_generation_run_id", "VARCHAR", False, None, False),
+        ("expected_vector_source_relative_path", "VARCHAR", False, None, False),
+        ("expected_vector_input_sha256", "VARCHAR", False, None, False),
+        ("expected_stored_vector_sha256", "VARCHAR", False, None, False),
+        ("staged_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "embedding_generation_history": (
         ("article_id", "VARCHAR", True, None, True),
@@ -229,20 +252,39 @@ _TABLE_COLUMNS = {
         ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
 }
+_VIEW_COLUMNS = {
+    "embedding_work_items": tuple(
+        (name, data_type, False, default, False)
+        for name, data_type, _not_null, default, _primary_key in _TABLE_COLUMNS[
+            "embedding_work_storage"
+        ]
+    ),
+    "embeddings": tuple(
+        (name, data_type, False, default, False)
+        for name, data_type, _not_null, default, _primary_key in _TABLE_COLUMNS[
+            "embedding_storage"
+        ]
+    ),
+}
 _KEY_CONSTRAINTS = {
     ("metadata", "PRIMARY KEY", ("key",)),
     ("embedding_configurations", "PRIMARY KEY", ("configuration_id",)),
     ("runs", "PRIMARY KEY", ("run_id",)),
     ("full_run_articles", "PRIMARY KEY", ("run_id", "article_id")),
     (
-        "embedding_work_items",
+        "embedding_work_storage",
         "PRIMARY KEY",
         ("article_id", "modality", "configuration_id"),
     ),
     (
-        "embeddings",
+        "embedding_storage",
         "PRIMARY KEY",
         ("article_id", "modality", "configuration_id"),
+    ),
+    (
+        "reconciliation_actions",
+        "PRIMARY KEY",
+        ("run_id", "article_id", "modality", "configuration_id"),
     ),
     (
         "embedding_generation_history",
@@ -739,7 +781,7 @@ class EmbeddingCatalog:
             )
             self.connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS embedding_work_items (
+                CREATE TABLE IF NOT EXISTS embedding_work_storage (
                     article_id VARCHAR NOT NULL,
                     modality VARCHAR NOT NULL,
                     configuration_id VARCHAR NOT NULL,
@@ -759,7 +801,7 @@ class EmbeddingCatalog:
             )
             self.connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS embeddings (
+                CREATE TABLE IF NOT EXISTS embedding_storage (
                     article_id VARCHAR NOT NULL,
                     modality VARCHAR NOT NULL,
                     configuration_id VARCHAR NOT NULL,
@@ -772,6 +814,69 @@ class EmbeddingCatalog:
                     vector FLOAT[2048] NOT NULL,
                     PRIMARY KEY (article_id, modality, configuration_id)
                 )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reconciliation_actions (
+                    run_id VARCHAR NOT NULL,
+                    article_id VARCHAR NOT NULL,
+                    modality VARCHAR NOT NULL,
+                    configuration_id VARCHAR NOT NULL,
+                    target_source_relative_path VARCHAR,
+                    target_state VARCHAR NOT NULL,
+                    expected_source_relative_path VARCHAR,
+                    expected_input_sha256 VARCHAR,
+                    expected_state VARCHAR NOT NULL,
+                    expected_generation_run_id VARCHAR,
+                    expected_vector_source_relative_path VARCHAR,
+                    expected_vector_input_sha256 VARCHAR,
+                    expected_stored_vector_sha256 VARCHAR,
+                    staged_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    PRIMARY KEY (
+                        run_id, article_id, modality, configuration_id
+                    )
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE VIEW embeddings AS
+                SELECT storage.* FROM embedding_storage AS storage
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM reconciliation_actions AS action
+                    JOIN runs ON runs.run_id = action.run_id
+                    WHERE runs.reconciliation_complete
+                      AND action.article_id = storage.article_id
+                      AND action.modality = storage.modality
+                      AND action.configuration_id = storage.configuration_id
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE VIEW embedding_work_items AS
+                SELECT storage.* FROM embedding_work_storage AS storage
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM reconciliation_actions AS action
+                    JOIN runs ON runs.run_id = action.run_id
+                    WHERE runs.reconciliation_complete
+                      AND action.article_id = storage.article_id
+                      AND action.modality = storage.modality
+                      AND action.configuration_id = storage.configuration_id
+                )
+                UNION ALL
+                SELECT action.article_id, action.modality,
+                       action.configuration_id,
+                       action.target_source_relative_path,
+                       NULL AS input_sha256, action.target_state,
+                       0 AS attempt_count, NULL AS error_code,
+                       NULL AS status_code, NULL AS retry_after_seconds,
+                       action.run_id AS last_run_id,
+                       NULL AS generation_run_id, action.staged_at AS updated_at
+                FROM reconciliation_actions AS action
+                JOIN runs ON runs.run_id = action.run_id
+                WHERE runs.reconciliation_complete
                 """
             )
             self.connection.execute(
@@ -944,9 +1049,7 @@ class EmbeddingCatalog:
                 """
             ).fetchall()
         }
-        if set(table_types) != _EMBEDDING_CATALOG_TABLES or set(
-            table_types.values()
-        ) != {"BASE TABLE"}:
+        if table_types != _EMBEDDING_CATALOG_TYPES:
             self._raise_unsupported_schema()
         table_columns = {
             table: tuple(
@@ -955,7 +1058,17 @@ class EmbeddingCatalog:
                     f"PRAGMA table_info('{table}')"
                 ).fetchall()
             )
-            for table in _EMBEDDING_CATALOG_TABLES
+            for table, object_type in _EMBEDDING_CATALOG_TYPES.items()
+            if object_type == "BASE TABLE"
+        }
+        view_columns = {
+            view: tuple(
+                (row[1], row[2], row[3], row[4], row[5])
+                for row in self.connection.execute(
+                    f"PRAGMA table_info('{view}')"
+                ).fetchall()
+            )
+            for view in _VIEW_COLUMNS
         }
         constraints = Counter(
             (
@@ -984,6 +1097,7 @@ class EmbeddingCatalog:
         ).fetchall()
         if (
             table_columns != _TABLE_COLUMNS
+            or view_columns != _VIEW_COLUMNS
             or constraints != _EXPECTED_CONSTRAINTS
             or indexes
         ):
@@ -1102,7 +1216,7 @@ class EmbeddingCatalog:
         if row is None:
             self.connection.execute(
                 """
-                INSERT INTO embedding_work_items
+                INSERT INTO embedding_work_storage
                 VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, NULL,
                         current_timestamp)
                 """,
@@ -1162,7 +1276,7 @@ class EmbeddingCatalog:
         if proven_success:
             self.connection.execute(
                 """
-                UPDATE embeddings
+                UPDATE embedding_storage
                 SET source_relative_path = ?, published_at_utc = ?,
                     publication_date_new_york = ?
                 WHERE article_id = ? AND modality = ? AND configuration_id = ?
@@ -1178,7 +1292,7 @@ class EmbeddingCatalog:
             )
             self.connection.execute(
                 """
-                UPDATE embedding_work_items
+                UPDATE embedding_work_storage
                 SET source_relative_path = ?, last_run_id = ?,
                     updated_at = current_timestamp
                 WHERE article_id = ? AND modality = ? AND configuration_id = ?
@@ -1208,7 +1322,7 @@ class EmbeddingCatalog:
                 )
             self.connection.execute(
                 """
-                UPDATE embedding_work_items
+                UPDATE embedding_work_storage
                 SET state = ?, last_run_id = ?, generation_run_id = NULL,
                     updated_at = current_timestamp
                 WHERE article_id = ? AND modality = ? AND configuration_id = ?
@@ -1226,7 +1340,7 @@ class EmbeddingCatalog:
         if state is WorkState.TERMINAL:
             self.connection.execute(
                 """
-                UPDATE embedding_work_items
+                UPDATE embedding_work_storage
                 SET last_run_id = ?, updated_at = current_timestamp
                 WHERE article_id = ? AND modality = ? AND configuration_id = ?
                 """,
@@ -1303,14 +1417,14 @@ class EmbeddingCatalog:
             ).fetchmany(page_size)
         return tuple(str(row[0]) for row in rows)
 
-    def reconcile_full_page(
+    def stage_reconciliation_page(
         self,
         run_id: str,
         *,
         page_size: int,
         before_commit: Callable[[int], None] | None = None,
     ) -> int:
-        """Invalidate one bounded page absent from the completed full inventory."""
+        """Stage one bounded page of exact, still-invisible work actions."""
 
         if page_size < 1:
             raise ValueError("page size must be positive")
@@ -1324,142 +1438,255 @@ class EmbeddingCatalog:
             raise EmbeddingCatalogError(
                 "full reconciliation requires completed discovery"
             )
-        article_ids = tuple(
-            str(row[0])
-            for row in self.connection.execute(
-                """
-                SELECT work.article_id
-                FROM embedding_work_items AS work
-                LEFT JOIN full_run_articles AS seen
-                  ON seen.run_id = ? AND seen.article_id = work.article_id
-                WHERE work.state <> ?
-                  AND (
-                      seen.article_id IS NULL
-                      OR (
-                          work.modality = ?
-                          AND work.source_relative_path IS DISTINCT FROM
+        rows = self.connection.execute(
+            """
+            SELECT work.article_id, work.modality, work.configuration_id,
+                   CASE
+                     WHEN seen.article_id IS NULL THEN NULL
+                     WHEN work.modality = ? THEN seen.header_image_path
+                     ELSE NULL
+                   END AS target_source_relative_path,
+                   CASE
+                     WHEN seen.article_id IS NOT NULL
+                      AND work.modality = ?
+                      AND seen.header_image_path IS NULL
+                     THEN ? ELSE ?
+                   END AS target_state,
+                   work.source_relative_path, work.input_sha256, work.state,
+                   work.generation_run_id, vector.source_relative_path,
+                   vector.input_sha256, vector.stored_vector_sha256
+            FROM embedding_work_storage AS work
+            LEFT JOIN full_run_articles AS seen
+              ON seen.run_id = ? AND seen.article_id = work.article_id
+            LEFT JOIN embedding_storage AS vector
+              ON vector.article_id = work.article_id
+             AND vector.modality = work.modality
+             AND vector.configuration_id = work.configuration_id
+            LEFT JOIN reconciliation_actions AS prior
+              ON prior.run_id = ? AND prior.article_id = work.article_id
+             AND prior.modality = work.modality
+             AND prior.configuration_id = work.configuration_id
+            WHERE prior.run_id IS NULL AND (
+                seen.article_id IS NULL
+                OR (
+                    work.modality = ?
+                    AND work.source_relative_path IS DISTINCT FROM
+                        seen.header_image_path
+                )
+                OR (
+                    work.modality = ? AND EXISTS (
+                        SELECT 1 FROM embedding_work_storage AS header
+                        WHERE header.article_id = work.article_id
+                          AND header.configuration_id = work.configuration_id
+                          AND header.modality = ?
+                          AND header.source_relative_path IS DISTINCT FROM
                               seen.header_image_path
-                      )
-                  )
-                GROUP BY work.article_id
-                ORDER BY work.article_id
-                LIMIT ?
+                    )
+                )
+            )
+            ORDER BY work.article_id, work.modality, work.configuration_id
+            LIMIT ?
+            """,
+            [
+                EmbeddingModality.HEADER_IMAGE.value,
+                EmbeddingModality.HEADER_IMAGE.value,
+                WorkState.NOT_APPLICABLE.value,
+                WorkState.STALE_INPUT.value,
+                run_id,
+                run_id,
+                EmbeddingModality.HEADER_IMAGE.value,
+                EmbeddingModality.MULTIMODAL_ARTICLE.value,
+                EmbeddingModality.HEADER_IMAGE.value,
+                page_size,
+            ],
+        ).fetchmany(page_size)
+        if rows:
+            self.connection.executemany(
+                """
+                INSERT INTO reconciliation_actions
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                """,
+                [[run_id, *row] for row in rows],
+            )
+        if before_commit is not None and rows:
+            before_commit(len(rows))
+        return len(rows)
+
+    def commit_reconciliation_visibility(self, run_id: str) -> None:
+        """Atomically expose one fully staged, identity-bound action set."""
+
+        mismatch = self.connection.execute(
+            """
+            SELECT count(*)
+            FROM reconciliation_actions AS action
+            LEFT JOIN embedding_work_storage AS work
+              USING (article_id, modality, configuration_id)
+            LEFT JOIN embedding_storage AS vector
+              USING (article_id, modality, configuration_id)
+            WHERE action.run_id = ? AND (
+                work.article_id IS NULL
+                OR work.source_relative_path IS DISTINCT FROM
+                    action.expected_source_relative_path
+                OR work.input_sha256 IS DISTINCT FROM action.expected_input_sha256
+                OR work.state IS DISTINCT FROM action.expected_state
+                OR work.generation_run_id IS DISTINCT FROM
+                    action.expected_generation_run_id
+                OR vector.source_relative_path IS DISTINCT FROM
+                    action.expected_vector_source_relative_path
+                OR vector.input_sha256 IS DISTINCT FROM
+                    action.expected_vector_input_sha256
+                OR vector.stored_vector_sha256 IS DISTINCT FROM
+                    action.expected_stored_vector_sha256
+            )
+            """,
+            [run_id],
+        ).fetchone()[0]
+        if mismatch:
+            raise EmbeddingCatalogError("reconciliation base identity changed")
+        self.finish_run(run_id, reconciled=True)
+
+    def compact_reconciliation_page(
+        self,
+        *,
+        page_size: int,
+        before_commit: Callable[[int], None] | None = None,
+    ) -> int:
+        """Materialize one exact action-row page without changing public state."""
+
+        if page_size < 1:
+            raise ValueError("page size must be positive")
+        actions = self.connection.execute(
+            """
+            SELECT action.run_id, action.article_id, action.modality,
+                   action.configuration_id,
+                   action.target_source_relative_path, action.target_state,
+                   action.expected_source_relative_path,
+                   action.expected_input_sha256, action.expected_state,
+                   action.expected_generation_run_id,
+                   action.expected_vector_source_relative_path,
+                   action.expected_vector_input_sha256,
+                   action.expected_stored_vector_sha256
+            FROM reconciliation_actions AS action
+            JOIN runs ON runs.run_id = action.run_id
+            WHERE runs.reconciliation_complete
+            ORDER BY action.run_id, action.article_id, action.modality,
+                     action.configuration_id
+            LIMIT ?
+            """,
+            [page_size],
+        ).fetchmany(page_size)
+        for action in actions:
+            (
+                action_run_id,
+                article_id,
+                modality,
+                configuration_identifier,
+                target_source_relative_path,
+                target_state,
+                expected_source_relative_path,
+                expected_input_sha256,
+                expected_state,
+                expected_generation_run_id,
+                expected_vector_source_relative_path,
+                expected_vector_input_sha256,
+                expected_stored_vector_sha256,
+            ) = action
+            identity = self.connection.execute(
+                """
+                SELECT work.source_relative_path, work.input_sha256, work.state,
+                       work.generation_run_id, vector.source_relative_path,
+                       vector.input_sha256, vector.stored_vector_sha256
+                FROM embedding_work_storage AS work
+                LEFT JOIN embedding_storage AS vector
+                  USING (article_id, modality, configuration_id)
+                WHERE work.article_id = ? AND work.modality = ?
+                  AND work.configuration_id = ?
+                """,
+                [article_id, modality, configuration_identifier],
+            ).fetchone()
+            expected = (
+                expected_source_relative_path,
+                expected_input_sha256,
+                expected_state,
+                expected_generation_run_id,
+                expected_vector_source_relative_path,
+                expected_vector_input_sha256,
+                expected_stored_vector_sha256,
+            )
+            if identity != expected:
+                raise EmbeddingCatalogError("reconciliation base identity changed")
+            self._archive_active_generation_from_storage(
+                run_id=str(action_run_id),
+                article_id=str(article_id),
+                modality=str(modality),
+                configuration_identifier=str(configuration_identifier),
+            )
+            self.connection.execute(
+                """
+                DELETE FROM embedding_storage
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [article_id, modality, configuration_identifier],
+            )
+            self.connection.execute(
+                """
+                UPDATE embedding_work_storage
+                SET source_relative_path = ?, input_sha256 = NULL, state = ?,
+                    attempt_count = 0, error_code = NULL, status_code = NULL,
+                    retry_after_seconds = NULL, last_run_id = ?,
+                    generation_run_id = NULL, updated_at = current_timestamp
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
                 """,
                 [
-                    run_id,
-                    WorkState.STALE_INPUT.value,
-                    EmbeddingModality.HEADER_IMAGE.value,
-                    page_size,
+                    target_source_relative_path,
+                    target_state,
+                    action_run_id,
+                    article_id,
+                    modality,
+                    configuration_identifier,
                 ],
-            ).fetchmany(page_size)
-        )
-        for article_id in article_ids:
-            disappeared = not bool(
-                self.connection.execute(
-                    """
-                    SELECT count(*) FROM full_run_articles
-                    WHERE run_id = ? AND article_id = ?
-                    """,
-                    [run_id, article_id],
-                ).fetchone()[0]
             )
-            seen_header_path = None
-            if not disappeared:
-                seen_header_path = self.connection.execute(
-                    """
-                    SELECT header_image_path FROM full_run_articles
-                    WHERE run_id = ? AND article_id = ?
-                    """,
-                    [run_id, article_id],
-                ).fetchone()[0]
-            if disappeared:
-                rows = self.connection.execute(
-                    """
-                    SELECT modality, configuration_id
-                    FROM embedding_work_items WHERE article_id = ?
-                    ORDER BY configuration_id, modality
-                    """,
-                    [article_id],
-                ).fetchall()
-            else:
-                rows = self.connection.execute(
-                    """
-                    SELECT modality, configuration_id
-                    FROM embedding_work_items
-                    WHERE article_id = ? AND modality IN (?, ?)
-                    ORDER BY configuration_id, modality
-                    """,
-                    [
-                        article_id,
-                        EmbeddingModality.HEADER_IMAGE.value,
-                        EmbeddingModality.MULTIMODAL_ARTICLE.value,
-                    ],
-                ).fetchall()
-            for modality, configuration_identifier in rows:
-                if (
-                    not disappeared
-                    and seen_header_path is None
-                    and modality == EmbeddingModality.HEADER_IMAGE.value
-                ):
-                    self._invalidate_work_generation(
-                        run_id=run_id,
-                        article_id=article_id,
-                        modality=str(modality),
-                        configuration_identifier=str(configuration_identifier),
-                        reason=SupersessionReason.INPUT_CHANGED,
-                        replacement_source_relative_path=None,
-                        replacement_input_sha256=None,
-                    )
-                    self.connection.execute(
-                        """
-                        UPDATE embedding_work_items
-                        SET source_relative_path = NULL, input_sha256 = NULL,
-                            state = ?, attempt_count = 0, error_code = NULL,
-                            status_code = NULL, retry_after_seconds = NULL,
-                            last_run_id = ?, generation_run_id = NULL,
-                            updated_at = current_timestamp
-                        WHERE article_id = ? AND modality = ?
-                          AND configuration_id = ?
-                        """,
-                        [
-                            WorkState.NOT_APPLICABLE.value,
-                            run_id,
-                            article_id,
-                            modality,
-                            configuration_identifier,
-                        ],
-                    )
-                    continue
-                self._invalidate_work_generation(
-                    run_id=run_id,
-                    article_id=article_id,
-                    modality=str(modality),
-                    configuration_identifier=str(configuration_identifier),
-                    reason=SupersessionReason.INPUT_CHANGED,
-                    replacement_source_relative_path=None,
-                    replacement_input_sha256=None,
-                )
-                self.connection.execute(
-                    """
-                    UPDATE embedding_work_items
-                    SET state = ?, attempt_count = 0, error_code = NULL,
-                        status_code = NULL, retry_after_seconds = NULL,
-                        last_run_id = ?, generation_run_id = NULL,
-                        updated_at = current_timestamp
-                    WHERE article_id = ? AND modality = ?
-                      AND configuration_id = ?
-                    """,
-                    [
-                        WorkState.STALE_INPUT.value,
-                        run_id,
-                        article_id,
-                        modality,
-                        configuration_identifier,
-                    ],
-                )
-        if before_commit is not None and article_ids:
-            before_commit(len(article_ids))
-        return len(article_ids)
+            self.connection.execute(
+                """
+                DELETE FROM reconciliation_actions
+                WHERE run_id = ? AND article_id = ? AND modality = ?
+                  AND configuration_id = ?
+                """,
+                [action_run_id, article_id, modality, configuration_identifier],
+            )
+        if before_commit is not None and actions:
+            before_commit(len(actions))
+        return len(actions)
+
+    def discard_invisible_reconciliation_page(self, *, page_size: int) -> int:
+        """Drop one bounded page staged by terminal non-visible runs."""
+
+        if page_size < 1:
+            raise ValueError("page size must be positive")
+        keys = self.connection.execute(
+            """
+            SELECT action.run_id, action.article_id, action.modality,
+                   action.configuration_id
+            FROM reconciliation_actions AS action
+            JOIN runs ON runs.run_id = action.run_id
+            WHERE NOT runs.reconciliation_complete
+              AND runs.status IN ('failed', 'interrupted')
+            ORDER BY action.run_id, action.article_id, action.modality,
+                     action.configuration_id
+            LIMIT ?
+            """,
+            [page_size],
+        ).fetchmany(page_size)
+        if keys:
+            self.connection.executemany(
+                """
+                DELETE FROM reconciliation_actions
+                WHERE run_id = ? AND article_id = ? AND modality = ?
+                  AND configuration_id = ?
+                """,
+                keys,
+            )
+        return len(keys)
 
     def finish_run(self, run_id: str, *, reconciled: bool) -> None:
         """Mark one normally returned run terminal after all required work."""
@@ -1516,7 +1743,7 @@ class EmbeddingCatalog:
         if row is None:
             self.connection.execute(
                 """
-                INSERT INTO embedding_work_items
+                INSERT INTO embedding_work_storage
                 VALUES (?, ?, ?, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, NULL,
                         current_timestamp)
                 """,
@@ -1545,9 +1772,23 @@ class EmbeddingCatalog:
                     replacement_source_relative_path=None,
                     replacement_input_sha256=None,
                 )
+            if modality == EmbeddingModality.HEADER_IMAGE.value:
+                self.connection.execute(
+                    """
+                    UPDATE embedding_work_storage SET state = ?
+                    WHERE article_id = ? AND modality = ?
+                      AND configuration_id = ?
+                    """,
+                    [
+                        WorkState.STALE_INPUT.value,
+                        article_id,
+                        EmbeddingModality.MULTIMODAL_ARTICLE.value,
+                        configuration_identifier,
+                    ],
+                )
         self.connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET source_relative_path = NULL, input_sha256 = NULL, state = ?,
                 attempt_count = 0, error_code = NULL, status_code = NULL,
                 retry_after_seconds = NULL, last_run_id = ?,
@@ -1597,7 +1838,7 @@ class EmbeddingCatalog:
         if row is None:
             self.connection.execute(
                 """
-                INSERT INTO embedding_work_items
+                INSERT INTO embedding_work_storage
                 VALUES (?, ?, ?, ?, NULL, ?, 0, ?, NULL, NULL, ?, NULL,
                         current_timestamp)
                 """,
@@ -1632,7 +1873,7 @@ class EmbeddingCatalog:
                     )
             self.connection.execute(
                 """
-                UPDATE embedding_work_items
+                UPDATE embedding_work_storage
                 SET source_relative_path = ?, input_sha256 = NULL, state = ?,
                     attempt_count = 0, error_code = ?, status_code = NULL,
                     retry_after_seconds = NULL, last_run_id = ?,
@@ -1675,14 +1916,14 @@ class EmbeddingCatalog:
         )
         self.connection.execute(
             """
-            DELETE FROM embeddings
+            DELETE FROM embedding_storage
             WHERE article_id = ? AND modality = ? AND configuration_id = ?
             """,
             [article_id, modality, configuration_identifier],
         )
         self.connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET source_relative_path = ?,
                 input_sha256 = COALESCE(?, input_sha256), state = ?,
                 attempt_count = 0, error_code = NULL, status_code = NULL,
@@ -1752,6 +1993,51 @@ class EmbeddingCatalog:
             ],
         )
 
+    def _archive_active_generation_from_storage(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+    ) -> None:
+        """Archive the exact physical generation hidden by a visible action."""
+
+        row = self.connection.execute(
+            """
+            SELECT work.generation_run_id, vector.source_relative_path,
+                   vector.input_sha256, vector.stored_vector_sha256
+            FROM embedding_storage AS vector
+            JOIN embedding_work_storage AS work
+              USING (article_id, modality, configuration_id)
+            WHERE vector.article_id = ? AND vector.modality = ?
+              AND vector.configuration_id = ?
+            """,
+            [article_id, modality, configuration_identifier],
+        ).fetchone()
+        if row is None:
+            return
+        self.connection.execute(
+            """
+            INSERT INTO embedding_generation_history
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            ON CONFLICT (
+                article_id, modality, configuration_id, generation_run_id
+            ) DO NOTHING
+            """,
+            [
+                article_id,
+                modality,
+                configuration_identifier,
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                run_id,
+                SupersessionReason.INPUT_CHANGED.value,
+            ],
+        )
+
     def start_attempt(
         self,
         *,
@@ -1764,7 +2050,7 @@ class EmbeddingCatalog:
 
         self.connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET state = ?, attempt_count = attempt_count + 1,
                 error_code = NULL, status_code = NULL,
                 retry_after_seconds = NULL, last_run_id = ?,
@@ -2060,7 +2346,7 @@ class EmbeddingCatalog:
             return
         self.connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET state = ?, error_code = ?, status_code = ?,
                 retry_after_seconds = ?, last_run_id = ?,
                 generation_run_id = NULL, updated_at = current_timestamp
@@ -2295,7 +2581,7 @@ class EmbeddingCatalog:
             raise ValueError("failure checkpoint requires a failure state")
         self.connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET state = ?, error_code = ?, status_code = ?,
                 retry_after_seconds = ?, last_run_id = ?,
                 generation_run_id = NULL,
@@ -2355,7 +2641,7 @@ class EmbeddingCatalog:
 
         self.connection.execute(
             """
-            INSERT INTO embeddings
+            INSERT INTO embedding_storage
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (article_id, modality, configuration_id)
             DO UPDATE SET
@@ -2382,7 +2668,7 @@ class EmbeddingCatalog:
         )
         self.connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET state = ?, source_relative_path = ?, input_sha256 = ?,
                 error_code = NULL,
                 status_code = NULL, retry_after_seconds = NULL,
@@ -2726,6 +3012,20 @@ class EmbeddingCatalog:
                 elapsed_seconds,
                 run_id,
             ],
+        )
+
+    def rendition_is_referenced(self, relative_path: str) -> bool:
+        """Check one candidate against current and historical provenance."""
+
+        return (
+            self.connection.execute(
+                """
+                SELECT 1 FROM image_input_provenance
+                WHERE rendition_relative_path = ? LIMIT 1
+                """,
+                [relative_path],
+            ).fetchone()
+            is not None
         )
 
     def run_result(self, run_id: str) -> EmbeddingRunResult:

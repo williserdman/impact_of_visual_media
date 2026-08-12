@@ -15,7 +15,7 @@ downstream.
 The repository also contains a downstream text/header-image embedding slice.
 `wsj-embeddings smoke` creates one generated canonical article in a temporary
 directory, encodes it with a deterministic fake adapter, publishes a
-2,048-dimensional normalized `article_text` vector to a separate twelve-table
+2,048-dimensional normalized `article_text` vector to a separate versioned
 DuckDB catalog, validates it, and removes the fixture. It never reads the
 configured archive or calls a network service. `wsj-embeddings pilot` is a
 separate, explicit hosted Jina v4 measurement command: it sends only fixed
@@ -312,14 +312,15 @@ references only; the pipeline never downloads them.
 
 ## Text, header-image, and multimodal embedding catalog contract
 
-The downstream catalog is a separate schema-version-13 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-14 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted production CLI.
-Versions 1 through 12 are refused without migration; move reproducible derived
+Versions 1 through 13 are refused without migration; move reproducible derived
 output aside or choose a fresh embedding output root.
 
-The catalog has exactly twelve base tables and no indexes. The operational
+The catalog has exactly thirteen base tables, two canonical views, and no
+indexes. The operational
 `full_run_articles` relation stores only run/article identity and optional
 source-relative header association, never Markdown or image bytes:
 
@@ -329,8 +330,11 @@ source-relative header association, never Markdown or image bytes:
 | `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `scope VARCHAR`, `status VARCHAR`, `discovery_complete BOOLEAN`, `reconciliation_complete BOOLEAN`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `hosted_requests INTEGER`, `hosted_retries INTEGER`, `usage_json VARCHAR`, `throttles INTEGER`, `elapsed_seconds DOUBLE`, `started_at TIMESTAMPTZ`, `finished_at TIMESTAMPTZ` | `run_id` |
 | `full_run_articles` | `run_id VARCHAR`, `article_id VARCHAR`, `header_image_path VARCHAR` | `(run_id, article_id)` |
-| `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
-| `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
+| `embedding_work_storage` | physical columns exposed by `embedding_work_items` | `(article_id, modality, configuration_id)` |
+| `embedding_storage` | physical columns exposed by `embeddings` | `(article_id, modality, configuration_id)` |
+| `reconciliation_actions` | exact run/article/modality/configuration target disposition plus expected source/input/state/generation/vector identity and `staged_at` | `(run_id, article_id, modality, configuration_id)` |
+| `embedding_work_items` (view) | canonical current work interface over storage and visible actions | — |
+| `embeddings` (view) | canonical current vector interface over storage and visible actions | — |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 | `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
 | `image_input_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_sha256 VARCHAR`, `source_format VARCHAR`, `source_bytes BIGINT`, `source_width INTEGER`, `source_height INTEGER`, `source_frames INTEGER`, `embedded_input_sha256 VARCHAR`, `embedded_format VARCHAR`, `embedded_bytes BIGINT`, `embedded_width INTEGER`, `embedded_height INTEGER`, `embedded_frames INTEGER`, `transform_id VARCHAR`, `rendition_relative_path VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
@@ -339,7 +343,8 @@ source-relative header association, never Markdown or image bytes:
 | `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
 
 The source path is nullable for article text and absent images. The input hash
-is nullable for `not_applicable` image work and only one applicable case: a
+is nullable for content-free `stale_input` work, `not_applicable` image work,
+and only one applicable case: a
 safe-path `retryable` header with `missing_header_image`, zero adapter attempts,
 and no active vector or generation. The three failure-detail columns retain
 classified codes and numeric response/retry metadata, never exception text or
@@ -432,11 +437,14 @@ and aggregate reconstruction, but never Markdown, image bytes, or excerpts.
 unchanged across reuse. Supersession history therefore names the run that
 actually generated the archived vector rather than a later replay.
 
-Completed full reconciliation removes active vectors for disappeared canonical
-articles across every retained configuration. A disappeared header association
-keeps article text, marks header work `not_applicable`, and removes dependent
-multimodal vectors across configurations. Derived renditions are removed only
-after their catalog references commit. If cleanup is interrupted, offline
+Full reconciliation first stages exact identity-bound actions in bounded action
+pages. Failed staging is invisible. One run-marker commit exposes the complete
+action set atomically through the canonical views, then bounded idempotent
+compaction materializes the same state. Header association changes preserve a
+configuration already matching the new path and stale only mismatched header
+and dependent multimodal work. Derived renditions are removed only after their
+catalog references commit, with one exact history-reference query per scanned
+candidate rather than a corpus-sized set. If cleanup is interrupted, offline
 validation reports the unreferenced file as `orphan_image_rendition`; a later
 completed full run safely retries cleanup without touching source or
 preprocessing output.

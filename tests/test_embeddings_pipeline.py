@@ -49,6 +49,7 @@ from wsj_embeddings.image_rendition import (
     ImageCodecError,
     ImageInfo,
     PillowImageCodec,
+    cleanup_orphan_image_renditions,
 )
 from wsj_embeddings.pipeline import (
     EmbeddingPipelineError,
@@ -120,7 +121,7 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("article_id", "VARCHAR", True, None, True),
         ("header_image_path", "VARCHAR", False, None, False),
     ),
-    "embedding_work_items": (
+    "embedding_work_storage": (
         ("article_id", "VARCHAR", True, None, True),
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
@@ -135,7 +136,7 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("generation_run_id", "VARCHAR", False, None, False),
         ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
-    "embeddings": (
+    "embedding_storage": (
         ("article_id", "VARCHAR", True, None, True),
         ("modality", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
@@ -146,6 +147,22 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("input_sha256", "VARCHAR", True, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("vector", "FLOAT[2048]", True, None, False),
+    ),
+    "reconciliation_actions": (
+        ("run_id", "VARCHAR", True, None, True),
+        ("article_id", "VARCHAR", True, None, True),
+        ("modality", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("target_source_relative_path", "VARCHAR", False, None, False),
+        ("target_state", "VARCHAR", True, None, False),
+        ("expected_source_relative_path", "VARCHAR", False, None, False),
+        ("expected_input_sha256", "VARCHAR", False, None, False),
+        ("expected_state", "VARCHAR", True, None, False),
+        ("expected_generation_run_id", "VARCHAR", False, None, False),
+        ("expected_vector_source_relative_path", "VARCHAR", False, None, False),
+        ("expected_vector_input_sha256", "VARCHAR", False, None, False),
+        ("expected_stored_vector_sha256", "VARCHAR", False, None, False),
+        ("staged_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "embedding_generation_history": (
         ("article_id", "VARCHAR", True, None, True),
@@ -251,10 +268,14 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     ("runs", ("run_id",)),
     ("full_run_articles", ("run_id", "article_id")),
     (
-        "embedding_work_items",
+        "embedding_work_storage",
         ("article_id", "modality", "configuration_id"),
     ),
-    ("embeddings", ("article_id", "modality", "configuration_id")),
+    ("embedding_storage", ("article_id", "modality", "configuration_id")),
+    (
+        "reconciliation_actions",
+        ("run_id", "article_id", "modality", "configuration_id"),
+    ),
     (
         "embedding_generation_history",
         ("article_id", "modality", "configuration_id", "generation_run_id"),
@@ -289,6 +310,20 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     (
         "article_text_aggregation_provenance",
         ("article_id", "configuration_id", "generation_run_id", "part_index"),
+    ),
+}
+EXPECTED_EMBEDDING_VIEW_COLUMNS = {
+    "embedding_work_items": tuple(
+        (name, data_type, False, default, False)
+        for name, data_type, _not_null, default, _primary_key in (
+            EXPECTED_EMBEDDING_TABLE_COLUMNS["embedding_work_storage"]
+        )
+    ),
+    "embeddings": tuple(
+        (name, data_type, False, default, False)
+        for name, data_type, _not_null, default, _primary_key in (
+            EXPECTED_EMBEDDING_TABLE_COLUMNS["embedding_storage"]
+        )
     ),
 }
 
@@ -2740,7 +2775,7 @@ def test_validator_recomputes_composite_and_checks_immutable_linkage(
             ).hexdigest()
             db.execute(
                 """
-                UPDATE embeddings
+                UPDATE embedding_storage
                 SET vector = ?, stored_vector_sha256 = ?
                 WHERE modality = 'multimodal_article'
                 """,
@@ -2779,14 +2814,14 @@ def test_run_coverage_cannot_use_another_runs_generation_to_mask_deletion(
         ).fetchall() == [(1,), (1,)]
         db.execute(
             """
-            DELETE FROM embeddings
+            DELETE FROM embedding_storage
             WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
               AND modality = 'article_text'
             """
         )
         db.execute(
             """
-            DELETE FROM embedding_work_items
+            DELETE FROM embedding_work_storage
             WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
               AND modality = 'article_text'
             """
@@ -2882,7 +2917,7 @@ def test_missing_source_vector_invalidates_composite_before_failed_regeneration(
     attach_generated_header_image(config, b"generated missing source vector")
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
     with duckdb.connect(str(config.embedding_catalog)) as db:
-        db.execute("DELETE FROM embeddings WHERE modality = 'header_image'")
+        db.execute("DELETE FROM embedding_storage WHERE modality = 'header_image'")
 
     class FailingImageAdapter(RecordingMultimodalAdapter):
         def embed_image(self, image_base64: str) -> tuple[float, ...]:
@@ -2943,7 +2978,7 @@ def test_validator_reports_antipodal_multimodal_recomputation_failure(tmp_path):
         ).hexdigest()
         db.execute(
             """
-            UPDATE embeddings
+            UPDATE embedding_storage
             SET vector = ?, stored_vector_sha256 = ?
             WHERE modality = 'header_image'
             """,
@@ -2958,7 +2993,7 @@ def test_validator_reports_antipodal_multimodal_recomputation_failure(tmp_path):
         )
         db.execute(
             """
-            UPDATE embeddings
+            UPDATE embedding_storage
             SET input_sha256 = ?
             WHERE modality = 'multimodal_article'
             """,
@@ -2966,7 +3001,7 @@ def test_validator_reports_antipodal_multimodal_recomputation_failure(tmp_path):
         )
         db.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET input_sha256 = ?
             WHERE modality = 'multimodal_article'
             """,
@@ -5771,6 +5806,174 @@ def test_failed_reconciliation_page_rolls_back_and_resumed_full_finishes(
         ).fetchall() == [("stale_input",)]
 
 
+def test_full_reconciliation_staging_failure_on_page_two_is_invisible(tmp_path):
+    """Break caught: page one removals leak before page-two staging fails."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    for suffix in ("B", "C"):
+        add_generated_embedding_article(
+            config,
+            article_id=f"wsj:SYNTHETIC-EMBEDDING-{suffix}",
+            markdown=f"# Generated article {suffix}\n",
+        )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        visible_embeddings_before = db.execute(
+            """
+            SELECT article_id, modality, configuration_id, stored_vector_sha256
+            FROM embeddings ORDER BY 1, 2, 3
+            """
+        ).fetchall()
+        visible_work_before = db.execute(
+            """
+            SELECT article_id, modality, configuration_id, state,
+                   generation_run_id
+            FROM embedding_work_items ORDER BY 1, 2, 3
+            """
+        ).fetchall()
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+
+    staged_pages = 0
+
+    def interrupt_second_staging_page(_page_size):
+        nonlocal staged_pages
+        assert _page_size == 1
+        staged_pages += 1
+        if staged_pages == 2:
+            raise SyntheticInterruption()
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            FakeEmbeddingAdapter(),
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                during_full_reconciliation_page=interrupt_second_staging_page,
+            ),
+        )
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT article_id, modality, configuration_id, stored_vector_sha256
+            FROM embeddings ORDER BY 1, 2, 3
+            """
+        ).fetchall() == visible_embeddings_before
+        assert db.execute(
+            """
+            SELECT article_id, modality, configuration_id, state,
+                   generation_run_id
+            FROM embedding_work_items ORDER BY 1, 2, 3
+            """
+        ).fetchall() == visible_work_before
+
+
+def test_full_reconciliation_visibility_is_atomic_before_compaction(tmp_path):
+    """Break caught: visibility waits for physical action compaction."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:SYNTHETIC-EMBEDDING-B",
+        markdown="# Generated article B\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            FakeEmbeddingAdapter(),
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_full_reconciliation_visibility=lambda: (_ for _ in ()).throw(
+                    SyntheticInterruption()
+                ),
+            ),
+        )
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+        assert db.execute(
+            "SELECT DISTINCT state FROM embedding_work_items"
+        ).fetchall() == [("stale_input",)]
+        assert db.execute("SELECT count(*) FROM embedding_storage").fetchone() == (
+            2,
+        )
+        assert db.execute(
+            "SELECT count(*) FROM reconciliation_actions"
+        ).fetchone()[0] > 0
+        assert db.execute(
+            """
+            SELECT status, reconciliation_complete FROM runs
+            ORDER BY started_at DESC, run_id DESC LIMIT 1
+            """
+        ).fetchone() == ("succeeded", True)
+    assert validate_embedding_outputs(config).ok
+
+
+def test_full_reconciliation_compaction_is_bounded_resumable_and_view_invariant(
+    tmp_path,
+):
+    """Break caught: compaction interruption changes public state or loses work."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:SYNTHETIC-EMBEDDING-B",
+        markdown="# Generated article B\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+    compaction_pages = 0
+
+    def interrupt_second_compaction_page(count):
+        nonlocal compaction_pages
+        assert count == 1
+        compaction_pages += 1
+        if compaction_pages == 2:
+            raise SyntheticInterruption()
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            FakeEmbeddingAdapter(),
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                during_full_reconciliation_compaction_page=(
+                    interrupt_second_compaction_page
+                ),
+            ),
+        )
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+        assert db.execute(
+            "SELECT DISTINCT state FROM embedding_work_items"
+        ).fetchall() == [("stale_input",)]
+        remaining = db.execute(
+            "SELECT count(*) FROM reconciliation_actions"
+        ).fetchone()[0]
+        assert remaining > 0
+
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+        assert db.execute(
+            "SELECT DISTINCT state FROM embedding_work_items"
+        ).fetchall() == [("stale_input",)]
+        assert db.execute(
+            "SELECT count(*) FROM reconciliation_actions"
+        ).fetchone() == (0,)
+
+
 def test_full_discovery_and_processing_are_bounded_lexical_pages(
     tmp_path,
     monkeypatch,
@@ -5862,6 +6065,84 @@ def test_full_header_disappearance_reconciles_every_configuration(tmp_path):
         ).fetchall() == [
             ("header_image", "not_applicable"),
             ("multimodal_article", "stale_input"),
+        ]
+
+
+def test_full_header_appearance_preserves_matching_current_configuration(tmp_path):
+    """Break caught: null-to-new reconciliation stales the new generation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), full=True, page_size=1)
+    new_path = attach_generated_header_image(config, b"generated new header")
+
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+
+    current_id = configuration_id(FakeEmbeddingAdapter.profile)
+    prior_id = configuration_id(PriorConfigurationAdapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, state, source_relative_path
+            FROM embedding_work_items WHERE configuration_id = ? ORDER BY 1
+            """,
+            [current_id],
+        ).fetchall() == [
+            ("article_text", "succeeded", None),
+            ("header_image", "succeeded", new_path),
+            ("multimodal_article", "succeeded", None),
+        ]
+        assert db.execute(
+            """
+            SELECT modality, state, source_relative_path
+            FROM embedding_work_items WHERE configuration_id = ? ORDER BY 1
+            """,
+            [prior_id],
+        ).fetchall() == [
+            ("article_text", "succeeded", None),
+            ("header_image", "stale_input", new_path),
+        ]
+
+
+def test_full_header_path_change_preserves_matching_current_configuration(tmp_path):
+    """Break caught: path-A-to-B reconciliation stales both configurations."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated header A")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), full=True, page_size=1)
+    new_path = attach_generated_header_image(
+        config,
+        b"generated header B",
+        relative_path="synthetic/article_replacement.png",
+    )
+
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+
+    current_id = configuration_id(FakeEmbeddingAdapter.profile)
+    prior_id = configuration_id(PriorConfigurationAdapter.profile)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, state, source_relative_path
+            FROM embedding_work_items WHERE configuration_id = ? ORDER BY 1
+            """,
+            [current_id],
+        ).fetchall() == [
+            ("article_text", "succeeded", None),
+            ("header_image", "succeeded", new_path),
+            ("multimodal_article", "succeeded", None),
+        ]
+        assert db.execute(
+            """
+            SELECT modality, state, source_relative_path
+            FROM embedding_work_items WHERE configuration_id = ? ORDER BY 1
+            """,
+            [prior_id],
+        ).fetchall() == [
+            ("article_text", "succeeded", None),
+            ("header_image", "stale_input", new_path),
+            ("multimodal_article", "stale_input", None),
         ]
 
 
@@ -5980,7 +6261,43 @@ def test_full_rendition_cleanup_occurs_after_commit_and_is_resumable(tmp_path):
     assert validate_embedding_outputs(config, image_codec=codec).ok
 
 
-def test_embedding_catalog_has_exact_version_thirteen_full_run_schema(
+def test_rendition_cleanup_checks_one_candidate_and_preserves_history(tmp_path):
+    """Break caught: cleanup materializes all historical rendition references."""
+
+    output_root = tmp_path / "generated-embedding-output"
+    namespace_name = "a" * 64
+    namespace = output_root / "renditions" / namespace_name
+    namespace.mkdir(parents=True)
+    historical_name = f"{'b' * 64}.jpg"
+    orphan_name = f"{'c' * 64}.jpg"
+    (namespace / historical_name).write_bytes(b"generated historical rendition")
+    (namespace / orphan_name).write_bytes(b"generated orphan rendition")
+    checked: list[str] = []
+
+    def is_referenced(relative_path):
+        checked.append(relative_path)
+        assert isinstance(relative_path, str)
+        return relative_path.endswith(historical_name)
+
+    output_descriptor = os.open(output_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        removed = cleanup_orphan_image_renditions(
+            output_descriptor,
+            is_referenced,
+        )
+    finally:
+        os.close(output_descriptor)
+
+    assert removed == 1
+    assert sorted(checked) == [
+        f"renditions/{namespace_name}/{historical_name}",
+        f"renditions/{namespace_name}/{orphan_name}",
+    ]
+    assert (namespace / historical_name).is_file()
+    assert not (namespace / orphan_name).exists()
+
+
+def test_embedding_catalog_has_exact_version_fourteen_reconciliation_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -6007,6 +6324,15 @@ def test_embedding_catalog_has_exact_version_thirteen_full_run_schema(
                 ).fetchall()
             )
             for table in EXPECTED_EMBEDDING_TABLE_COLUMNS
+        }
+        view_columns = {
+            view: tuple(
+                (row[1], row[2], row[3], row[4], row[5])
+                for row in connection.execute(
+                    f"PRAGMA table_info('{view}')"
+                ).fetchall()
+            )
+            for view in EXPECTED_EMBEDDING_VIEW_COLUMNS
         }
         constraints = Counter(
             (
@@ -6054,18 +6380,22 @@ def test_embedding_catalog_has_exact_version_thirteen_full_run_schema(
         "embedding_generation_history": "BASE TABLE",
         "full_run_articles": "BASE TABLE",
         "image_input_provenance": "BASE TABLE",
-        "embedding_work_items": "BASE TABLE",
-        "embeddings": "BASE TABLE",
+        "embedding_work_items": "VIEW",
+        "embedding_work_storage": "BASE TABLE",
+        "embeddings": "VIEW",
+        "embedding_storage": "BASE TABLE",
         "long_text_part_generations": "BASE TABLE",
         "long_text_parts": "BASE TABLE",
         "metadata": "BASE TABLE",
         "multimodal_embedding_provenance": "BASE TABLE",
+        "reconciliation_actions": "BASE TABLE",
         "runs": "BASE TABLE",
     }
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
+    assert view_columns == EXPECTED_EMBEDDING_VIEW_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "13")]
+    assert metadata == [("schema_version", "14")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -6554,6 +6884,42 @@ def test_pipeline_refuses_exact_version_twelve_catalog_without_migration(tmp_pat
         }.isdisjoint(lifecycle_columns)
 
 
+def test_pipeline_refuses_exact_version_thirteen_catalog_without_migration(tmp_path):
+    """Break caught: v13 storage is silently rewritten behind current views."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP VIEW embeddings")
+        db.execute("DROP VIEW embedding_work_items")
+        db.execute("DROP TABLE reconciliation_actions")
+        db.execute("ALTER TABLE embedding_storage RENAME TO embeddings")
+        db.execute(
+            "ALTER TABLE embedding_work_storage RENAME TO embedding_work_items"
+        )
+        db.execute("UPDATE metadata SET value = '13' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("13",)
+        assert dict(
+            db.execute(
+                """
+                SELECT table_name, table_type FROM information_schema.tables
+                WHERE table_schema = 'main'
+                """
+            ).fetchall()
+        )["embeddings"] == "BASE TABLE"
+
+
 def test_pipeline_refuses_malformed_current_schema_with_version_eight_label(
     tmp_path,
 ):
@@ -6637,6 +7003,84 @@ def test_validator_rejects_invalid_limited_run_lifecycle(tmp_path, run_update):
     assert "invalid_run_lifecycle" in codes
 
 
+def test_validator_accepts_content_free_stale_input_disposition(tmp_path):
+    """Break caught: stale reconciled work is treated as applicable input."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:SYNTHETIC-EMBEDDING-B",
+        markdown="# Generated article B\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            "DELETE FROM articles WHERE article_id = ?",
+            ["wsj:SYNTHETIC-EMBEDDING-B"],
+        )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+
+    result = validate_embedding_outputs(config)
+
+    assert result.ok
+
+
+def test_validator_rejects_visible_reconciliation_base_identity_mismatch(tmp_path):
+    """Break caught: pending action can hide a different physical generation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            FakeEmbeddingAdapter(),
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_full_reconciliation_visibility=lambda: (_ for _ in ()).throw(
+                    SyntheticInterruption()
+                ),
+            ),
+        )
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(
+            """
+            UPDATE embedding_work_storage SET state = 'queued'
+            WHERE modality = 'article_text'
+            """
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_reconciliation_action" in codes
+
+
+def test_validator_accepts_pending_visible_multimodal_reconciliation(tmp_path):
+    """Break caught: uncompacted image/composite generations look orphaned."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated pending visible header")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            FakeEmbeddingAdapter(),
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_full_reconciliation_visibility=lambda: (_ for _ in ()).throw(
+                    SyntheticInterruption()
+                ),
+            ),
+        )
+
+    assert validate_embedding_outputs(config).ok
+
+
 @pytest.mark.parametrize("disposition", ("absent", "missing"))
 def test_validator_reports_missing_header_disposition_checkpoint(
     tmp_path,
@@ -6650,7 +7094,7 @@ def test_validator_reports_missing_header_disposition_checkpoint(
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
     with duckdb.connect(str(config.embedding_catalog)) as connection:
         connection.execute(
-            "DELETE FROM embedding_work_items WHERE modality = 'header_image'"
+            "DELETE FROM embedding_work_storage WHERE modality = 'header_image'"
         )
 
     codes = {issue.code for issue in validate_embedding_outputs(config).issues}
@@ -6689,7 +7133,7 @@ def test_validator_reports_missing_vector_claimed_by_successful_run(tmp_path):
     config = write_generated_preprocessing_fixture(tmp_path)
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
     with duckdb.connect(str(config.embedding_catalog)) as connection:
-        connection.execute("DELETE FROM embeddings")
+        connection.execute("DELETE FROM embedding_storage")
 
     assert validate_embedding_outputs(config) == EmbeddingValidationResult(
         issues=(
@@ -6708,7 +7152,7 @@ def test_validator_reports_invalid_durable_work_state(tmp_path):
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
     with duckdb.connect(str(config.embedding_catalog)) as connection:
         connection.execute(
-            "UPDATE embedding_work_items SET state = 'synthetic_invalid'"
+            "UPDATE embedding_work_storage SET state = 'synthetic_invalid'"
         )
 
     assert validate_embedding_outputs(config) == EmbeddingValidationResult(
@@ -6733,7 +7177,7 @@ def test_validator_rejects_missing_or_malformed_active_work_hash(
     with duckdb.connect(str(config.embedding_catalog)) as connection:
         connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET input_sha256 = ?
             WHERE modality = 'article_text'
             """,
@@ -6768,7 +7212,7 @@ def test_validator_rejects_invalid_work_and_vector_source_paths(
     with duckdb.connect(str(config.embedding_catalog)) as connection:
         connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET source_relative_path = ?
             WHERE modality = ?
             """,
@@ -6776,7 +7220,7 @@ def test_validator_rejects_invalid_work_and_vector_source_paths(
         )
         connection.execute(
             """
-            UPDATE embeddings
+            UPDATE embedding_storage
             SET source_relative_path = ?
             WHERE modality = ?
             """,
@@ -6808,7 +7252,7 @@ def test_validator_rejects_vector_for_not_applicable_header_image(tmp_path):
         ).fetchone()
         connection.execute(
             """
-            INSERT INTO embeddings
+            INSERT INTO embedding_storage
             VALUES ('wsj:SYNTHETIC-EMBEDDING', 'header_image', ?, NULL,
                     ?, ?, 2048, ?, ?, ?)
             """,
@@ -6836,7 +7280,7 @@ def test_validator_rejects_generation_metadata_on_not_applicable_image(tmp_path)
         run_id = connection.execute("SELECT run_id FROM runs").fetchone()[0]
         connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET source_relative_path = '../outside.png', input_sha256 = ?,
                 attempt_count = 1, error_code = 'synthetic_failure',
                 generation_run_id = ?
@@ -6862,7 +7306,7 @@ def test_validator_rejects_success_without_valid_generation_run(
     with duckdb.connect(str(config.embedding_catalog)) as connection:
         connection.execute(
             """
-            UPDATE embedding_work_items
+            UPDATE embedding_work_storage
             SET generation_run_id = ?
             WHERE modality = 'article_text'
             """,
@@ -7328,7 +7772,7 @@ def test_validator_reports_vector_and_publication_metadata_corruption(tmp_path):
     with duckdb.connect(str(config.embedding_catalog)) as db:
         db.execute(
             """
-            UPDATE embeddings
+            UPDATE embedding_storage
             SET published_at_utc = ?, vector = ?
             """,
             [datetime(2024, 1, 3, 15, 30, tzinfo=UTC), [0.0] * 2048],
@@ -7381,7 +7825,10 @@ def test_validator_checks_intrinsic_properties_for_orphaned_embedding_rows(tmp_p
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
     with duckdb.connect(str(config.embedding_catalog)) as db:
         db.execute(
-            "UPDATE embeddings SET article_id = 'orphan', modality = 'unsupported'"
+            """
+            UPDATE embedding_storage
+            SET article_id = 'orphan', modality = 'unsupported'
+            """
         )
 
     result = validate_embedding_outputs(config)

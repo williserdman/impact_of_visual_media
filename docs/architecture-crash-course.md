@@ -126,7 +126,7 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
 | `wsj_embeddings/image_rendition.py` | bounded image decode, exact-byte eligibility, deterministic Pillow rendition, and atomic derived-file installation | source-image mutation or hosted requests |
 | `wsj_embeddings/batching.py` | mixed-input payload packing, bounded concurrency, rate-aware retry waves, and safe observations | HTTP serialization or catalog publication |
-| `wsj_embeddings/catalog.py` | separate schema version 13, exact read-only inspection, bounded lifecycle/generation/part/provenance/full-run transactions | preprocessing catalog mutation |
+| `wsj_embeddings/catalog.py` | separate schema version 14, canonical current views, and bounded lifecycle/generation/provenance/reconciliation transactions | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection/full traversal, text/image encoding, composite derivation, publication, and reconciliation | hosted credential loading |
 | `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
@@ -258,8 +258,8 @@ ORDER BY published_at_utc, article_id;
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 13 has exactly twelve base tables, no views,
-and no indexes. Versions 1 through 12 and malformed output are refused without
+catalog. Embedding schema version 14 has exactly thirteen base tables, two
+canonical views, and no indexes. Versions 1 through 13 and malformed output are refused without
 migration. `full_run_articles` stores only run/article identity and the optional
 source-relative header association, never Markdown or image bytes.
 
@@ -269,8 +269,11 @@ source-relative header association, never Markdown or image bytes.
 | `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `scope VARCHAR`, `status VARCHAR`, `discovery_complete BOOLEAN`, `reconciliation_complete BOOLEAN`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `hosted_requests INTEGER`, `hosted_retries INTEGER`, `usage_json VARCHAR`, `throttles INTEGER`, `elapsed_seconds DOUBLE`, `started_at TIMESTAMPTZ`, `finished_at TIMESTAMPTZ` | `run_id` |
 | `full_run_articles` | `run_id VARCHAR`, `article_id VARCHAR`, `header_image_path VARCHAR` | `(run_id, article_id)` |
-| `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
-| `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
+| `embedding_work_storage` | physical columns exposed by `embedding_work_items` | `(article_id, modality, configuration_id)` |
+| `embedding_storage` | physical columns exposed by `embeddings` | `(article_id, modality, configuration_id)` |
+| `reconciliation_actions` | exact target disposition and expected source/input/state/generation/vector identity | `(run_id, article_id, modality, configuration_id)` |
+| `embedding_work_items` (view) | canonical current work interface | — |
+| `embeddings` (view) | canonical current vector interface | — |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 | `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
 | `image_input_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_sha256 VARCHAR`, `source_format VARCHAR`, `source_bytes BIGINT`, `source_width INTEGER`, `source_height INTEGER`, `source_frames INTEGER`, `embedded_input_sha256 VARCHAR`, `embedded_format VARCHAR`, `embedded_bytes BIGINT`, `embedded_width INTEGER`, `embedded_height INTEGER`, `embedded_frames INTEGER`, `transform_id VARCHAR`, `rendition_relative_path VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
@@ -582,13 +585,17 @@ one read-only snapshot of the canonical `articles` relation in lexical
 association to the run inventory. No disappearance inference occurs unless
 that traversal exhausts.
 The coordinator then reopens and processes each inventory page through the
-existing bounded modality pipeline. Only after all pages return does it
-reconcile disappeared articles and headers across every stored configuration in
-bounded transactions. A failed page rolls back only that page and leaves the
-run non-complete; a later full run re-evaluates remaining stale work. Obsolete
-derived renditions are descriptor-checked and unlinked only after the catalog
-transaction commits. Interrupted cleanup leaves a validator-visible harmless
-orphan for a later full run to remove.
+existing bounded modality pipeline. Only after all pages return does it stage
+exact reconciliation actions in bounded keyset pages. Failed staging remains
+invisible. One run-marker transaction exposes all actions atomically through
+the canonical `embeddings` and `embedding_work_items` views. Bounded physical
+compaction checks the expected generation/vector/work identity and cannot
+change the public result; interruption resumes safely. Header actions are exact
+per configuration, preserving work that already matches the new association.
+`stale_input` is a content-free, generation-free disposition with no input hash.
+Obsolete derived renditions are descriptor-checked one candidate at a time and
+queried for exact current/historical reference before unlinking. Interrupted
+cleanup leaves a validator-visible harmless orphan for a later full run.
 
 An unchanged rerun does not sweep a post-commit orphan. To remove one safely:
 
@@ -630,7 +637,7 @@ reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
-and local header-image embeddings. It checks the exact twelve-table embedding
+and local header-image embeddings. It checks the exact version-14 embedding
 schema first, opens the
 preprocessing catalog through its public exact-schema contract, and reports
 stable sorted issues for configuration identity/reference failures, malformed
@@ -800,7 +807,10 @@ catalog and the separate generated hosted probe.
 - **stale extractor**: stored candidate was produced by an older extractor
   version and needs explicitly scoped reprocessing.
 - **full reconciliation**: missing-source inference performed only at the end
-  of a completed `run --full`.
+  of a completed `run --full`, exposed atomically through canonical views.
+- **stale input**: content-free work disposition for an input removed or made
+  ineligible by completed full reconciliation; it retains no input hash or
+  active generation.
 - **orphan**: generated Markdown not referenced by the current `articles`
   table.
 - **content-free failure**: stable code/message that contains no licensed

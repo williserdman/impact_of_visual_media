@@ -95,6 +95,7 @@ def validate_embedding_outputs(
                 _validate_configurations(catalog.connection, issues)
                 _validate_run_metrics(catalog.connection, issues)
                 _validate_run_lifecycle(catalog.connection, issues)
+                _validate_reconciliation_actions(catalog.connection, issues)
                 _validate_global_image_provenance_references(
                     catalog.connection,
                     issues,
@@ -375,6 +376,52 @@ def _validate_run_lifecycle(
         )
 
 
+def _validate_reconciliation_actions(
+    connection: duckdb.DuckDBPyConnection,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Prove pending actions still name their exact physical generation."""
+
+    invalid = connection.execute(
+        """
+        SELECT count(*)
+        FROM reconciliation_actions AS action
+        LEFT JOIN runs ON runs.run_id = action.run_id
+        LEFT JOIN embedding_work_storage AS work
+          ON work.article_id = action.article_id
+         AND work.modality = action.modality
+         AND work.configuration_id = action.configuration_id
+        LEFT JOIN embedding_storage AS vector
+          ON vector.article_id = action.article_id
+         AND vector.modality = action.modality
+         AND vector.configuration_id = action.configuration_id
+        WHERE runs.run_id IS NULL OR runs.scope <> 'full'
+           OR (runs.reconciliation_complete AND runs.status <> 'succeeded')
+           OR (runs.status = 'succeeded' AND NOT runs.reconciliation_complete)
+           OR action.target_state NOT IN ('stale_input', 'not_applicable')
+           OR work.article_id IS NULL
+           OR work.source_relative_path IS DISTINCT FROM
+                action.expected_source_relative_path
+           OR work.input_sha256 IS DISTINCT FROM action.expected_input_sha256
+           OR work.state IS DISTINCT FROM action.expected_state
+           OR work.generation_run_id IS DISTINCT FROM
+                action.expected_generation_run_id
+           OR vector.source_relative_path IS DISTINCT FROM
+                action.expected_vector_source_relative_path
+           OR vector.input_sha256 IS DISTINCT FROM
+                action.expected_vector_input_sha256
+           OR vector.stored_vector_sha256 IS DISTINCT FROM
+                action.expected_stored_vector_sha256
+        """
+    ).fetchone()[0]
+    if invalid:
+        _append(
+            issues,
+            "invalid_reconciliation_action",
+            "reconciliation actions do not match exact physical generation state",
+        )
+
+
 def _select_configuration_id(
     connection: duckdb.DuckDBPyConnection,
     requested: str | None,
@@ -429,6 +476,14 @@ def _validate_run_coverage(
             SELECT configuration_id, generation_run_id AS run_id
             FROM embedding_generation_history
             WHERE configuration_id = ?
+            UNION ALL
+            SELECT action.configuration_id,
+                   action.expected_generation_run_id AS run_id
+            FROM reconciliation_actions AS action
+            JOIN runs ON runs.run_id = action.run_id
+            WHERE action.configuration_id = ?
+              AND runs.reconciliation_complete
+              AND action.expected_generation_run_id IS NOT NULL
         ), generation_counts AS (
             SELECT run_id, configuration_id, count(*) AS published_embeddings
             FROM all_generations
@@ -439,7 +494,7 @@ def _validate_run_coverage(
         LEFT JOIN generation_counts USING (run_id, configuration_id)
         WHERE coalesce(published_embeddings, 0) != expected_embeddings
         """,
-        [configuration_id, configuration_id, configuration_id],
+        [configuration_id, configuration_id, configuration_id, configuration_id],
     ).fetchone()[0]
     if missing:
         _append(
@@ -572,6 +627,27 @@ def _validate_work_items(
                     issues,
                     "embedding_without_success_checkpoint",
                     "embedding rows lack a matching successful work checkpoint",
+                )
+        elif work_state is WorkState.STALE_INPUT:
+            if (
+                input_sha256 is not None
+                or attempt_count != 0
+                or failure_metadata_present
+                or generation_run_id is not None
+                or (
+                    modality == EmbeddingModality.HEADER_IMAGE.value
+                    and source_relative_path is not None
+                    and not is_safe_source_relative_path(source_relative_path)
+                )
+                or (
+                    modality != EmbeddingModality.HEADER_IMAGE.value
+                    and source_relative_path is not None
+                )
+            ):
+                _append(
+                    issues,
+                    "invalid_stale_input_checkpoint",
+                    "stale input work retains generation or unsafe path metadata",
                 )
         elif is_missing_header:
             article = articles.get(article_id)
@@ -882,8 +958,17 @@ def _validate_image_input_provenance(
         SELECT article_id, generation_run_id, input_sha256
         FROM embedding_generation_history
         WHERE configuration_id = ? AND modality = 'header_image'
+        UNION ALL
+        SELECT action.article_id, action.expected_generation_run_id,
+               action.expected_vector_input_sha256
+        FROM reconciliation_actions AS action
+        JOIN runs ON runs.run_id = action.run_id
+        WHERE action.configuration_id = ?
+          AND action.modality = 'header_image'
+          AND runs.reconciliation_complete
+          AND action.expected_generation_run_id IS NOT NULL
         """,
-        [configuration_id, configuration_id],
+        [configuration_id, configuration_id, configuration_id],
     ).fetchall()
     expected_generations = {
         (str(article_id), str(generation_run_id), str(source_sha256))
@@ -1413,8 +1498,17 @@ def _validate_multimodal_provenance(
         SELECT article_id, generation_run_id, input_sha256
         FROM embedding_generation_history
         WHERE configuration_id = ? AND modality = 'multimodal_article'
+        UNION ALL
+        SELECT action.article_id, action.expected_generation_run_id,
+               action.expected_vector_input_sha256
+        FROM reconciliation_actions AS action
+        JOIN runs ON runs.run_id = action.run_id
+        WHERE action.configuration_id = ?
+          AND action.modality = 'multimodal_article'
+          AND runs.reconciliation_complete
+          AND action.expected_generation_run_id IS NOT NULL
         """,
-        [configuration_id, configuration_id],
+        [configuration_id, configuration_id, configuration_id],
     ).fetchall()
     for article_id, generation_run_id, input_sha256 in composite_generations:
         provenance = provenance_by_generation.get(
@@ -1872,8 +1966,18 @@ def _validate_long_text_parts(
                stored_vector_sha256, generation_run_id, false AS active
         FROM embedding_generation_history
         WHERE configuration_id = ? AND modality = 'article_text'
+        UNION ALL
+        SELECT action.article_id, action.expected_vector_input_sha256,
+               NULL AS vector, action.expected_stored_vector_sha256,
+               action.expected_generation_run_id, false AS active
+        FROM reconciliation_actions AS action
+        JOIN runs ON runs.run_id = action.run_id
+        WHERE action.configuration_id = ?
+          AND action.modality = 'article_text'
+          AND runs.reconciliation_complete
+          AND action.expected_generation_run_id IS NOT NULL
         """,
-        [configuration_id, configuration_id],
+        [configuration_id, configuration_id, configuration_id],
     ).fetchall()
     canonical_cache: dict[str, tuple[str, bytes] | None] = {}
     for (
@@ -2137,7 +2241,19 @@ def _generation_reference_exists(
         """,
         [article_id, modality, configuration_id, generation_run_id],
     ).fetchone()
-    references = tuple(row for row in (active, history) if row is not None)
+    pending = connection.execute(
+        """
+        SELECT action.expected_stored_vector_sha256
+        FROM reconciliation_actions AS action
+        JOIN runs ON runs.run_id = action.run_id
+        WHERE action.article_id = ? AND action.modality = ?
+          AND action.configuration_id = ?
+          AND action.expected_generation_run_id = ?
+          AND runs.reconciliation_complete
+        """,
+        [article_id, modality, configuration_id, generation_run_id],
+    ).fetchone()
+    references = tuple(row for row in (active, history, pending) if row is not None)
     if stored_vector_sha256 is None:
         return bool(references)
     return any(row[0] == stored_vector_sha256 for row in references)
