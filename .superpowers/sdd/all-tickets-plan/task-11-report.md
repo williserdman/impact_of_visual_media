@@ -101,6 +101,16 @@ deselected in 13.84s`. Adapter and scheduler files passed `43 passed in 5.25s`;
 the final scheduler file, including preservation of parsed per-item Retry-After
 metadata, passed `12 passed in 0.87s`.
 
+The second correction round reproduced three additional boundaries. A fatal in
+the first submission of a two-request concurrent wave left the completed second
+success in progress; a retryable long part that succeeded on its next in-run
+attempt still prevented parent aggregation; and a successful response carrying
+HTTP-date `Retry-After` yielded a zero-second wait. After deferring deterministic
+fatal selection until all completed exchanges are processed, tracking only final
+unresolved long-part outcomes, and normalizing the parsed date seconds into safe
+rate metadata, the coordinator pair passed `2 passed, 182 deselected in 9.92s`
+and the date-delay fixture passed `1 passed, 32 deselected in 0.32s`.
+
 ## Self-review
 
 - Production uses `JinaEmbeddingAdapter.embed_batch`; tests inject only local
@@ -118,6 +128,8 @@ metadata, passed `12 passed in 0.87s`.
   real hosted adapter and explicit batching fakes opt into the new scheduler.
 - Auth/authz errors intentionally leave in-progress checkpoints; replay can
   recover them after the operator corrects run-scope credentials or access.
+- Concurrent wave exchanges are processed in stable submission order; the first
+  fatal in that order is raised only after completed sibling outcomes commit.
 - Schema validation reconstructs every batching profile field and refuses
   prior or malformed shapes before writable use.
 

@@ -877,7 +877,8 @@ def _run_rate_aware_work(
             )
             if work.part is not None:
                 assert work.article_input_sha256 is not None
-                failed_long_articles.add(work.article.article_id)
+                if final:
+                    failed_long_articles.add(work.article.article_id)
                 with catalog.transaction():
                     if failure_state is WorkState.TERMINAL:
                         catalog.record_terminal_long_text_part_failure(

@@ -21,6 +21,7 @@ from wsj_embeddings.adapters import (
     JinaHostedAdapterError,
     JinaHttpResponse,
 )
+from wsj_embeddings.batching import BatchPolicy, execute_rate_aware_batches
 from wsj_embeddings.tokenizer import PinnedJinaV4Tokenizer, PinnedTokenizerError
 
 
@@ -463,6 +464,48 @@ def test_hosted_adapter_parses_http_date_retry_after_against_injected_clock(
         adapter.embed((JinaEmbeddingInput.text("private"),))
 
     assert raised.value.retry_after_seconds == expected
+
+
+def test_successful_http_date_retry_after_becomes_capped_scheduler_delay():
+    """Break caught: parsed date delay is absent from successful safe metadata."""
+
+    class SequenceTransport:
+        def __init__(self) -> None:
+            self.responses = iter(
+                (
+                    _response(
+                        [{"index": 0, "embedding": _embedding(1.0, 0.0)}],
+                        headers={
+                            "Retry-After": "Wed, 12 Aug 2026 12:00:05 GMT",
+                            "X-RateLimit-Remaining-Requests": "0",
+                        },
+                    ),
+                    _response(
+                        [{"index": 0, "embedding": _embedding(1.0, 0.0)}]
+                    ),
+                )
+            )
+
+        def post(self, _url, *, headers, body, timeout_seconds):
+            del headers, body, timeout_seconds
+            return next(self.responses)
+
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=SequenceTransport(),
+        wall_clock=lambda: datetime(2026, 8, 12, 12, 0, tzinfo=UTC),
+    )
+    sleeps: list[float] = []
+
+    execute_rate_aware_batches(
+        adapter,
+        (JinaEmbeddingInput.text("one"), JinaEmbeddingInput.text("two")),
+        policy=BatchPolicy(1, 100, 100, 1, 2, 1.0, 3.0),
+        sleep=sleeps.append,
+        jitter=lambda _attempt: 0.0,
+    )
+
+    assert sleeps == [3.0]
 
 
 def test_hosted_adapter_requires_only_named_environment_credential():

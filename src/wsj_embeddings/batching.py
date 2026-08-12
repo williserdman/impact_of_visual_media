@@ -180,10 +180,12 @@ def execute_rate_aware_batches(
         retry_delays: list[float] = []
         next_pending = list(deferred)
         throttled_wave = False
+        fatal_errors: list[JinaHostedAdapterError] = []
         for batch, exchange in exchanges:
             if isinstance(exchange, JinaHostedAdapterError):
                 if exchange.code in _RUN_FATAL_CODES or not exchange.retryable:
-                    raise exchange
+                    fatal_errors.append(exchange)
+                    continue
                 throttled = exchange.code == "rate_limit"
                 if throttled:
                     throttles += 1
@@ -291,6 +293,8 @@ def execute_rate_aware_batches(
                         headers=headers,
                     )
                 )
+        if fatal_errors:
+            raise fatal_errors[0]
         if throttled_wave:
             concurrency = max(1, concurrency // 2)
         if retry_delays:

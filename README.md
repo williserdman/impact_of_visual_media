@@ -355,6 +355,10 @@ authorization, and invalid request configuration stop the run. Summaries and
 retry/throttle observations, and whole-run elapsed seconds—never request
 content. Each durable prior attempt reduces the remaining request budget, so
 replay cannot purchase beyond the configured ceiling.
+All completed exchanges in a concurrent wave are processed in stable submission
+order before a request-wide fatal error is raised, preserving successful sibling
+work. A long part that succeeds on an in-run retry no longer leaves its parent
+marked failed and therefore participates in immediate complete-part aggregation.
 Every successful image generation has content-free `image_input_provenance`:
 source and exact embedded-input hashes, formats, byte counts, dimensions, frame counts,
 transform identity, and an optional output-relative rendition path. It stores

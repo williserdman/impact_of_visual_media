@@ -1056,6 +1056,60 @@ def test_wave_success_is_durable_before_later_fatal_and_replay_skips_purchase(
     ]
 
 
+def test_concurrent_wave_commits_second_success_before_raising_first_fatal(
+    tmp_path,
+):
+    """Break caught: fatal first submission prevents a completed sibling commit."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+
+    class FatalFirstWaveAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_concurrency=2,
+            batch_max_attempts=2,
+            client_configuration_version="synthetic-fatal-first-wave-v1",
+        )
+
+        def __init__(self, *, fatal_first: bool) -> None:
+            super().__init__()
+            self.fatal_first = fatal_first
+
+        def embed_batch(self, inputs, *, limits):
+            inputs = tuple(inputs)
+            if self.fatal_first and inputs[0].value == "#\n":
+                self.calls.append(inputs)
+                raise JinaHostedAdapterError(
+                    "authentication", retryable=False, status_code=401
+                )
+            return super().embed_batch(inputs, limits=limits)
+
+    adapter = FatalFirstWaveAdapter(fatal_first=True)
+    with pytest.raises(JinaHostedAdapterError, match="authentication"):
+        run_embedding_pipeline(config, adapter, limit=2)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT article_id, state FROM embedding_work_items
+            WHERE modality = 'article_text' ORDER BY article_id
+            """
+        ).fetchall() == [
+            ("wsj:SYNTHETIC-EMBEDDING", "in_progress"),
+            ("wsj:ZZZ-SYNTHETIC-EMBEDDING", "succeeded"),
+        ]
+
+    replay = FatalFirstWaveAdapter(fatal_first=False)
+    run_embedding_pipeline(config, replay, limit=2)
+    assert [[item.value for item in call] for call in replay.calls] == [["#\n"]]
+
+
 def test_batched_replay_enters_attempt_two_and_terminalizes_at_durable_ceiling(
     tmp_path,
 ):
@@ -1229,6 +1283,51 @@ def test_batched_long_part_resume_keeps_sibling_parts_and_header_success(tmp_pat
             (1, "succeeded", 2),
             (2, "succeeded", 2),
         ]
+
+
+def test_batched_long_part_retry_then_success_aggregates_parent_in_same_run(tmp_path):
+    """Break caught: an intermediate part failure permanently blocks aggregation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    article_input_sha256 = replace_generated_embedding_markdown(
+        config, "AAAA\n\nBBBB\n\nCCCC"
+    )
+
+    class RetryingLongBatchAdapter(LongTextRecordingBatchAdapter):
+        profile = replace(
+            LongTextRecordingBatchAdapter.profile,
+            batch_max_attempts=2,
+            client_configuration_version="synthetic-long-retry-success-v1",
+        )
+
+    adapter = RetryingLongBatchAdapter([{1: "missing_response_item"}, {}])
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        batch_sleep=lambda _seconds: None,
+        batch_jitter=lambda _attempt: 0.0,
+    )
+
+    assert [len(call) for call in adapter.calls] == [3, 1]
+    assert result.embeddings == 1
+    assert result.succeeded == 1
+    assert result.retryable == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count FROM long_text_parts
+            WHERE article_input_sha256 = ? ORDER BY part_index
+            """,
+            [article_input_sha256],
+        ).fetchall() == [
+            ("succeeded", 1),
+            ("succeeded", 2),
+            ("succeeded", 1),
+        ]
+        assert db.execute(
+            "SELECT state FROM embedding_work_items WHERE modality = 'article_text'"
+        ).fetchone() == ("succeeded",)
 
 
 def test_rate_limited_batch_retries_in_run_and_reports_throttle(tmp_path):

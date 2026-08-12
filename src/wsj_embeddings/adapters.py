@@ -429,6 +429,8 @@ class JinaEmbeddingAdapter:
         retry_after = _retry_after_seconds(
             response.headers, now=self._wall_clock()
         )
+        if retry_after is not None:
+            rate_headers["retry-after"] = retry_after
         return JinaEmbeddingBatchResponse(
             items=_validated_batch_items(
                 payload,

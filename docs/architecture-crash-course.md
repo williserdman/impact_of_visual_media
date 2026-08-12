@@ -729,6 +729,10 @@ orphan cleanup, and full-only missing-source reconciliation.
   request configuration stop the run. Run state stores only allowlisted finite
   nonnegative numeric usage, request/retry/throttle counts, and elapsed seconds
   covering preparation through final aggregation and metric publication.
+  Once a concurrent wave completes, exchanges are handled in stable submission
+  order and any request-wide fatal is raised only after completed sibling
+  outcomes have crossed their independent transactions. Intermediate long-part
+  failures do not block parent aggregation when that same part later succeeds.
 - Local header images are opened read-only without following symlinks and
   hashed. Eligible images are base64-encoded from those same bytes; oversized
   safe images use the verified deterministic rendition below the embedding
