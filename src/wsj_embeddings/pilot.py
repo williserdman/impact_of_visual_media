@@ -8,9 +8,11 @@ import math
 import re
 import struct
 import threading
+import time
 import zlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from wsj_embeddings.adapters import (
     JinaEmbeddingAdapter,
@@ -97,18 +99,123 @@ class _ObservingAdapter:
                 self._active -= 1
 
 
-def run_jina_pilot(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
+@dataclass(slots=True)
+class _PilotQuotaReservation:
+    reserved_at: datetime
+    estimated_tokens: int
+    observed_input_tokens: int | None = None
+
+    @property
+    def effective_tokens(self) -> int:
+        return max(
+            self.estimated_tokens,
+            self.observed_input_tokens or self.estimated_tokens,
+        )
+
+
+class _PilotQuotaLimiter:
+    """State-free rolling limiter shared by all probes in one invocation."""
+
+    def __init__(
+        self,
+        adapter: JinaEmbeddingAdapter,
+        *,
+        clock: Callable[[], datetime],
+        sleep: Callable[[float], None],
+    ) -> None:
+        self._profile = adapter.profile
+        self._clock = clock
+        self._sleep = sleep
+        self._reservations: list[_PilotQuotaReservation] = []
+        self._pending_waves: list[list[_PilotQuotaReservation]] = []
+
+    def reserve_wave(
+        self, wave: tuple[tuple[JinaEmbeddingInput, ...], ...]
+    ) -> None:
+        costs = tuple(sum(item.estimated_tokens for item in batch) for batch in wave)
+        if (
+            not costs
+            or len(costs) > self._profile.quota_max_requests
+            or sum(costs) > self._profile.quota_max_estimated_tokens
+            or any(cost > self._profile.batch_max_estimated_tokens for cost in costs)
+        ):
+            raise JinaHostedAdapterError("deterministic_request", retryable=False)
+        while True:
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("pilot quota clock must be timezone-aware")
+            window_start = now - timedelta(
+                seconds=self._profile.quota_window_seconds
+            )
+            self._reservations = [
+                reservation
+                for reservation in self._reservations
+                if reservation.reserved_at > window_start
+            ]
+            active_tokens = sum(
+                reservation.effective_tokens
+                for reservation in self._reservations
+            )
+            if (
+                len(self._reservations) + len(costs)
+                <= self._profile.quota_max_requests
+                and active_tokens + sum(costs)
+                <= self._profile.quota_max_estimated_tokens
+            ):
+                reservations = [
+                    _PilotQuotaReservation(now, cost) for cost in costs
+                ]
+                self._reservations.extend(reservations)
+                self._pending_waves.append(reservations)
+                return
+            retry_at = min(
+                reservation.reserved_at
+                + timedelta(seconds=self._profile.quota_window_seconds)
+                for reservation in self._reservations
+            )
+            self._sleep(max(0.0, (retry_at - now).total_seconds()))
+
+    def reconcile_wave(
+        self, observations: tuple[dict[str, int | float], ...]
+    ) -> None:
+        reservations = self._pending_waves.pop(0)
+        for reservation, usage in zip(reservations, observations, strict=True):
+            observed = usage.get("input_tokens", usage.get("prompt_tokens"))
+            if (
+                isinstance(observed, bool)
+                or not isinstance(observed, (int, float))
+                or not math.isfinite(float(observed))
+                or float(observed) < 0
+                or not float(observed).is_integer()
+            ):
+                continue
+            reservation.observed_input_tokens = max(
+                reservation.estimated_tokens, int(observed)
+            )
+
+
+def run_jina_pilot(
+    adapter: JinaEmbeddingAdapter,
+    *,
+    quota_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    quota_sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
     """Measure fixed synthetic hosted requests without reading or writing state."""
 
+    limiter = _PilotQuotaLimiter(
+        adapter,
+        clock=quota_clock,
+        sleep=quota_sleep,
+    )
     normal_probes = _normal_probes()
-    first_result = _run_probe(adapter, normal_probes[0])
+    first_result = _run_probe(adapter, normal_probes[0], limiter)
     boundary_probes = _boundary_probes(adapter)
     results = (
         first_result,
-        *(_run_probe(adapter, probe) for probe in normal_probes[1:]),
-        *(_run_probe(adapter, probe) for probe in boundary_probes),
+        *(_run_probe(adapter, probe, limiter) for probe in normal_probes[1:]),
+        *(_run_probe(adapter, probe, limiter) for probe in boundary_probes),
     )
-    concurrency_result = _run_concurrency_probe(adapter)
+    concurrency_result = _run_concurrency_probe(adapter, limiter)
     openapi_observation = _observe_openapi(adapter)
     model_catalogue_observation = _observe_model_catalogue(adapter)
     total_retries = sum(
@@ -154,7 +261,9 @@ def run_jina_pilot(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
 
 
 def _run_probe(
-    adapter: JinaEmbeddingAdapter, probe: _PilotProbe
+    adapter: JinaEmbeddingAdapter,
+    probe: _PilotProbe,
+    limiter: _PilotQuotaLimiter,
 ) -> dict[str, object]:
     observer = _ObservingAdapter(adapter)
     text_token_count = sum(
@@ -166,6 +275,8 @@ def _run_probe(
             probe.inputs,
             policy=_pilot_policy(adapter, probe.inputs, max_concurrency=1),
             jitter=lambda _attempt: 0.0,
+            before_wave=limiter.reserve_wave,
+            after_wave=limiter.reconcile_wave,
         )
     except BatchExecutionFatal as error:
         if error.code in {"authentication", "authorization"}:
@@ -253,7 +364,9 @@ def _run_probe(
     return result
 
 
-def _run_concurrency_probe(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
+def _run_concurrency_probe(
+    adapter: JinaEmbeddingAdapter, limiter: _PilotQuotaLimiter
+) -> dict[str, object]:
     inputs = (
         JinaEmbeddingInput.text("generated concurrency probe one"),
         JinaEmbeddingInput.text("generated concurrency probe two"),
@@ -270,6 +383,8 @@ def _run_concurrency_probe(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
                 max_items=1,
             ),
             jitter=lambda _attempt: 0.0,
+            before_wave=limiter.reserve_wave,
+            after_wave=limiter.reconcile_wave,
         )
     except BatchExecutionFatal as error:
         if error.code in {"authentication", "authorization"}:
@@ -525,7 +640,9 @@ def _safe_nonnegative_number(value: object) -> int | float | None:
 
 def _normal_probes() -> tuple[_PilotProbe, ...]:
     normal_text = JinaEmbeddingInput.text("generated pilot text")
-    normal_image = JinaEmbeddingInput.image_base64(_encoded_png())
+    normal_image = JinaEmbeddingInput.image_base64(
+        _encoded_png(), estimated_tokens=10
+    )
     return (
         _PilotProbe("text_normal", (normal_text,)),
         _PilotProbe("image_normal", (normal_image,)),
@@ -541,7 +658,11 @@ def _boundary_probes(adapter: JinaEmbeddingAdapter) -> tuple[_PilotProbe, ...]:
         *(
             _PilotProbe(
                 f"image_nominal_{size}_bytes",
-                (JinaEmbeddingInput.image_base64(_encoded_png(size)),),
+                (
+                    JinaEmbeddingInput.image_base64(
+                        _encoded_png(size), estimated_tokens=10
+                    ),
+                ),
             )
             for size in _IMAGE_PROBE_BYTES
         ),

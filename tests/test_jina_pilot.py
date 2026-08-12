@@ -5,16 +5,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import struct
 import threading
 import zlib
 from collections.abc import Mapping
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from wsj_embeddings.adapters import JinaHttpResponse
+from wsj_embeddings.adapters import JinaEmbeddingAdapter, JinaHttpResponse
 from wsj_embeddings.cli import build_parser, main
-from wsj_embeddings.pilot import _encoded_png
+from wsj_embeddings.pilot import _encoded_png, run_jina_pilot
 from wsj_embeddings.tokenizer import PinnedJinaV4Tokenizer, PinnedTokenizerError
 
 
@@ -116,6 +119,39 @@ def _run_pilot(transport, *, capsys) -> dict[str, object]:
         == 0
     )
     return json.loads(capsys.readouterr().out)
+
+
+def test_all_live_pilot_probes_share_one_state_free_quota_window(tmp_path):
+    transport = PilotTransport()
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=transport,
+        tokenizer=PilotTokenizer(),
+    )
+    adapter.profile = replace(
+        adapter.profile,
+        quota_max_requests=2,
+        quota_max_estimated_tokens=45_000,
+        quota_window_seconds=60,
+    )
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    result = run_jina_pilot(
+        adapter,
+        quota_clock=lambda: now[0],
+        quota_sleep=advance,
+    )
+
+    assert result["readiness"]["outcome"] == "ready_for_operator_review"
+    assert len(transport.requests) > 2
+    assert len(sleeps) == math.ceil(len(transport.requests) / 2) - 1
+    assert set(sleeps) == {60.0}
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize(
