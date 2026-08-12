@@ -31,9 +31,11 @@ and optional local header images through one coordinator seam and publishes a
 separate embedding catalog. Smoke injects a deterministic fake adapter, while an explicit pilot
 sends only fixed in-memory generated text and PNG bytes through hosted Jina.
 The production command exposes only an affirmatively authorized positive limit
-of lexical article IDs. Durable per-modality checkpoints resume unchanged work;
+of lexical article IDs or an explicit full scope. Durable per-modality
+checkpoints resume unchanged work;
 an absent image is explicitly `not_applicable`, and remote editorial-image URLs
-are never image work. Full-corpus workflows remain unavailable.
+are never image work. Full traversal and removal inference are available only
+through the explicit authorized `--full` boundary.
 
 ```mermaid
 flowchart LR
@@ -47,7 +49,7 @@ flowchart LR
     F --> R
     H --> R
     U[Remote image URLs] --> F
-    E --> T[Fixture-only article text embedding tracer]
+    E --> T[Downstream text and header-image embedding coordinator]
     F --> T
     T --> G[(Separate embedding catalog)]
 ```
@@ -354,8 +356,8 @@ synthetic pilot that confirms the live image contract. Both the input rules and
 transform ID participate in `configuration_id`. The runtime transform ID also
 binds the linked JPEG, libjpeg-turbo, zlib, and WebP build versions; codec/profile
 ambiguity fails before configuration or work publication. The production Pillow
-path remains unexecuted in the shared environment and requires Task 14/ticket
-15's clean-install synthetic verification.
+path has a generated clean-install regression that binds the linked build
+identity and proves exact-byte pass-through and derived-JPEG publication.
 
 The rendition is staged below `renditions/<transform-hash>/`, fsynced, reopened,
 decoded, byte-compared, hashed, and atomically installed. After decode the full
@@ -750,6 +752,15 @@ orphan cleanup, and full-only missing-source reconciliation.
 
 ## 13. Downstream boundaries
 
+Production runs and the generated pilot use the real hosted Jina API; automated
+tests use injected fake adapters or simulated HTTP transports only. Before
+licensed content is transmitted, the operator must have the required license
+authorization and accept the provider's current privacy and data-handling
+terms. The hosted model name is a mutable alias, so recorded model/API metadata
+improves provenance but cannot guarantee exact hosted reproducibility. Current
+cost and throughput remain unknown until a successful pilot is reviewed, and a
+real full-corpus run must not be left unattended.
+
 - The fixture tracer queries `articles`, opens `cleaned_markdown_path` and any
   source-relative `header_image_path`, and writes all three vector modalities
   outside the preprocessing output root. It
@@ -783,7 +794,11 @@ orphan cleanup, and full-only missing-source reconciliation.
   covering preparation through final aggregation and metric publication.
   Once a concurrent wave completes, exchanges are handled in stable submission
   order and any request-wide fatal is raised only after completed sibling
-  outcomes have crossed their independent transactions. Intermediate long-part
+  outcomes have crossed their independent transactions. A request-wide
+  deterministic rejection first terminalizes every unresolved item in that
+  rejected request and marks the run failed; replay does not repurchase those
+  items. Authentication and authorization leave recoverable in-progress
+  checkpoints for replay after operator correction. Intermediate long-part
   failures do not block parent aggregation when that same part later succeeds.
 - Local header images are opened read-only without following symlinks and
   hashed. Eligible images are base64-encoded from those same bytes; oversized

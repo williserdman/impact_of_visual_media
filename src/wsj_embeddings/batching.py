@@ -184,6 +184,19 @@ def execute_rate_aware_batches(
         for batch, exchange in exchanges:
             if isinstance(exchange, JinaHostedAdapterError):
                 if exchange.code in _RUN_FATAL_CODES or not exchange.retryable:
+                    if exchange.code == "deterministic_request":
+                        for item in batch:
+                            outcome = JinaBatchItemOutcome(
+                                item.index,
+                                None,
+                                exchange.code,
+                                retryable=False,
+                                status_code=exchange.status_code,
+                                retry_after_seconds=exchange.retry_after_seconds,
+                            )
+                            final[item.index] = outcome
+                            if on_outcome is not None:
+                                on_outcome(item.index, item.attempt, outcome, True)
                     fatal_errors.append(exchange)
                     continue
                 throttled = exchange.code == "rate_limit"

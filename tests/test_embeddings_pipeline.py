@@ -4683,7 +4683,7 @@ def test_removed_canonical_header_invalidates_image_and_same_config_multimodal(
             [current_id],
         ).fetchall() == [
             ("header_image", "not_applicable", None),
-            ("multimodal_article", "queued", None),
+            ("multimodal_article", "stale_input", None),
         ]
         assert db.execute(
             """
@@ -6992,9 +6992,18 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             if column[0]
             not in {"char_start", "char_end", "byte_start", "byte_end"}
         )
-        assert {row[0] for row in db.execute("SHOW TABLES").fetchall()} == (
-            set(expected_v8_columns)
-        )
+        assert {
+            row[0]
+            for row in db.execute(
+                "SELECT table_name FROM duckdb_tables()"
+            ).fetchall()
+        } == set(expected_v8_columns)
+        assert {
+            row[0]
+            for row in db.execute(
+                "SELECT view_name FROM duckdb_views() WHERE internal = false"
+            ).fetchall()
+        } == set(EXPECTED_EMBEDDING_VIEW_COLUMNS)
         assert {
             table: tuple(
                 (row[1], row[2], row[3], row[4], row[5])
@@ -7007,24 +7016,7 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             for row in db.execute(
                 "PRAGMA table_info('embedding_configurations')"
             ).fetchall()
-        ] == [
-            "configuration_id",
-            "model",
-            "observed_model",
-            "observed_api_version",
-            "task",
-            "dimensions",
-            "output_type",
-            "normalization",
-            "tokenizer_revision",
-            "context_token_limit",
-            "context_rules",
-            "long_text_aggregation",
-            "image_input_rules",
-            "image_transform",
-            "multimodal_formula",
-            "client_configuration_version",
-        ]
+        ] == [column[0] for column in expected_v8_columns["embedding_configurations"]]
         assert [
             row[1]
             for row in db.execute("PRAGMA table_info('long_text_parts')").fetchall()
@@ -7647,6 +7639,10 @@ def test_validator_reports_invalid_durable_work_state(tmp_path):
     assert validate_embedding_outputs(config) == EmbeddingValidationResult(
         issues=(
             EmbeddingValidationIssue(
+                "invalid_public_embedding_checkpoint",
+                "public embeddings lack exact reusable-success work provenance",
+            ),
+            EmbeddingValidationIssue(
                 "invalid_work_state",
                 "embedding work items use an unsupported lifecycle state",
             ),
@@ -7898,12 +7894,13 @@ def test_pipeline_refuses_embedding_catalog_with_unexpected_index(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "damage",
-    (
-        "ALTER TABLE runs DROP COLUMN embeddings",
-        "ALTER TABLE embedding_configurations ALTER COLUMN model DROP NOT NULL",
-        "CREATE OR REPLACE TABLE embeddings AS SELECT * FROM embeddings",
-        "UPDATE metadata SET value = '999' WHERE key = 'schema_version'",
+        "damage",
+        (
+            "ALTER TABLE runs DROP COLUMN embeddings",
+            "ALTER TABLE embedding_configurations ALTER COLUMN model DROP NOT NULL",
+            "CREATE OR REPLACE TABLE embedding_storage AS "
+            "SELECT * FROM embedding_storage",
+            "UPDATE metadata SET value = '999' WHERE key = 'schema_version'",
     ),
     ids=("missing-column", "changed-nullability", "missing-primary-key", "version"),
 )
@@ -7912,9 +7909,11 @@ def test_pipeline_refuses_damaged_embedding_schema(tmp_path, damage):
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
     with duckdb.connect(str(config.embedding_catalog)) as db:
         db.execute(damage)
+    before = config.embedding_catalog.read_bytes()
 
     with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
         run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    assert config.embedding_catalog.read_bytes() == before
 
 
 def test_existing_embedding_catalog_is_inspected_read_only_before_write(
@@ -8302,6 +8301,10 @@ def test_validator_reports_run_without_configuration_reference(tmp_path):
                 "successful work lacks its generating run identity",
             ),
             EmbeddingValidationIssue(
+                "invalid_public_embedding_checkpoint",
+                "public embeddings lack exact reusable-success work provenance",
+            ),
+            EmbeddingValidationIssue(
                 "missing_run_configuration_reference",
                 "embedding runs lack a configuration reference",
             ),
@@ -8327,6 +8330,10 @@ def test_validator_checks_intrinsic_properties_for_orphaned_embedding_rows(tmp_p
             EmbeddingValidationIssue(
                 "invalid_modality",
                 "embedding rows use an unsupported modality",
+            ),
+            EmbeddingValidationIssue(
+                "invalid_public_embedding_checkpoint",
+                "public embeddings lack exact reusable-success work provenance",
             ),
                 EmbeddingValidationIssue(
                     "missing_canonical_article",

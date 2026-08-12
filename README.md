@@ -106,6 +106,15 @@ Run a successful credentialed pilot before authorizing a real-corpus embedding
 run. Automated tests never call the hosted API: they inject simulated HTTP
 responses or a fake adapter at the same public seams.
 
+Production `run` and the generated-content `pilot` use the real hosted Jina API.
+Before either command is used, the operator must be authorized to transmit the
+selected licensed material and must confirm that the provider's current terms,
+privacy controls, and data-handling policy are acceptable. The configured
+`jina-embeddings-v4` name is a hosted mutable alias: the catalog records the
+returned model and observed API metadata, but exact hosted reproducibility is
+not guaranteed if the provider changes behavior behind that alias. Cost and
+throughput are unknown until a successful current pilot is reviewed.
+
 `wsj-embeddings` does not accept the preprocessing TOML configuration and has
 no implicit root defaults. `inventory`, `validate`, and `run` require explicit source,
 preprocessing-output, and embedding-output roots; resolving them must produce
@@ -166,6 +175,10 @@ content-free inventory, and processes it in bounded pages. Only successful
 exhaustion and processing enter bounded reconciliation. Limited, failed,
 interrupted, or cancelled runs never infer deletion.
 
+Do not run a real full-corpus operation unattended. Use a durable terminal,
+monitor the content-free run summaries and provider limits, and keep the
+embedding output on recoverable storage so an interrupted run can be replayed.
+
 Add `--reprocess` only when article text in the selected scope must be
 regenerated despite matching content and configuration. Independent unchanged
 header-image successes remain reusable. Reprocess never expands beyond the
@@ -187,8 +200,9 @@ animated, corrupt, unsafe, or still-oversized input is terminal and publishes
 no placeholder vector. At runtime the transform identity additionally includes
 the linked JPEG, libjpeg-turbo, zlib, and WebP build versions; an unavailable or
 mismatched build fails before configuration or work publication. The production
-Pillow path still requires the clean-install synthetic verification owned by
-Task 14/ticket 15. Markdown at or below the conservative 8,000-token input
+Pillow path is exercised by a generated clean-install regression fixture that
+checks exact-byte pass-through and derived-JPEG publication. Markdown at or
+below the conservative 8,000-token input
 ceiling keeps the single hosted-input path, reserving 192 tokens below the
 confirmed 8,192-token model context. Longer Markdown is greedily partitioned at
 complete blank-line-delimited block boundaries; an individually oversized
@@ -409,7 +423,11 @@ content. Each durable prior attempt reduces the remaining request budget, so
 replay cannot purchase beyond the configured ceiling.
 All completed exchanges in a concurrent wave are processed in stable submission
 order before a request-wide fatal error is raised, preserving successful sibling
-work. A long part that succeeds on an in-run retry no longer leaves its parent
+work. A request-wide deterministic rejection terminalizes every unresolved
+item in the rejected request before the run is marked failed; replay does not
+repurchase those terminal items. Authentication and authorization failures
+remain recoverable in-progress checkpoints after the operator corrects access.
+A long part that succeeds on an in-run retry no longer leaves its parent
 marked failed and therefore participates in immediate complete-part aggregation.
 Every successful image generation has content-free `image_input_provenance`:
 source and exact embedded-input hashes, formats, byte counts, dimensions, frame counts,

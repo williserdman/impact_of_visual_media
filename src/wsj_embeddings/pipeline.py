@@ -448,22 +448,27 @@ def run_embedding_pipeline(
             getattr(adapter, "rate_aware_batching", False)
             and callable(getattr(adapter, "embed_batch", None))
         ):
-            metrics = _run_rate_aware_work(
-                config,
-                adapter,
-                catalog,
-                run_id,
-                configuration_identifier,
-                profile,
-                articles,
-                prepared_images,
-                registered_states,
-                reprocess=reprocess,
-                failpoints=active_failpoints,
-                batch_sleep=batch_sleep,
-                batch_jitter=batch_jitter,
-                monotonic=monotonic,
-            )
+            try:
+                metrics = _run_rate_aware_work(
+                    config,
+                    adapter,
+                    catalog,
+                    run_id,
+                    configuration_identifier,
+                    profile,
+                    articles,
+                    prepared_images,
+                    registered_states,
+                    reprocess=reprocess,
+                    failpoints=active_failpoints,
+                    batch_sleep=batch_sleep,
+                    batch_jitter=batch_jitter,
+                    monotonic=monotonic,
+                )
+            except JinaHostedAdapterError:
+                with catalog.transaction():
+                    catalog.fail_run(run_id)
+                raise
             for article in articles:
                 with catalog.transaction():
                     _publish_multimodal_article(

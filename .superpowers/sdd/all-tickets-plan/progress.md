@@ -42,3 +42,5 @@ Task 13: fix round 1/5 (4 addressed, 0 open; commits e443754..a204cf4)
 Task 13: fix round 2/5 (1 documentation overclaim addressed, 0 open; commits a204cf4..484df3f)
 Task 13: deferred review debt resolved (`_safe_usage` numeric normalization; generation-history modality/work/config/run identity validation)
 Task 13: complete (commits 8d807e7..484df3f, review clean)
+Task 14: implementation complete; clean install, production Pillow fixture, operator docs, fatal lifecycle repair, and final fixture-safe gate recorded in task-14-report.md.
+Task 14: final gate: 561 passed; Ruff clean; preprocessing smoke, embedding smoke, and generated embedding validation successful.

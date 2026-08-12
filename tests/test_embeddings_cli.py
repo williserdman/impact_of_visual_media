@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import duckdb
 import pytest
+from PIL import Image
 
 import wsj_embeddings.pipeline as embedding_pipeline_module
 from wsj_embeddings import FakeEmbeddingAdapter
@@ -34,7 +36,9 @@ def write_generated_cli_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     source_root.mkdir()
     header_path = source_root / "headers" / "a.jpg"
     header_path.parent.mkdir()
-    header_path.write_bytes(b"generated CLI header image")
+    header_bytes = io.BytesIO()
+    Image.new("RGB", (2, 2), (32, 64, 96)).save(header_bytes, format="PNG")
+    header_path.write_bytes(header_bytes.getvalue())
     article_rows = (
         ("wsj:B", "# Complete B\n\nSecond paragraph.\n", None),
         ("wsj:A", "# Complete A\n\nFirst paragraph.\n", "headers/a.jpg"),
@@ -599,8 +603,12 @@ def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
     """Break caught: hosted request failures leak their cause or request content."""
 
     class FailingTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+
         def post(self, url, *, headers, body, timeout_seconds):
             del url, headers, body, timeout_seconds
+            self.calls += 1
             if failure == "timeout":
                 raise TimeoutError("transport-secret")
             return JinaHttpResponse(
@@ -610,6 +618,7 @@ def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
             )
 
     roots = write_generated_cli_fixture(tmp_path)
+    failing_transport = FailingTransport()
 
     exit_code = main(
         [
@@ -620,12 +629,26 @@ def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
             "--authorize-hosted-processing",
         ],
         environment={"JINA_API_KEY": "credential-secret"},
-        transport=FailingTransport(),
+        transport=failing_transport,
     )
     captured = capsys.readouterr()
 
-    assert exit_code == 1
-    assert captured.out == f'{json.dumps({"error": expected_code}, sort_keys=True)}\n'
+    if failure == "rejection":
+        assert exit_code == 1
+        assert captured.out == (
+            f'{json.dumps({"error": expected_code}, sort_keys=True)}\n'
+        )
+    else:
+        result = json.loads(captured.out)
+        assert exit_code == 0
+        assert result["articles"] == 1
+        assert result["attempted"] == 6
+        assert result["embeddings"] == 0
+        assert result["hosted_requests"] == 3
+        assert result["retries"] == 4
+        assert result["retryable"] == 0
+        assert result["terminal"] == 2
+        assert result["header_failed"] == 1
     assert captured.err == ""
     for forbidden in (
         str(tmp_path),
@@ -635,18 +658,42 @@ def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
         "Complete A",
     ):
         assert forbidden not in captured.out
-    expected_state = "retryable" if failure in {"timeout", "rate"} else "terminal"
     expected_status = (
         None if failure == "timeout" else (429 if failure == "rate" else 413)
     )
+    expected_attempts = 1 if failure == "rejection" else 3
+    expected_run_status = "failed" if failure == "rejection" else "succeeded"
+    configuration_identifier = ""
     with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
+        configuration_identifier = db.execute(
+            "SELECT configuration_id FROM embedding_configurations"
+        ).fetchone()[0]
         assert db.execute(
             """
-            SELECT state, attempt_count, error_code, status_code
+            SELECT modality, state, attempt_count, error_code, status_code
             FROM embedding_work_items
+            ORDER BY modality
             """
-        ).fetchone() == (expected_state, 1, expected_code, expected_status)
+        ).fetchall() == [
+            (
+                "article_text",
+                "terminal",
+                expected_attempts,
+                expected_code,
+                expected_status,
+            ),
+            (
+                "header_image",
+                "terminal",
+                expected_attempts,
+                expected_code,
+                expected_status,
+            ),
+        ]
         assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+        assert db.execute(
+            "SELECT status, finished_at IS NOT NULL, terminal FROM runs"
+        ).fetchone() == (expected_run_status, True, 2)
     assert not (roots[2] / "pipeline.lock").exists()
     catalog_bytes = (roots[2] / "catalog.duckdb").read_bytes()
     for forbidden in (
@@ -656,6 +703,37 @@ def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
         b"Complete A",
     ):
         assert forbidden not in catalog_bytes
+
+    replay_exit = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--limit",
+            "1",
+            "--authorize-hosted-processing",
+        ],
+        environment={"JINA_API_KEY": "credential-secret"},
+        transport=failing_transport,
+    )
+    replay = json.loads(capsys.readouterr().out)
+    assert replay_exit == 0
+    assert replay["attempted"] == 0
+    assert replay["terminal"] == 2
+    assert failing_transport.calls == (1 if failure == "rejection" else 3)
+
+    validation_exit = main(
+        [
+            "validate",
+            *root_arguments(*roots),
+            "--configuration-id",
+            configuration_identifier,
+        ]
+    )
+    validation = json.loads(capsys.readouterr().out)
+    assert validation_exit == 1
+    assert {issue["code"] for issue in validation["issues"]} == {
+        "header_image_terminal_failure"
+    }
 
 
 def test_run_reports_existing_lock_without_removing_or_disclosing_it(

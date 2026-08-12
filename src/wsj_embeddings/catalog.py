@@ -1830,7 +1830,9 @@ class EmbeddingCatalog:
             if modality == EmbeddingModality.HEADER_IMAGE.value:
                 self.connection.execute(
                     """
-                    UPDATE embedding_work_storage SET state = ?
+                    UPDATE embedding_work_storage
+                    SET source_relative_path = NULL, input_sha256 = NULL,
+                        state = ?
                     WHERE article_id = ? AND modality = ?
                       AND configuration_id = ?
                     """,
