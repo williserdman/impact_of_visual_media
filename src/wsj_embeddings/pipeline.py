@@ -1672,6 +1672,7 @@ def _run_rate_aware_work(
     active_quota_clock = (
         (lambda: datetime.now(UTC)) if quota_clock is None else quota_clock
     )
+    reserved_wave: list[tuple[str, ...]] = []
 
     def reserve_wave(
         wave: tuple[tuple[JinaEmbeddingInput, ...], ...],
@@ -1687,12 +1688,37 @@ def _run_rate_aware_work(
                     profile=profile,
                 )
             if decision.reservation_ids:
+                reserved_wave.append(decision.reservation_ids)
                 if failpoints.after_quota_reservation is not None:
                     failpoints.after_quota_reservation(decision.reservation_ids)
                 return
             active_sleep(decision.retry_after_seconds)
 
     execution_kwargs["before_wave"] = reserve_wave
+
+    def reconcile_wave_usage(
+        observations: tuple[dict[str, int | float], ...],
+    ) -> None:
+        reservation_ids = reserved_wave.pop(0)
+        for reservation_id, usage in zip(
+            reservation_ids, observations, strict=True
+        ):
+            observed = usage.get("input_tokens", usage.get("prompt_tokens"))
+            if (
+                isinstance(observed, bool)
+                or not isinstance(observed, (int, float))
+                or not math.isfinite(float(observed))
+                or float(observed) < 0
+                or not float(observed).is_integer()
+            ):
+                continue
+            with catalog.transaction():
+                catalog.reconcile_hosted_request_usage(
+                    reservation_ids=(reservation_id,),
+                    observed_input_tokens=int(observed),
+                )
+
+    execution_kwargs["after_wave"] = reconcile_wave_usage
     if batch_sleep is not None:
         execution_kwargs["sleep"] = batch_sleep
     if batch_jitter is not None:

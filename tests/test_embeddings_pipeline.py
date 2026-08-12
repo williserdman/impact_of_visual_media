@@ -2172,12 +2172,84 @@ def test_rate_limited_batch_retries_in_run_and_reports_throttle(tmp_path):
     )
 
     assert [len(call) for call in adapter.calls] == [2, 2]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT count(*) FROM hosted_request_reservations"
+        ).fetchone() == (2,)
     assert sleeps == [2.5]
     assert result.embeddings == 3
     assert result.retryable == 0
     assert result.hosted_requests == 2
     assert result.retries == 2
     assert result.throttles == 1
+
+
+def test_mixed_batch_reserves_combined_text_and_image_token_estimate(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated quota image")
+    adapter = RecordingBatchAdapter()
+
+    run_embedding_pipeline(config, adapter, limit=1)
+
+    expected = sum(item.estimated_tokens for item in adapter.calls[0])
+    assert {item.kind for item in adapter.calls[0]} == {"text", "image"}
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT estimated_tokens FROM hosted_request_reservations
+            """
+        ).fetchall() == [(expected,)]
+
+
+def test_provider_input_usage_increases_quota_debt_before_next_wave(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:SYNTHETIC-USAGE-QUOTA",
+        markdown="# Usage quota\n",
+    )
+
+    class ObservedUsageAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_concurrency=1,
+            quota_max_requests=90,
+            quota_max_estimated_tokens=50,
+            client_configuration_version="synthetic-observed-usage-v1",
+        )
+
+        def embed_batch(self, inputs, *, limits):
+            response = super().embed_batch(inputs, limits=limits)
+            return replace(
+                response,
+                usage={"input_tokens": 50, "total_tokens": 50},
+            )
+
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    run_embedding_pipeline(
+        config,
+        ObservedUsageAdapter(),
+        limit=2,
+        quota_clock=lambda: now[0],
+        batch_sleep=advance,
+    )
+
+    assert sleeps == [60.0]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT observed_input_tokens
+            FROM hosted_request_reservations
+            ORDER BY reserved_at, reservation_id
+            """
+        ).fetchall() == [(50,), (50,)]
 
 
 def test_indexed_deterministic_image_retries_alone_to_durable_limit(tmp_path):
@@ -7905,6 +7977,51 @@ def test_catalog_reserves_dual_rolling_quota_and_expires_old_capacity(tmp_path):
             [admitted.reservation_ids[0]],
         ).fetchone() == (45_000, 45_001)
         assert len(reservation_ids) == 90
+
+
+def test_catalog_admits_two_maximum_requests_but_blocks_a_third(tmp_path):
+    database_path = tmp_path / "catalog.duckdb"
+    profile = FakeEmbeddingAdapter.profile
+    configuration_identifier = configuration_id(profile)
+    started = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+
+    with EmbeddingCatalog.open(database_path) as catalog:
+        with catalog.transaction():
+            catalog.begin_run("run-wave", configuration_identifier, profile, 1)
+            admitted = catalog.reserve_hosted_requests(
+                run_id="run-wave",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(45_000, 45_000),
+                reserved_at=started,
+                profile=profile,
+            )
+        with catalog.transaction():
+            blocked = catalog.reserve_hosted_requests(
+                run_id="run-wave",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(1,),
+                reserved_at=started,
+                profile=profile,
+            )
+
+    assert len(admitted.reservation_ids) == 2
+    assert blocked == embedding_catalog_module.QuotaReservationDecision((), 60.0)
+
+
+def test_validator_rejects_malformed_hosted_quota_reservation(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, RecordingBatchAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            UPDATE hosted_request_reservations
+            SET observed_input_tokens = estimated_tokens - 1
+            """
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_hosted_quota_reservation" in codes
 
 
 def test_pipeline_refuses_exact_version_sixteen_catalog_without_migration(tmp_path):

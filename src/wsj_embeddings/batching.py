@@ -136,6 +136,7 @@ def execute_rate_aware_batches(
     before_wave: (
         Callable[[tuple[tuple[JinaEmbeddingInput, ...], ...]], None] | None
     ) = None,
+    after_wave: Callable[[tuple[dict[str, int | float], ...]], None] | None = None,
     on_outcome: Callable[[int, int, JinaBatchItemOutcome, bool], None] | None = None,
     prior_attempt_counts: Sequence[int] | None = None,
     attempt_limits: Sequence[int] | None = None,
@@ -213,6 +214,15 @@ def execute_rate_aware_batches(
                 except JinaHostedAdapterError as error:
                     exchange = error
                 exchanges.append((batch, exchange))
+        if after_wave is not None:
+            after_wave(
+                tuple(
+                    dict(exchange.usage)
+                    if isinstance(exchange, JinaEmbeddingBatchResponse)
+                    else {}
+                    for _batch, exchange in exchanges
+                )
+            )
         requests += len(wave)
         retry_delays: list[float] = []
         next_pending = list(deferred)
