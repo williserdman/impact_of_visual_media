@@ -69,8 +69,7 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
     "embedding_configurations": (
         ("configuration_id", "VARCHAR", True, None, True),
         ("model", "VARCHAR", True, None, False),
-        ("observed_model", "VARCHAR", True, None, False),
-        ("observed_api_version", "VARCHAR", True, None, False),
+        ("client_api_contract_version", "VARCHAR", True, None, False),
         ("task", "VARCHAR", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
         ("output_type", "VARCHAR", True, None, False),
@@ -84,6 +83,7 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("batch_max_items", "INTEGER", True, None, False),
         ("batch_max_estimated_tokens", "INTEGER", True, None, False),
         ("batch_max_encoded_bytes", "BIGINT", True, None, False),
+        ("batch_max_response_bytes", "BIGINT", True, None, False),
         ("batch_max_concurrency", "INTEGER", True, None, False),
         ("batch_max_attempts", "INTEGER", True, None, False),
         ("batch_initial_backoff_seconds", "DOUBLE", True, None, False),
@@ -147,6 +147,9 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("publication_date_new_york", "DATE", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
         ("input_sha256", "VARCHAR", True, None, False),
+        ("derivation_kind", "VARCHAR", True, None, False),
+        ("raw_response_sha256", "VARCHAR", False, None, False),
+        ("response_model", "VARCHAR", False, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("vector", "FLOAT[2048]", True, None, False),
     ),
@@ -163,6 +166,9 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("expected_generation_run_id", "VARCHAR", False, None, False),
         ("expected_vector_source_relative_path", "VARCHAR", False, None, False),
         ("expected_vector_input_sha256", "VARCHAR", False, None, False),
+        ("expected_derivation_kind", "VARCHAR", False, None, False),
+        ("expected_raw_response_sha256", "VARCHAR", False, None, False),
+        ("expected_response_model", "VARCHAR", False, None, False),
         ("expected_stored_vector_sha256", "VARCHAR", False, None, False),
         ("staged_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
@@ -173,6 +179,9 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("generation_run_id", "VARCHAR", True, None, True),
         ("source_relative_path", "VARCHAR", False, None, False),
         ("input_sha256", "VARCHAR", True, None, False),
+        ("derivation_kind", "VARCHAR", True, None, False),
+        ("raw_response_sha256", "VARCHAR", False, None, False),
+        ("response_model", "VARCHAR", False, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("superseded_run_id", "VARCHAR", True, None, False),
         ("superseded_reason", "VARCHAR", True, None, False),
@@ -228,6 +237,9 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("retry_after_seconds", "DOUBLE", False, None, False),
         ("last_run_id", "VARCHAR", True, None, False),
         ("generation_run_id", "VARCHAR", False, None, False),
+        ("derivation_kind", "VARCHAR", False, None, False),
+        ("raw_response_sha256", "VARCHAR", False, None, False),
+        ("response_model", "VARCHAR", False, None, False),
         ("stored_vector_sha256", "VARCHAR", False, None, False),
         ("vector", "FLOAT[2048]", False, None, False),
         ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
@@ -245,6 +257,9 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("byte_end", "BIGINT", True, None, False),
         ("part_input_sha256", "VARCHAR", True, None, False),
         ("token_count", "INTEGER", True, None, False),
+        ("derivation_kind", "VARCHAR", True, None, False),
+        ("raw_response_sha256", "VARCHAR", False, None, False),
+        ("response_model", "VARCHAR", False, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("vector", "FLOAT[2048]", True, None, False),
         ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
@@ -586,7 +601,15 @@ class RecordingBatchAdapter(FakeEmbeddingAdapter):
             items.append(
                 JinaBatchItemOutcome(
                     index,
-                    JinaEmbeddedVector(index, values, values, "a" * 64, "b" * 64),
+                    JinaEmbeddedVector(
+                        index,
+                        values,
+                        values,
+                        "a" * 64,
+                        hashlib.sha256(
+                            b"".join(struct.pack("<f", value) for value in values)
+                        ).hexdigest(),
+                    ),
                     None,
                 )
             )
@@ -604,6 +627,39 @@ class LongTextRecordingBatchAdapter(RecordingBatchAdapter):
         tokenizer_engine="synthetic-codepoint-tokenizer-v1",
         context_token_limit=8,
         client_configuration_version="synthetic-rate-aware-long-batching-v1",
+    )
+
+
+class HostedProvenanceBatchAdapter(RecordingBatchAdapter):
+    """Generated transport outcome shaped like a real hosted response."""
+
+    def embed_batch(self, inputs, *, limits):
+        response = super().embed_batch(inputs, limits=limits)
+        return replace(
+            response,
+            items=tuple(
+                replace(
+                    outcome,
+                    vector=(
+                        None
+                        if outcome.vector is None
+                        else replace(
+                            outcome.vector,
+                            response_model="jina-v4-observed-deployment-a",
+                        )
+                    ),
+                )
+                for outcome in response.items
+            ),
+        )
+
+
+class HostedProvenanceLongTextAdapter(
+    HostedProvenanceBatchAdapter, LongTextRecordingBatchAdapter
+):
+    profile = replace(
+        LongTextRecordingBatchAdapter.profile,
+        client_configuration_version="synthetic-hosted-provenance-long-v1",
     )
 
 
@@ -739,8 +795,7 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
     )
     alternatives = {
         "model": "changed-model-alias",
-        "observed_model": "changed-observed-model",
-        "observed_api_version": "changed-api-version",
+        "client_api_contract_version": "changed-api-contract-version",
         "task": "changed-task",
         "dimensions": 1024,
         "output_type": "changed-output-type",
@@ -754,6 +809,7 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
         "batch_max_items": 15,
         "batch_max_estimated_tokens": 15_000,
         "batch_max_encoded_bytes": 15_000_000,
+        "batch_max_response_bytes": 3_000_000,
         "batch_max_concurrency": 3,
         "batch_max_attempts": 4,
         "batch_initial_backoff_seconds": 2.0,
@@ -887,7 +943,10 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
             FROM embeddings
             """
         ).fetchone()
-        vector_type = db.execute("PRAGMA table_info('embeddings')").fetchall()[9][2]
+        vector_type = {
+            row[1]: row[2]
+            for row in db.execute("PRAGMA table_info('embeddings')").fetchall()
+        }["vector"]
     assert row[:5] == (
         "wsj:SYNTHETIC-EMBEDDING",
         "article_text",
@@ -938,6 +997,118 @@ def test_rate_aware_coordinator_batches_mixed_items_and_summarizes_hosted_usage(
             ("header_image",),
             ("multimodal_article",),
         ]
+
+
+def test_hosted_source_hashes_and_response_model_survive_active_and_history(
+    tmp_path,
+):
+    """Break caught: coordinator drops adapter raw hashes before publication."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated hosted provenance image")
+    adapter = HostedProvenanceBatchAdapter()
+    run_embedding_pipeline(config, adapter, limit=1)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, derivation_kind, raw_response_sha256,
+                   response_model
+            FROM embeddings ORDER BY modality
+            """
+        ).fetchall() == [
+            (
+                "article_text",
+                "hosted_response",
+                "a" * 64,
+                "jina-v4-observed-deployment-a",
+            ),
+            (
+                "header_image",
+                "hosted_response",
+                "a" * 64,
+                "jina-v4-observed-deployment-a",
+            ),
+            ("multimodal_article", "multimodal_midpoint", None, None),
+        ]
+
+    replace_generated_embedding_markdown(config, "# Changed generated text\n")
+    run_embedding_pipeline(config, HostedProvenanceBatchAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT derivation_kind, raw_response_sha256, response_model
+            FROM embedding_generation_history
+            WHERE modality = 'article_text'
+            """
+        ).fetchone() == (
+            "hosted_response",
+            "a" * 64,
+            "jina-v4-observed-deployment-a",
+        )
+    assert validate_embedding_outputs(config).ok
+
+
+def test_hosted_long_parts_retain_raw_hash_while_aggregate_is_derived(tmp_path):
+    """Break caught: part raw provenance is recomputed or copied to aggregate."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+    adapter = HostedProvenanceLongTextAdapter()
+    run_embedding_pipeline(config, adapter, limit=1)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        for table in ("long_text_parts", "long_text_part_generations"):
+            assert db.execute(
+                f"""
+                SELECT DISTINCT derivation_kind, raw_response_sha256,
+                                response_model
+                FROM {table}
+                """
+            ).fetchall() == [
+                (
+                    "hosted_response",
+                    "a" * 64,
+                    "jina-v4-observed-deployment-a",
+                )
+            ]
+        assert db.execute(
+            """
+            SELECT derivation_kind, raw_response_sha256, response_model
+            FROM embeddings WHERE modality = 'article_text'
+            """
+        ).fetchone() == ("long_text_aggregate", None, None)
+    assert validate_embedding_outputs(config).ok
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (
+        ("raw_response_sha256", None),
+        ("raw_response_sha256", "not-a-sha256"),
+        ("response_model", None),
+        ("response_model", "unsafe\nmodel"),
+        ("derivation_kind", "multimodal_midpoint"),
+    ),
+)
+def test_validator_rejects_malformed_hosted_vector_provenance(
+    tmp_path, column, value
+):
+    """Break caught: hosted vector audit fields can be missing or contradictory."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    adapter = HostedProvenanceBatchAdapter()
+    run_embedding_pipeline(config, adapter, limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            f"UPDATE embedding_storage SET {column} = ? "
+            "WHERE modality = 'article_text'",
+            [value],
+        )
+
+    assert "invalid_vector_provenance" in {
+        issue.code for issue in validate_embedding_outputs(config).issues
+    }
 
 
 def test_catalog_boundary_drops_hostile_or_nonnumeric_usage(tmp_path):
@@ -1152,6 +1323,21 @@ def test_concurrent_wave_commits_second_success_before_raising_first_fatal(
             ("wsj:SYNTHETIC-EMBEDDING", "in_progress"),
             ("wsj:ZZZ-SYNTHETIC-EMBEDDING", "succeeded"),
         ]
+        assert db.execute(
+            """
+            SELECT status, hosted_requests, hosted_retries, usage_json,
+                   throttles, elapsed_seconds >= 0, finished_at IS NOT NULL
+            FROM runs ORDER BY started_at DESC LIMIT 1
+            """
+        ).fetchone() == (
+            "failed",
+            2,
+            0,
+            '{"prompt_tokens":1,"total_tokens":1}',
+            0,
+            True,
+            True,
+        )
 
     replay = FatalFirstWaveAdapter(fatal_first=False)
     run_embedding_pipeline(config, replay, limit=2)
@@ -1421,6 +1607,56 @@ def test_rate_limited_batch_retries_in_run_and_reports_throttle(tmp_path):
     assert result.throttles == 1
 
 
+def test_indexed_deterministic_image_retries_alone_to_durable_limit(tmp_path):
+    """Break caught: one rejected image terminates its successful text sibling."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated rejected batch image")
+    adapter = RecordingBatchAdapter(
+        [
+            {1: "deterministic_request"},
+            {0: "deterministic_request"},
+            {0: "deterministic_request"},
+        ]
+    )
+
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        batch_sleep=lambda _seconds: None,
+        batch_jitter=lambda _attempt: 0.0,
+    )
+
+    assert [[item.kind for item in call] for call in adapter.calls] == [
+        ["text", "image"],
+        ["image"],
+        ["image"],
+    ]
+    assert result.succeeded == 1
+    assert result.terminal == 1
+    assert result.header_failed == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, state, attempt_count FROM embedding_work_items
+            ORDER BY modality
+            """
+        ).fetchall() == [
+            ("article_text", "succeeded", 1),
+            ("header_image", "terminal", 3),
+        ]
+        assert db.execute("SELECT modality FROM embeddings").fetchall() == [
+            ("article_text",)
+        ]
+
+    replay = RecordingBatchAdapter()
+    replay_result = run_embedding_pipeline(config, replay, limit=1)
+    assert replay.calls == []
+    assert replay_result.reused == 1
+    assert replay_result.terminal == 1
+
+
 @pytest.mark.parametrize("code", ("authentication", "authorization"))
 def test_batch_auth_failure_stops_run_scope_without_transient_retry(tmp_path, code):
     """Break caught: credential or permission failure enters item retry policy."""
@@ -1448,6 +1684,13 @@ def test_batch_auth_failure_stops_run_scope_without_transient_retry(tmp_path, co
             "SELECT state, attempt_count FROM embedding_work_items"
         ).fetchall() == [("in_progress", 1), ("not_applicable", 0)]
         assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+        assert db.execute(
+            """
+            SELECT status, hosted_requests, hosted_retries, usage_json,
+                   throttles, elapsed_seconds >= 0, finished_at IS NOT NULL
+            FROM runs
+            """
+        ).fetchone() == ("failed", 1, 0, "{}", 0, True, True)
 
 
 def test_invalid_batch_profile_stops_before_run_or_output_mutation(tmp_path):
@@ -6679,7 +6922,7 @@ def test_rendition_cleanup_checks_one_candidate_and_preserves_history(tmp_path):
     assert not (namespace / orphan_name).exists()
 
 
-def test_embedding_catalog_has_exact_version_fourteen_reconciliation_schema(
+def test_embedding_catalog_has_exact_version_fifteen_provenance_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -6777,7 +7020,200 @@ def test_embedding_catalog_has_exact_version_fourteen_reconciliation_schema(
     assert view_columns == EXPECTED_EMBEDDING_VIEW_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "14")]
+    assert metadata == [("schema_version", "15")]
+
+
+def test_pipeline_refuses_exact_version_fourteen_catalog_without_migration(
+    tmp_path,
+):
+    """Break caught: provenance fields are silently added to v14 output."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP VIEW embeddings")
+        for column in (
+            "derivation_kind",
+            "raw_response_sha256",
+            "response_model",
+        ):
+            db.execute(f"ALTER TABLE embedding_storage DROP COLUMN {column}")
+            db.execute(
+                f"ALTER TABLE embedding_generation_history DROP COLUMN {column}"
+            )
+            db.execute(f"ALTER TABLE long_text_parts DROP COLUMN {column}")
+            db.execute(
+                f"ALTER TABLE long_text_part_generations DROP COLUMN {column}"
+            )
+        for column in (
+            "expected_derivation_kind",
+            "expected_raw_response_sha256",
+            "expected_response_model",
+        ):
+            db.execute(f"ALTER TABLE reconciliation_actions DROP COLUMN {column}")
+        db.execute(
+            """
+            CREATE TABLE embedding_configurations_v14 (
+                configuration_id VARCHAR PRIMARY KEY, model VARCHAR NOT NULL,
+                observed_model VARCHAR NOT NULL,
+                observed_api_version VARCHAR NOT NULL, task VARCHAR NOT NULL,
+                dimensions INTEGER NOT NULL, output_type VARCHAR NOT NULL,
+                normalization VARCHAR NOT NULL,
+                tokenizer_revision VARCHAR NOT NULL,
+                tokenizer_engine VARCHAR NOT NULL,
+                context_token_limit INTEGER NOT NULL,
+                context_rules VARCHAR NOT NULL,
+                long_text_aggregation VARCHAR NOT NULL,
+                long_text_part_attempt_limit INTEGER NOT NULL,
+                batch_max_items INTEGER NOT NULL,
+                batch_max_estimated_tokens INTEGER NOT NULL,
+                batch_max_encoded_bytes BIGINT NOT NULL,
+                batch_max_concurrency INTEGER NOT NULL,
+                batch_max_attempts INTEGER NOT NULL,
+                batch_initial_backoff_seconds DOUBLE NOT NULL,
+                batch_max_backoff_seconds DOUBLE NOT NULL,
+                image_input_rules VARCHAR NOT NULL,
+                image_transform VARCHAR NOT NULL,
+                multimodal_formula VARCHAR NOT NULL,
+                client_configuration_version VARCHAR NOT NULL
+            )
+            """
+        )
+        db.execute("DROP TABLE embedding_configurations")
+        db.execute(
+            "ALTER TABLE embedding_configurations_v14 "
+            "RENAME TO embedding_configurations"
+        )
+        db.execute(
+            """
+            CREATE VIEW embeddings AS
+            SELECT storage.* FROM embedding_storage AS storage
+            WHERE NOT EXISTS (
+                SELECT 1 FROM reconciliation_actions AS action
+                JOIN runs ON runs.run_id = action.run_id
+                WHERE runs.reconciliation_complete
+                  AND action.article_id = storage.article_id
+                  AND action.modality = storage.modality
+                  AND action.configuration_id = storage.configuration_id
+            )
+            """
+        )
+        db.execute("UPDATE metadata SET value = '14' WHERE key = 'schema_version'")
+        expected_v14 = dict(EXPECTED_EMBEDDING_TABLE_COLUMNS)
+        expected_v14["embedding_configurations"] = (
+            ("configuration_id", "VARCHAR", True, None, True),
+            ("model", "VARCHAR", True, None, False),
+            ("observed_model", "VARCHAR", True, None, False),
+            ("observed_api_version", "VARCHAR", True, None, False),
+            *tuple(
+                column
+                for column in EXPECTED_EMBEDDING_TABLE_COLUMNS[
+                    "embedding_configurations"
+                ]
+                if column[0]
+                not in {
+                    "configuration_id",
+                    "model",
+                    "client_api_contract_version",
+                    "batch_max_response_bytes",
+                }
+            ),
+        )
+        for table, columns in tuple(expected_v14.items()):
+            excluded = {
+                "embedding_storage": {
+                    "derivation_kind",
+                    "raw_response_sha256",
+                    "response_model",
+                },
+                "embedding_generation_history": {
+                    "derivation_kind",
+                    "raw_response_sha256",
+                    "response_model",
+                },
+                "long_text_parts": {
+                    "derivation_kind",
+                    "raw_response_sha256",
+                    "response_model",
+                },
+                "long_text_part_generations": {
+                    "derivation_kind",
+                    "raw_response_sha256",
+                    "response_model",
+                },
+                "reconciliation_actions": {
+                    "expected_derivation_kind",
+                    "expected_raw_response_sha256",
+                    "expected_response_model",
+                },
+            }.get(table, set())
+            expected_v14[table] = tuple(
+                column for column in columns if column[0] not in excluded
+            )
+        assert {
+            table: tuple(
+                (row[1], row[2], row[3], row[4], row[5])
+                for row in db.execute(f"PRAGMA table_info('{table}')").fetchall()
+            )
+            for table in expected_v14
+        } == expected_v14
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("14",)
+        assert {
+            row[1]
+            for row in db.execute("PRAGMA table_info('embedding_storage')").fetchall()
+        }.isdisjoint({"derivation_kind", "raw_response_sha256", "response_model"})
+
+
+def test_new_run_recovers_abandoned_running_run_and_invisible_actions(tmp_path):
+    """Break caught: a hard crash strands running state and staged removals."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    abandoned_run_id = "generated-abandoned-full-run"
+    profile = FakeEmbeddingAdapter.profile
+    with EmbeddingCatalog.open(config.embedding_catalog) as catalog:
+        with catalog.transaction():
+            catalog.begin_run(
+                abandoned_run_id,
+                configuration_id(profile),
+                profile,
+                0,
+                scope="full",
+            )
+            catalog.mark_full_discovery_complete(abandoned_run_id)
+        with catalog.transaction():
+            staged, _cursor = catalog.stage_reconciliation_page(
+                abandoned_run_id,
+                after_action_key=None,
+                page_size=1,
+            )
+            assert staged == 1
+
+    resumed = run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert resumed.reused == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT status, finished_at IS NOT NULL FROM runs WHERE run_id = ?",
+            [abandoned_run_id],
+        ).fetchone() == ("interrupted", True)
+        assert db.execute(
+            "SELECT count(*) FROM reconciliation_actions WHERE run_id = ?",
+            [abandoned_run_id],
+        ).fetchone() == (0,)
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (1,)
+    assert validate_embedding_outputs(config).ok
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -7739,7 +8175,7 @@ def test_validator_rejects_vector_for_not_applicable_header_image(tmp_path):
             """
             INSERT INTO embedding_storage
             VALUES ('wsj:SYNTHETIC-EMBEDDING', 'header_image', ?, NULL,
-                    ?, ?, 2048, ?, ?, ?)
+                    ?, ?, 2048, ?, 'synthetic_fixture', NULL, NULL, ?, ?)
             """,
             [
                 configuration_identifier,

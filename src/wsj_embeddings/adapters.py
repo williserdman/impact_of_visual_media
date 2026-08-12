@@ -136,6 +136,7 @@ class JinaBatchLimits:
     max_items: int
     max_estimated_tokens: int
     max_encoded_bytes: int
+    max_response_bytes: int = 2_000_000
 
     def __post_init__(self) -> None:
         if any(
@@ -144,6 +145,7 @@ class JinaBatchLimits:
                 self.max_items,
                 self.max_estimated_tokens,
                 self.max_encoded_bytes,
+                self.max_response_bytes,
             )
         ):
             raise ValueError("batch limits must be positive integers")
@@ -168,7 +170,26 @@ class JinaTransport(Protocol):
         headers: Mapping[str, str],
         body: bytes,
         timeout_seconds: float,
+        max_response_bytes: int,
     ) -> JinaHttpResponse: ...
+
+
+class _JinaResponseTooLarge(RuntimeError):
+    """Internal content-free signal from the bounded HTTP reader."""
+
+
+def _read_bounded_body(stream: object, *, max_response_bytes: int) -> bytes:
+    """Read at most the configured body ceiling plus one detection byte."""
+
+    chunks: list[bytes] = []
+    received = 0
+    while received <= max_response_bytes:
+        chunk = stream.read(min(65_536, max_response_bytes + 1 - received))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        received += len(chunk)
+    raise _JinaResponseTooLarge
 
 
 class UrllibJinaTransport:
@@ -181,6 +202,7 @@ class UrllibJinaTransport:
         headers: Mapping[str, str],
         body: bytes,
         timeout_seconds: float,
+        max_response_bytes: int,
     ) -> JinaHttpResponse:
         request = urllib.request.Request(
             url,
@@ -193,13 +215,17 @@ class UrllibJinaTransport:
                 return JinaHttpResponse(
                     status_code=response.status,
                     headers=dict(response.headers.items()),
-                    body=response.read(),
+                    body=_read_bounded_body(
+                        response, max_response_bytes=max_response_bytes
+                    ),
                 )
         except urllib.error.HTTPError as error:
             return JinaHttpResponse(
                 status_code=error.code,
                 headers=dict(error.headers.items()) if error.headers else {},
-                body=error.read(),
+                body=_read_bounded_body(
+                    error, max_response_bytes=max_response_bytes
+                ),
             )
 
 
@@ -221,6 +247,7 @@ class JinaEmbeddedVector:
     stored_vector: tuple[float, ...]
     raw_response_sha256: str
     stored_vector_sha256: str
+    response_model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,8 +312,7 @@ class JinaEmbeddingAdapter:
         dimensions=_JINA_DIMENSIONS,
         output_type="float",
         normalization="l2-client-float32-v1",
-        observed_model=_JINA_MODEL,
-        observed_api_version="2026.07.27.1603",
+        client_api_contract_version="openapi-2026.07.27.1603",
         tokenizer_revision=_TOKENIZER_IDENTITY,
         context_token_limit=_CONSERVATIVE_CONTEXT_TOKEN_LIMIT,
         context_rules="markdown-block-greedy-no-overlap-truncate-false-v1",
@@ -294,7 +320,8 @@ class JinaEmbeddingAdapter:
         image_input_rules=PRODUCTION_IMAGE_INPUT_RULES,
         image_transform=PRODUCTION_IMAGE_TRANSFORM_ID,
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
-        client_configuration_version="wsj-embeddings-config-v4",
+        batch_max_response_bytes=2_000_000,
+        client_configuration_version="wsj-embeddings-config-v5",
     )
     rate_aware_batching = True
 
@@ -372,6 +399,7 @@ class JinaEmbeddingAdapter:
                 max_encoded_bytes=max(
                     1, sum(item.encoded_bytes for item in inputs)
                 ),
+                max_response_bytes=self.profile.batch_max_response_bytes,
             ),
         )
         if any(item.vector is None for item in batch.items):
@@ -418,12 +446,18 @@ class JinaEmbeddingAdapter:
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        response = self._send(body)
+        response = self._send(
+            body,
+            max_response_bytes=min(
+                limits.max_response_bytes,
+                self.profile.batch_max_response_bytes,
+            ),
+        )
         if not 200 <= response.status_code < 300:
             self._raise_for_status(response)
         payload = self._decode_success(response)
-        model = payload.get("model")
-        if model != _JINA_MODEL:
+        model = _safe_response_model(payload.get("model"))
+        if model is None:
             raise JinaHostedAdapterError("invalid_response", retryable=False)
         rate_headers = _safe_rate_limit_headers(response.headers)
         retry_after = _retry_after_seconds(
@@ -437,6 +471,7 @@ class JinaEmbeddingAdapter:
                 expected_count=len(request_items),
                 status_code=response.status_code,
                 retry_after_seconds=retry_after,
+                response_model=model,
             ),
             usage=_safe_usage(payload.get("usage")),
             response_metadata=JinaResponseMetadata(
@@ -446,7 +481,7 @@ class JinaEmbeddingAdapter:
             ),
         )
 
-    def _send(self, body: bytes) -> JinaHttpResponse:
+    def _send(self, body: bytes, *, max_response_bytes: int) -> JinaHttpResponse:
         try:
             return self._transport.post(
                 _JINA_EMBEDDINGS_URL,
@@ -456,7 +491,10 @@ class JinaEmbeddingAdapter:
                 },
                 body=body,
                 timeout_seconds=self._timeout_seconds,
+                max_response_bytes=max_response_bytes,
             )
+        except _JinaResponseTooLarge:
+            raise JinaHostedAdapterError("invalid_response", retryable=False) from None
         except TimeoutError:
             raise JinaHostedAdapterError("timeout", retryable=True) from None
         except OSError:
@@ -498,7 +536,7 @@ class JinaEmbeddingAdapter:
 
 
 def _validated_vectors(
-    payload: Mapping[str, object], *, expected_count: int
+    payload: Mapping[str, object], *, expected_count: int, response_model: str
 ) -> tuple[JinaEmbeddedVector, ...]:
     data = payload.get("data")
     if not isinstance(data, list) or len(data) != expected_count:
@@ -551,6 +589,7 @@ def _validated_vectors(
             stored_vector=stored_vector,
             raw_response_sha256=hashlib.sha256(raw_representation).hexdigest(),
             stored_vector_sha256=hashlib.sha256(packed_stored).hexdigest(),
+            response_model=response_model,
         )
     if set(by_index) != set(range(expected_count)):
         raise JinaHostedAdapterError("invalid_response", retryable=False)
@@ -563,6 +602,7 @@ def _validated_batch_items(
     expected_count: int,
     status_code: int,
     retry_after_seconds: float | None,
+    response_model: str,
 ) -> tuple[JinaBatchItemOutcome, ...]:
     """Validate each unambiguous response index without discarding siblings."""
 
@@ -621,6 +661,7 @@ def _validated_batch_items(
             vector = _validated_vectors(
                 {"data": [{**indexed[0], "index": 0}]},
                 expected_count=1,
+                response_model=response_model,
             )[0]
         except JinaHostedAdapterError:
             outcomes.append(
@@ -653,6 +694,16 @@ def _safe_usage(value: object) -> dict[str, int | float]:
         if number is not None:
             usage[key] = number
     return usage
+
+
+def _safe_response_model(value: object) -> str | None:
+    """Retain a bounded content-free model label exactly as returned."""
+
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 256:
+        return None
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        return None
+    return value
 
 
 def _safe_rate_limit_headers(headers: Mapping[str, str]) -> dict[str, float]:
@@ -720,8 +771,7 @@ class FakeEmbeddingAdapter:
         dimensions=2048,
         output_type="float",
         normalization="l2-client-float32-v1",
-        observed_model="fake-jina-embeddings-v4",
-        observed_api_version="synthetic-v1",
+        client_api_contract_version="synthetic-v1",
         tokenizer_revision="synthetic-jina-v4-tokenizer-v1",
         tokenizer_engine="synthetic-codepoint-tokenizer-v1",
         context_token_limit=8_000,
@@ -730,7 +780,7 @@ class FakeEmbeddingAdapter:
         image_input_rules=PRODUCTION_IMAGE_INPUT_RULES,
         image_transform=PRODUCTION_IMAGE_TRANSFORM_ID,
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
-        client_configuration_version="wsj-embeddings-config-v4",
+        client_configuration_version="wsj-embeddings-config-v5",
     )
     image_codec = FixturePassthroughImageCodec()
 

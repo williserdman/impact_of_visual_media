@@ -110,9 +110,10 @@ Production `run` and the generated-content `pilot` use the real hosted Jina API.
 Before either command is used, the operator must be authorized to transmit the
 selected licensed material and must confirm that the provider's current terms,
 privacy controls, and data-handling policy are acceptable. The configured
-`jina-embeddings-v4` name is a hosted mutable alias: the catalog records the
-returned model and observed API metadata, but exact hosted reproducibility is
-not guaranteed if the provider changes behavior behind that alias. Cost and
+`jina-embeddings-v4` name is a hosted mutable alias: each hosted generation
+records the returned model, while the pilot separately reports current API
+observations. Exact hosted reproducibility is not guaranteed if the provider
+changes behavior behind that alias. Cost and
 throughput are unknown until a successful current pilot is reviewed.
 
 `wsj-embeddings` does not accept the preprocessing TOML configuration and has
@@ -359,11 +360,11 @@ references only; the pipeline never downloads them.
 
 ## Text, header-image, and multimodal embedding catalog contract
 
-The downstream catalog is a separate schema-version-14 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-15 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted production CLI.
-Versions 1 through 13 are refused without migration; move reproducible derived
+Versions 1 through 14 are refused without migration; move reproducible derived
 output aside or choose a fresh embedding output root.
 
 The catalog has exactly thirteen base tables, two canonical views, and no
@@ -374,7 +375,7 @@ source-relative header association, never Markdown or image bytes:
 | Table | Ordered columns | Key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
-| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
+| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `client_api_contract_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_response_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `scope VARCHAR`, `status VARCHAR`, `discovery_complete BOOLEAN`, `reconciliation_complete BOOLEAN`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `hosted_requests INTEGER`, `hosted_retries INTEGER`, `usage_json VARCHAR`, `throttles INTEGER`, `elapsed_seconds DOUBLE`, `started_at TIMESTAMPTZ`, `finished_at TIMESTAMPTZ` | `run_id` |
 | `full_run_articles` | `run_id VARCHAR`, `article_id VARCHAR`, `header_image_path VARCHAR` | `(run_id, article_id)` |
 | `embedding_work_storage` | physical columns exposed by `embedding_work_items` | `(article_id, modality, configuration_id)` |
@@ -382,11 +383,11 @@ source-relative header association, never Markdown or image bytes:
 | `reconciliation_actions` | exact run/article/modality/configuration target disposition plus expected source/input/state/generation/vector identity and `staged_at` | `(run_id, article_id, modality, configuration_id)` |
 | `embedding_work_items` (view) | canonical current work interface over storage and visible actions | — |
 | `embeddings` (view) | canonical current vector interface over storage and visible actions | — |
-| `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
+| `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `derivation_kind VARCHAR`, `raw_response_sha256 VARCHAR`, `response_model VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 | `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
 | `image_input_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_sha256 VARCHAR`, `source_format VARCHAR`, `source_bytes BIGINT`, `source_width INTEGER`, `source_height INTEGER`, `source_frames INTEGER`, `embedded_input_sha256 VARCHAR`, `embedded_format VARCHAR`, `embedded_bytes BIGINT`, `embedded_width INTEGER`, `embedded_height INTEGER`, `embedded_frames INTEGER`, `transform_id VARCHAR`, `rendition_relative_path VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
-| `long_text_parts` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `updated_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index)` |
-| `long_text_part_generations` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `generation_run_id VARCHAR`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index, generation_run_id)` |
+| `long_text_parts` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `derivation_kind VARCHAR`, `raw_response_sha256 VARCHAR`, `response_model VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `updated_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index)` |
+| `long_text_part_generations` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `generation_run_id VARCHAR`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `derivation_kind VARCHAR`, `raw_response_sha256 VARCHAR`, `response_model VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index, generation_run_id)` |
 | `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
 
 The source path is nullable for article text and absent images. The input hash
@@ -408,7 +409,8 @@ leaves the prior configuration queryable.
 
 Production requests may mix article text, header images, and long-text parts.
 Each request is bounded independently by item count, estimated text tokens,
-total encoded input bytes, and configured concurrency. Response indexes are
+total encoded input bytes, response bytes, and configured concurrency. HTTP
+success and error bodies are read only through that response ceiling. Response indexes are
 validated independently and every item commits in its own transaction, so a
 valid sibling survives a missing or malformed response item. Retryable
 timeouts, connection errors, rate limits, and eligible server failures use
@@ -423,9 +425,11 @@ content. Each durable prior attempt reduces the remaining request budget, so
 replay cannot purchase beyond the configured ceiling.
 All completed exchanges in a concurrent wave are processed in stable submission
 order before a request-wide fatal error is raised, preserving successful sibling
-work. A request-wide deterministic rejection terminalizes every unresolved
+work and its usage telemetry. A request-wide deterministic rejection terminalizes every unresolved
 item in the rejected request before the run is marked failed; replay does not
-repurchase those terminal items. Authentication and authorization failures
+repurchase those terminal items. An indexed deterministic image rejection
+retries only that image through its durable three-attempt limit, preserving a
+successful text sibling. Authentication and authorization failures
 remain recoverable in-progress checkpoints after the operator corrects access.
 A long part that succeeds on an in-run retry no longer leaves its parent
 marked failed and therefore participates in immediate complete-part aggregation.
@@ -451,11 +455,18 @@ absent, non-directory, or inaccessible archive root is an operational
 absent, one transaction archives/removes both its image vector and its
 same-configuration multimodal dependent before recording `not_applicable`.
 `configuration_id` is the SHA-256 of compact,
-key-sorted JSON covering model alias, observed hosted model/API metadata, task,
+key-sorted JSON covering requested model alias, implemented-against API
+contract version, task,
 dimensions, output type, normalization, tokenizer artifact and engine,
 context rules/ceiling, long-text aggregation and attempt limit, batching
-payload/concurrency/retry policy, image input/transform rules, multimodal
+payload/response/concurrency/retry policy, image input/transform rules, multimodal
 formula, and client configuration version.
+The provider-returned model is instead recorded per hosted vector generation
+and may differ from the mutable alias. `raw_response_sha256` covers canonical
+compact JSON bytes for the exact raw embedding array; `stored_vector_sha256`
+covers normalized little-endian float32 bytes. Locally derived long-text
+aggregates and multimodal midpoints have explicit derivation kinds and null
+raw-response/model fields.
 The tokenizer engine is exactly `tokenizers-0.21.4`; checksum-verified artifact
 bytes are decoded and loaded directly from memory, so a path replacement after
 verification cannot change the tokenizer. The current long-text rule is
@@ -505,6 +516,10 @@ candidate rather than a corpus-sized set. If cleanup is interrupted, offline
 validation reports the unreferenced file as `orphan_image_rendition`; a later
 completed full run safely retries cleanup without touching source or
 preprocessing output.
+After the exclusive embedding lock is reacquired, a new run first marks any
+prior `running` records `interrupted` and then discards their still-invisible
+reconciliation actions in bounded pages. Completed visible reconciliation is
+never changed by this crash recovery.
 
 A retained catalog can be queried without joining back to article bodies:
 

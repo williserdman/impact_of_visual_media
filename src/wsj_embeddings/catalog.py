@@ -22,11 +22,12 @@ from wsj_embeddings.models import (
     EmbeddingProfile,
     EmbeddingRunResult,
     SupersessionReason,
+    VectorDerivationKind,
     WorkState,
 )
 from wsj_embeddings.run_metrics import normalize_safe_usage
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "14"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "15"
 
 _EMBEDDING_CATALOG_TYPES = {
     "article_text_aggregation_provenance",
@@ -57,8 +58,7 @@ _TABLE_COLUMNS = {
     "embedding_configurations": (
         ("configuration_id", "VARCHAR", True, None, True),
         ("model", "VARCHAR", True, None, False),
-        ("observed_model", "VARCHAR", True, None, False),
-        ("observed_api_version", "VARCHAR", True, None, False),
+        ("client_api_contract_version", "VARCHAR", True, None, False),
         ("task", "VARCHAR", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
         ("output_type", "VARCHAR", True, None, False),
@@ -72,6 +72,7 @@ _TABLE_COLUMNS = {
         ("batch_max_items", "INTEGER", True, None, False),
         ("batch_max_estimated_tokens", "INTEGER", True, None, False),
         ("batch_max_encoded_bytes", "BIGINT", True, None, False),
+        ("batch_max_response_bytes", "BIGINT", True, None, False),
         ("batch_max_concurrency", "INTEGER", True, None, False),
         ("batch_max_attempts", "INTEGER", True, None, False),
         ("batch_initial_backoff_seconds", "DOUBLE", True, None, False),
@@ -135,6 +136,9 @@ _TABLE_COLUMNS = {
         ("publication_date_new_york", "DATE", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
         ("input_sha256", "VARCHAR", True, None, False),
+        ("derivation_kind", "VARCHAR", True, None, False),
+        ("raw_response_sha256", "VARCHAR", False, None, False),
+        ("response_model", "VARCHAR", False, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("vector", "FLOAT[2048]", True, None, False),
     ),
@@ -151,6 +155,9 @@ _TABLE_COLUMNS = {
         ("expected_generation_run_id", "VARCHAR", False, None, False),
         ("expected_vector_source_relative_path", "VARCHAR", False, None, False),
         ("expected_vector_input_sha256", "VARCHAR", False, None, False),
+        ("expected_derivation_kind", "VARCHAR", False, None, False),
+        ("expected_raw_response_sha256", "VARCHAR", False, None, False),
+        ("expected_response_model", "VARCHAR", False, None, False),
         ("expected_stored_vector_sha256", "VARCHAR", False, None, False),
         ("staged_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
@@ -161,6 +168,9 @@ _TABLE_COLUMNS = {
         ("generation_run_id", "VARCHAR", True, None, True),
         ("source_relative_path", "VARCHAR", False, None, False),
         ("input_sha256", "VARCHAR", True, None, False),
+        ("derivation_kind", "VARCHAR", True, None, False),
+        ("raw_response_sha256", "VARCHAR", False, None, False),
+        ("response_model", "VARCHAR", False, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("superseded_run_id", "VARCHAR", True, None, False),
         ("superseded_reason", "VARCHAR", True, None, False),
@@ -216,6 +226,9 @@ _TABLE_COLUMNS = {
         ("retry_after_seconds", "DOUBLE", False, None, False),
         ("last_run_id", "VARCHAR", True, None, False),
         ("generation_run_id", "VARCHAR", False, None, False),
+        ("derivation_kind", "VARCHAR", False, None, False),
+        ("raw_response_sha256", "VARCHAR", False, None, False),
+        ("response_model", "VARCHAR", False, None, False),
         ("stored_vector_sha256", "VARCHAR", False, None, False),
         ("vector", "FLOAT[2048]", False, None, False),
         ("updated_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
@@ -233,6 +246,9 @@ _TABLE_COLUMNS = {
         ("byte_end", "BIGINT", True, None, False),
         ("part_input_sha256", "VARCHAR", True, None, False),
         ("token_count", "INTEGER", True, None, False),
+        ("derivation_kind", "VARCHAR", True, None, False),
+        ("raw_response_sha256", "VARCHAR", False, None, False),
+        ("response_model", "VARCHAR", False, None, False),
         ("stored_vector_sha256", "VARCHAR", True, None, False),
         ("vector", "FLOAT[2048]", True, None, False),
         ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
@@ -731,8 +747,7 @@ class EmbeddingCatalog:
                 CREATE TABLE IF NOT EXISTS embedding_configurations (
                     configuration_id VARCHAR PRIMARY KEY,
                     model VARCHAR NOT NULL,
-                    observed_model VARCHAR NOT NULL,
-                    observed_api_version VARCHAR NOT NULL,
+                    client_api_contract_version VARCHAR NOT NULL,
                     task VARCHAR NOT NULL,
                     dimensions INTEGER NOT NULL,
                     output_type VARCHAR NOT NULL,
@@ -746,6 +761,7 @@ class EmbeddingCatalog:
                     batch_max_items INTEGER NOT NULL,
                     batch_max_estimated_tokens INTEGER NOT NULL,
                     batch_max_encoded_bytes BIGINT NOT NULL,
+                    batch_max_response_bytes BIGINT NOT NULL,
                     batch_max_concurrency INTEGER NOT NULL,
                     batch_max_attempts INTEGER NOT NULL,
                     batch_initial_backoff_seconds DOUBLE NOT NULL,
@@ -827,6 +843,9 @@ class EmbeddingCatalog:
                     publication_date_new_york DATE NOT NULL,
                     dimensions INTEGER NOT NULL,
                     input_sha256 VARCHAR NOT NULL,
+                    derivation_kind VARCHAR NOT NULL,
+                    raw_response_sha256 VARCHAR,
+                    response_model VARCHAR,
                     stored_vector_sha256 VARCHAR NOT NULL,
                     vector FLOAT[2048] NOT NULL,
                     PRIMARY KEY (article_id, modality, configuration_id)
@@ -848,6 +867,9 @@ class EmbeddingCatalog:
                     expected_generation_run_id VARCHAR,
                     expected_vector_source_relative_path VARCHAR,
                     expected_vector_input_sha256 VARCHAR,
+                    expected_derivation_kind VARCHAR,
+                    expected_raw_response_sha256 VARCHAR,
+                    expected_response_model VARCHAR,
                     expected_stored_vector_sha256 VARCHAR,
                     staged_at TIMESTAMP WITH TIME ZONE NOT NULL,
                     PRIMARY KEY (
@@ -905,6 +927,9 @@ class EmbeddingCatalog:
                     generation_run_id VARCHAR NOT NULL,
                     source_relative_path VARCHAR,
                     input_sha256 VARCHAR NOT NULL,
+                    derivation_kind VARCHAR NOT NULL,
+                    raw_response_sha256 VARCHAR,
+                    response_model VARCHAR,
                     stored_vector_sha256 VARCHAR NOT NULL,
                     superseded_run_id VARCHAR NOT NULL,
                     superseded_reason VARCHAR NOT NULL,
@@ -981,6 +1006,9 @@ class EmbeddingCatalog:
                     retry_after_seconds DOUBLE,
                     last_run_id VARCHAR NOT NULL,
                     generation_run_id VARCHAR,
+                    derivation_kind VARCHAR,
+                    raw_response_sha256 VARCHAR,
+                    response_model VARCHAR,
                     stored_vector_sha256 VARCHAR,
                     vector FLOAT[2048],
                     updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -1006,6 +1034,9 @@ class EmbeddingCatalog:
                     byte_end BIGINT NOT NULL,
                     part_input_sha256 VARCHAR NOT NULL,
                     token_count INTEGER NOT NULL,
+                    derivation_kind VARCHAR NOT NULL,
+                    raw_response_sha256 VARCHAR,
+                    response_model VARCHAR,
                     stored_vector_sha256 VARCHAR NOT NULL,
                     vector FLOAT[2048] NOT NULL,
                     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -1163,12 +1194,13 @@ class EmbeddingCatalog:
         self.connection.execute(
             """
             INSERT INTO embedding_configurations (
-                configuration_id, model, observed_model, observed_api_version,
+                configuration_id, model, client_api_contract_version,
                 task, dimensions, output_type, normalization,
                 tokenizer_revision, tokenizer_engine, context_token_limit,
                 context_rules, long_text_aggregation,
                 long_text_part_attempt_limit, batch_max_items,
                 batch_max_estimated_tokens, batch_max_encoded_bytes,
+                batch_max_response_bytes,
                 batch_max_concurrency, batch_max_attempts,
                 batch_initial_backoff_seconds, batch_max_backoff_seconds,
                 image_input_rules, image_transform,
@@ -1181,8 +1213,7 @@ class EmbeddingCatalog:
             [
                 configuration_identifier,
                 profile.model,
-                profile.observed_model,
-                profile.observed_api_version,
+                profile.client_api_contract_version,
                 profile.task,
                 profile.dimensions,
                 profile.output_type,
@@ -1196,6 +1227,7 @@ class EmbeddingCatalog:
                 profile.batch_max_items,
                 profile.batch_max_estimated_tokens,
                 profile.batch_max_encoded_bytes,
+                profile.batch_max_response_bytes,
                 profile.batch_max_concurrency,
                 profile.batch_max_attempts,
                 profile.batch_initial_backoff_seconds,
@@ -1504,7 +1536,9 @@ class EmbeddingCatalog:
                    END AS target_state,
                    work.source_relative_path, work.input_sha256, work.state,
                    work.generation_run_id, vector.source_relative_path,
-                   vector.input_sha256, vector.stored_vector_sha256
+                   vector.input_sha256, vector.derivation_kind,
+                   vector.raw_response_sha256, vector.response_model,
+                   vector.stored_vector_sha256
             FROM embedding_work_storage AS work
             LEFT JOIN full_run_articles AS seen
               ON seen.run_id = ? AND seen.article_id = work.article_id
@@ -1540,7 +1574,8 @@ class EmbeddingCatalog:
             self.connection.executemany(
                 """
                 INSERT INTO reconciliation_actions
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        current_timestamp)
                 """,
                 [[run_id, *row] for row in rows],
             )
@@ -1574,6 +1609,12 @@ class EmbeddingCatalog:
                     action.expected_vector_source_relative_path
                 OR vector.input_sha256 IS DISTINCT FROM
                     action.expected_vector_input_sha256
+                OR vector.derivation_kind IS DISTINCT FROM
+                    action.expected_derivation_kind
+                OR vector.raw_response_sha256 IS DISTINCT FROM
+                    action.expected_raw_response_sha256
+                OR vector.response_model IS DISTINCT FROM
+                    action.expected_response_model
                 OR vector.stored_vector_sha256 IS DISTINCT FROM
                     action.expected_stored_vector_sha256
             )
@@ -1614,6 +1655,9 @@ class EmbeddingCatalog:
                    action.expected_generation_run_id,
                    action.expected_vector_source_relative_path,
                    action.expected_vector_input_sha256,
+                   action.expected_derivation_kind,
+                   action.expected_raw_response_sha256,
+                   action.expected_response_model,
                    action.expected_stored_vector_sha256
             FROM reconciliation_actions AS action
             JOIN runs ON runs.run_id = action.run_id
@@ -1639,13 +1683,18 @@ class EmbeddingCatalog:
                 expected_generation_run_id,
                 expected_vector_source_relative_path,
                 expected_vector_input_sha256,
+                expected_derivation_kind,
+                expected_raw_response_sha256,
+                expected_response_model,
                 expected_stored_vector_sha256,
             ) = action
             identity = self.connection.execute(
                 """
                 SELECT work.source_relative_path, work.input_sha256, work.state,
                        work.generation_run_id, vector.source_relative_path,
-                       vector.input_sha256, vector.stored_vector_sha256
+                       vector.input_sha256, vector.derivation_kind,
+                       vector.raw_response_sha256, vector.response_model,
+                       vector.stored_vector_sha256
                 FROM embedding_work_storage AS work
                 LEFT JOIN embedding_storage AS vector
                   USING (article_id, modality, configuration_id)
@@ -1661,6 +1710,9 @@ class EmbeddingCatalog:
                 expected_generation_run_id,
                 expected_vector_source_relative_path,
                 expected_vector_input_sha256,
+                expected_derivation_kind,
+                expected_raw_response_sha256,
+                expected_response_model,
                 expected_stored_vector_sha256,
             )
             if identity != expected:
@@ -1742,6 +1794,19 @@ class EmbeddingCatalog:
                 keys,
             )
         return len(keys)
+
+    def interrupt_abandoned_runs(self) -> int:
+        """Terminalize prior process-owned run records after lock reacquisition."""
+
+        rows = self.connection.execute(
+            """
+            UPDATE runs
+            SET status = 'interrupted', finished_at = current_timestamp
+            WHERE status = 'running'
+            RETURNING run_id
+            """
+        ).fetchall()
+        return len(rows)
 
     def finish_run(self, run_id: str, *, reconciled: bool) -> None:
         """Mark one normally returned run terminal after all required work."""
@@ -2012,6 +2077,7 @@ class EmbeddingCatalog:
         row = self.connection.execute(
             """
             SELECT w.generation_run_id, e.source_relative_path, e.input_sha256,
+                   e.derivation_kind, e.raw_response_sha256, e.response_model,
                    e.stored_vector_sha256
             FROM embeddings AS e
             JOIN embedding_work_items AS w
@@ -2027,12 +2093,15 @@ class EmbeddingCatalog:
             generation_run_id,
             source_relative_path,
             input_sha256,
+            derivation_kind,
+            raw_response_sha256,
+            response_model,
             stored_vector_sha256,
         ) = row
         self.connection.execute(
             """
             INSERT INTO embedding_generation_history
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
             ON CONFLICT (
                 article_id, modality, configuration_id, generation_run_id
             ) DO NOTHING
@@ -2044,6 +2113,9 @@ class EmbeddingCatalog:
                 generation_run_id,
                 source_relative_path,
                 input_sha256,
+                derivation_kind,
+                raw_response_sha256,
+                response_model,
                 stored_vector_sha256,
                 run_id,
                 reason.value,
@@ -2063,7 +2135,9 @@ class EmbeddingCatalog:
         row = self.connection.execute(
             """
             SELECT work.generation_run_id, vector.source_relative_path,
-                   vector.input_sha256, vector.stored_vector_sha256
+                   vector.input_sha256, vector.derivation_kind,
+                   vector.raw_response_sha256, vector.response_model,
+                   vector.stored_vector_sha256
             FROM embedding_storage AS vector
             JOIN embedding_work_storage AS work
               USING (article_id, modality, configuration_id)
@@ -2077,7 +2151,7 @@ class EmbeddingCatalog:
         self.connection.execute(
             """
             INSERT INTO embedding_generation_history
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
             ON CONFLICT (
                 article_id, modality, configuration_id, generation_run_id
             ) DO NOTHING
@@ -2090,6 +2164,9 @@ class EmbeddingCatalog:
                 row[1],
                 row[2],
                 row[3],
+                row[4],
+                row[5],
+                row[6],
                 run_id,
                 SupersessionReason.INPUT_CHANGED.value,
             ],
@@ -2144,6 +2221,7 @@ class EmbeddingCatalog:
                 """
                 SELECT part_count, char_start, char_end, byte_start, byte_end,
                        part_input_sha256, token_count, state, generation_run_id,
+                       derivation_kind, raw_response_sha256, response_model,
                        stored_vector_sha256, vector
                 FROM long_text_parts
                 WHERE article_id = ? AND configuration_id = ?
@@ -2165,9 +2243,11 @@ class EmbeddingCatalog:
                         byte_start, byte_end, part_input_sha256, token_count,
                         state, attempt_count, error_code, status_code,
                         retry_after_seconds, last_run_id, generation_run_id,
+                        derivation_kind, raw_response_sha256, response_model,
                         stored_vector_sha256, vector, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL,
-                              NULL, NULL, ?, NULL, NULL, NULL, current_timestamp)
+                              NULL, NULL, ?, NULL, NULL, NULL, NULL, NULL,
+                              NULL, current_timestamp)
                     """,
                     [
                         article_id,
@@ -2205,6 +2285,8 @@ class EmbeddingCatalog:
                     SET state = ?, attempt_count = 0, error_code = NULL,
                         status_code = NULL, retry_after_seconds = NULL,
                         last_run_id = ?, generation_run_id = NULL,
+                        derivation_kind = NULL, raw_response_sha256 = NULL,
+                        response_model = NULL,
                         stored_vector_sha256 = NULL, vector = NULL,
                         updated_at = current_timestamp
                     WHERE article_id = ? AND configuration_id = ?
@@ -2225,7 +2307,8 @@ class EmbeddingCatalog:
                 state is WorkState.SUCCEEDED
                 and row[8] is not None
                 and row[9] is not None
-                and row[10] is not None
+                and row[12] is not None
+                and row[13] is not None
             )
             if proven_success:
                 self.connection.execute(
@@ -2251,6 +2334,8 @@ class EmbeddingCatalog:
                     """
                     UPDATE long_text_parts
                     SET state = ?, last_run_id = ?, generation_run_id = NULL,
+                        derivation_kind = NULL, raw_response_sha256 = NULL,
+                        response_model = NULL,
                         stored_vector_sha256 = NULL, vector = NULL,
                         updated_at = current_timestamp
                     WHERE article_id = ? AND configuration_id = ?
@@ -2301,7 +2386,9 @@ class EmbeddingCatalog:
             SET state = ?, attempt_count = attempt_count + 1,
                 error_code = NULL, status_code = NULL,
                 retry_after_seconds = NULL, last_run_id = ?,
-                generation_run_id = NULL, stored_vector_sha256 = NULL,
+                generation_run_id = NULL, derivation_kind = NULL,
+                raw_response_sha256 = NULL, response_model = NULL,
+                stored_vector_sha256 = NULL,
                 vector = NULL, updated_at = current_timestamp
             WHERE article_id = ? AND configuration_id = ?
               AND article_input_sha256 = ? AND part_index = ?
@@ -2342,7 +2429,9 @@ class EmbeddingCatalog:
             UPDATE long_text_parts
             SET state = ?, error_code = ?, status_code = ?,
                 retry_after_seconds = ?, last_run_id = ?,
-                generation_run_id = NULL, stored_vector_sha256 = NULL,
+                generation_run_id = NULL, derivation_kind = NULL,
+                raw_response_sha256 = NULL, response_model = NULL,
+                stored_vector_sha256 = NULL,
                 vector = NULL, updated_at = current_timestamp
             WHERE article_id = ? AND configuration_id = ?
               AND article_input_sha256 = ? AND part_index = ?
@@ -2483,6 +2572,9 @@ class EmbeddingCatalog:
         configuration_identifier: str,
         article_input_sha256: str,
         part_index: int,
+        derivation_kind: str,
+        raw_response_sha256: str | None,
+        response_model: str | None,
         stored_vector_sha256: str,
         vector: Sequence[float],
     ) -> None:
@@ -2494,13 +2586,16 @@ class EmbeddingCatalog:
             SELECT article_id, configuration_id, article_input_sha256,
                    part_index, ?, part_count, char_start, char_end,
                    byte_start, byte_end, part_input_sha256, token_count,
-                   ?, ?, current_timestamp
+                   ?, ?, ?, ?, ?, current_timestamp
             FROM long_text_parts
             WHERE article_id = ? AND configuration_id = ?
               AND article_input_sha256 = ? AND part_index = ?
             """,
             [
                 run_id,
+                derivation_kind,
+                raw_response_sha256,
+                response_model,
                 stored_vector_sha256,
                 list(vector),
                 article_id,
@@ -2514,7 +2609,9 @@ class EmbeddingCatalog:
             UPDATE long_text_parts
             SET state = ?, error_code = NULL, status_code = NULL,
                 retry_after_seconds = NULL, last_run_id = ?,
-                generation_run_id = ?, stored_vector_sha256 = ?, vector = ?,
+                generation_run_id = ?, derivation_kind = ?,
+                raw_response_sha256 = ?, response_model = ?,
+                stored_vector_sha256 = ?, vector = ?,
                 updated_at = current_timestamp
             WHERE article_id = ? AND configuration_id = ?
               AND article_input_sha256 = ? AND part_index = ?
@@ -2523,6 +2620,9 @@ class EmbeddingCatalog:
                 WorkState.SUCCEEDED.value,
                 run_id,
                 run_id,
+                derivation_kind,
+                raw_response_sha256,
+                response_model,
                 stored_vector_sha256,
                 list(vector),
                 article_id,
@@ -2544,7 +2644,8 @@ class EmbeddingCatalog:
 
         row = self.connection.execute(
             """
-            SELECT g.generation_run_id, g.stored_vector_sha256, g.vector
+            SELECT g.generation_run_id, g.stored_vector_sha256, g.vector,
+                   g.derivation_kind, g.raw_response_sha256, g.response_model
             FROM long_text_parts AS p
             JOIN long_text_part_generations AS g
               USING (article_id, configuration_id, article_input_sha256,
@@ -2561,7 +2662,7 @@ class EmbeddingCatalog:
                 WorkState.SUCCEEDED.value,
             ],
         ).fetchone()
-        if row is None or any(value is None for value in row):
+        if row is None or any(row[index] is None for index in (0, 1, 2, 3)):
             raise ValueError("long-text part lacks a proven generation")
         return tuple(row)
 
@@ -2691,6 +2792,9 @@ class EmbeddingCatalog:
         publication_date_new_york: object,
         dimensions: int,
         input_sha256: str,
+        derivation_kind: str,
+        raw_response_sha256: str | None,
+        response_model: str | None,
         stored_vector_sha256: str,
         vector: Sequence[float],
     ) -> None:
@@ -2699,7 +2803,7 @@ class EmbeddingCatalog:
         self.connection.execute(
             """
             INSERT INTO embedding_storage
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (article_id, modality, configuration_id)
             DO UPDATE SET
                 source_relative_path = excluded.source_relative_path,
@@ -2707,6 +2811,9 @@ class EmbeddingCatalog:
                 publication_date_new_york = excluded.publication_date_new_york,
                 dimensions = excluded.dimensions,
                 input_sha256 = excluded.input_sha256,
+                derivation_kind = excluded.derivation_kind,
+                raw_response_sha256 = excluded.raw_response_sha256,
+                response_model = excluded.response_model,
                 stored_vector_sha256 = excluded.stored_vector_sha256,
                 vector = excluded.vector
             """,
@@ -2719,6 +2826,9 @@ class EmbeddingCatalog:
                 publication_date_new_york,
                 dimensions,
                 input_sha256,
+                derivation_kind,
+                raw_response_sha256,
+                response_model,
                 stored_vector_sha256,
                 list(vector),
             ],
@@ -2780,6 +2890,9 @@ class EmbeddingCatalog:
             publication_date_new_york=publication_date_new_york,
             dimensions=dimensions,
             input_sha256=input_sha256,
+            derivation_kind=VectorDerivationKind.LONG_TEXT_AGGREGATE.value,
+            raw_response_sha256=None,
+            response_model=None,
             stored_vector_sha256=stored_vector_sha256,
             vector=vector,
         )
@@ -2837,6 +2950,9 @@ class EmbeddingCatalog:
         embedded_frames: int,
         transform_id: str,
         rendition_relative_path: str | None,
+        derivation_kind: str,
+        raw_response_sha256: str | None,
+        response_model: str | None,
         stored_vector_sha256: str,
         vector: Sequence[float],
     ) -> None:
@@ -2852,6 +2968,9 @@ class EmbeddingCatalog:
             publication_date_new_york=publication_date_new_york,
             dimensions=dimensions,
             input_sha256=source_sha256,
+            derivation_kind=derivation_kind,
+            raw_response_sha256=raw_response_sha256,
+            response_model=response_model,
             stored_vector_sha256=stored_vector_sha256,
             vector=vector,
         )
@@ -2996,6 +3115,9 @@ class EmbeddingCatalog:
             publication_date_new_york=publication_date_new_york,
             dimensions=dimensions,
             input_sha256=input_sha256,
+            derivation_kind=VectorDerivationKind.MULTIMODAL_MIDPOINT.value,
+            raw_response_sha256=None,
+            response_model=None,
             stored_vector_sha256=stored_vector_sha256,
             vector=vector,
         )

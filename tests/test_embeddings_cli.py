@@ -606,8 +606,16 @@ def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
         def __init__(self) -> None:
             self.calls = 0
 
-        def post(self, url, *, headers, body, timeout_seconds):
-            del url, headers, body, timeout_seconds
+        def post(
+            self,
+            url,
+            *,
+            headers,
+            body,
+            timeout_seconds,
+            max_response_bytes,
+        ):
+            del url, headers, body, timeout_seconds, max_response_bytes
             self.calls += 1
             if failure == "timeout":
                 raise TimeoutError("transport-secret")

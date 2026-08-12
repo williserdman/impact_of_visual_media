@@ -44,6 +44,7 @@ class BatchPolicy:
     max_attempts: int
     initial_backoff_seconds: float
     max_backoff_seconds: float
+    max_response_bytes: int = 2_000_000
 
     def __post_init__(self) -> None:
         integer_values = (
@@ -52,6 +53,7 @@ class BatchPolicy:
             self.max_encoded_bytes,
             self.max_concurrency,
             self.max_attempts,
+            self.max_response_bytes,
         )
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value < 1
@@ -70,6 +72,7 @@ class BatchPolicy:
             self.max_items,
             self.max_estimated_tokens,
             self.max_encoded_bytes,
+            self.max_response_bytes,
         )
 
 
@@ -84,6 +87,33 @@ class BatchExecutionResult:
     throttles: int
     elapsed_seconds: float
     max_concurrency_observed: int
+
+
+class BatchExecutionFatal(JinaHostedAdapterError):
+    """Fatal hosted error carrying all safe observations completed before it."""
+
+    def __init__(
+        self,
+        error: JinaHostedAdapterError,
+        *,
+        requests: int,
+        retries: int,
+        usage: dict[str, int | float],
+        throttles: int,
+        elapsed_seconds: float,
+    ) -> None:
+        super().__init__(
+            error.code,
+            retryable=error.retryable,
+            status_code=error.status_code,
+            retry_after_seconds=error.retry_after_seconds,
+            rate_limit_headers=error.rate_limit_headers,
+        )
+        self.requests = requests
+        self.retries = retries
+        self.usage = dict(usage)
+        self.throttles = throttles
+        self.elapsed_seconds = elapsed_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,7 +290,13 @@ def execute_rate_aware_batches(
             for item, outcome in zip(batch, exchange.items, strict=True):
                 if outcome.index != batch.index(item):
                     raise JinaHostedAdapterError("invalid_response", retryable=False)
-                if outcome.vector is not None or not outcome.retryable:
+                deterministic_image_retry = (
+                    outcome.vector is None
+                    and outcome.error_code == "deterministic_request"
+                    and item.value.kind == "image"
+                )
+                retryable_item = outcome.retryable or deterministic_image_retry
+                if outcome.vector is not None or not retryable_item:
                     delivered = JinaBatchItemOutcome(
                         item.index,
                         outcome.vector,
@@ -287,7 +323,19 @@ def execute_rate_aware_batches(
                         on_outcome(item.index, item.attempt, delivered, True)
                     continue
                 if on_outcome is not None:
-                    on_outcome(item.index, item.attempt, outcome, False)
+                    on_outcome(
+                        item.index,
+                        item.attempt,
+                        JinaBatchItemOutcome(
+                            item.index,
+                            None,
+                            outcome.error_code,
+                            retryable=True,
+                            status_code=outcome.status_code,
+                            retry_after_seconds=outcome.retry_after_seconds,
+                        ),
+                        False,
+                    )
                 retries += 1
                 next_pending.append(
                     _PendingItem(
@@ -307,7 +355,14 @@ def execute_rate_aware_batches(
                     )
                 )
         if fatal_errors:
-            raise fatal_errors[0]
+            raise BatchExecutionFatal(
+                fatal_errors[0],
+                requests=requests,
+                retries=retries,
+                usage=usage,
+                throttles=throttles,
+                elapsed_seconds=max(0.0, monotonic() - started_at),
+            ) from None
         if throttled_wave:
             concurrency = max(1, concurrency // 2)
         if retry_delays:

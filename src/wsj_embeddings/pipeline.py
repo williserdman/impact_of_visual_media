@@ -21,10 +21,12 @@ import duckdb
 from wsj_embeddings.adapters import (
     EmbeddingAdapter,
     JinaBatchItemOutcome,
+    JinaEmbeddedVector,
     JinaEmbeddingInput,
     JinaHostedAdapterError,
 )
 from wsj_embeddings.batching import (
+    BatchExecutionFatal,
     BatchExecutionResult,
     BatchPolicy,
     execute_rate_aware_batches,
@@ -56,6 +58,7 @@ from wsj_embeddings.models import (
     EmbeddingModality,
     EmbeddingProfile,
     EmbeddingRunResult,
+    VectorDerivationKind,
     WorkState,
 )
 from wsj_embeddings.source_image import SourceImageError, read_source_image
@@ -76,6 +79,17 @@ _TERMINAL_IMAGE_PREPARATION_CODES = frozenset(
         "unsupported_image",
     }
 )
+
+
+def _merged_usage(
+    baseline: dict[str, int | float], addition: dict[str, int | float]
+) -> dict[str, int | float]:
+    """Return additive safe usage without mutating either observation."""
+
+    merged = dict(baseline)
+    for key, value in addition.items():
+        merged[key] = merged.get(key, 0) + value
+    return merged
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +136,9 @@ class _SuccessfulLongTextPart:
     generation_run_id: str
     stored_vector_sha256: str
     vector: tuple[float, ...]
+    derivation_kind: str
+    raw_response_sha256: str | None
+    response_model: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +146,9 @@ class _PreparedEmbedding:
     input_sha256: str
     stored_vector_sha256: str
     vector: tuple[float, ...]
+    derivation_kind: str = VectorDerivationKind.SYNTHETIC_FIXTURE.value
+    raw_response_sha256: str | None = None
+    response_model: str | None = None
     long_text_parts: tuple[_SuccessfulLongTextPart, ...] = ()
 
 
@@ -367,6 +387,8 @@ def run_embedding_pipeline(
         embedding_pipeline_lock(config.embedding_lock_path) as output_descriptor,
         EmbeddingCatalog.open_in(output_descriptor) as catalog,
     ):
+        with catalog.transaction():
+            catalog.interrupt_abandoned_runs()
         while True:
             with catalog.transaction():
                 discarded = catalog.discard_invisible_reconciliation_page(
@@ -465,8 +487,28 @@ def run_embedding_pipeline(
                     batch_jitter=batch_jitter,
                     monotonic=monotonic,
                 )
+            except BatchExecutionFatal as error:
+                with catalog.transaction():
+                    catalog.finish_run_metrics(
+                        run_id,
+                        hosted_requests=error.requests,
+                        hosted_retries=error.retries,
+                        usage=error.usage,
+                        throttles=error.throttles,
+                        elapsed_seconds=max(0.0, run_clock() - run_started_at),
+                    )
+                    catalog.fail_run(run_id)
+                raise
             except JinaHostedAdapterError:
                 with catalog.transaction():
+                    catalog.finish_run_metrics(
+                        run_id,
+                        hosted_requests=0,
+                        hosted_retries=0,
+                        usage={},
+                        throttles=0,
+                        elapsed_seconds=max(0.0, run_clock() - run_started_at),
+                    )
                     catalog.fail_run(run_id)
                 raise
             for article in articles:
@@ -651,6 +693,11 @@ def run_embedding_pipeline(
                             rendition_relative_path=(
                                 image_input.rendition_relative_path
                             ),
+                            derivation_kind=prepared_embedding.derivation_kind,
+                            raw_response_sha256=(
+                                prepared_embedding.raw_response_sha256
+                            ),
+                            response_model=prepared_embedding.response_model,
                             stored_vector_sha256=(
                                 prepared_embedding.stored_vector_sha256
                             ),
@@ -669,6 +716,11 @@ def run_embedding_pipeline(
                             ),
                             dimensions=profile.dimensions,
                             input_sha256=prepared_embedding.input_sha256,
+                            derivation_kind=prepared_embedding.derivation_kind,
+                            raw_response_sha256=(
+                                prepared_embedding.raw_response_sha256
+                            ),
+                            response_model=prepared_embedding.response_model,
                             stored_vector_sha256=(
                                 prepared_embedding.stored_vector_sha256
                             ),
@@ -735,6 +787,8 @@ def _run_full_embedding_pipeline(
         embedding_pipeline_lock(config.embedding_lock_path) as output_descriptor,
         EmbeddingCatalog.open_in(output_descriptor) as catalog,
     ):
+        with catalog.transaction():
+            catalog.interrupt_abandoned_runs()
         while True:
             with catalog.transaction():
                 discarded = catalog.discard_invisible_reconciliation_page(
@@ -877,6 +931,30 @@ def _run_full_embedding_pipeline(
                     error.code, "rendition_cleanup"
                 ) from error
             return result
+        except BatchExecutionFatal as error:
+            with catalog.transaction():
+                catalog.finish_run_metrics(
+                    run_id,
+                    hosted_requests=int(totals["requests"]) + error.requests,
+                    hosted_retries=int(totals["retries"]) + error.retries,
+                    usage=_merged_usage(dict(totals["usage"]), error.usage),
+                    throttles=int(totals["throttles"]) + error.throttles,
+                    elapsed_seconds=max(0.0, run_clock() - run_started_at),
+                )
+                catalog.fail_run(run_id)
+            raise
+        except JinaHostedAdapterError:
+            with catalog.transaction():
+                catalog.finish_run_metrics(
+                    run_id,
+                    hosted_requests=int(totals["requests"]),
+                    hosted_retries=int(totals["retries"]),
+                    usage=dict(totals["usage"]),
+                    throttles=int(totals["throttles"]),
+                    elapsed_seconds=max(0.0, run_clock() - run_started_at),
+                )
+                catalog.fail_run(run_id)
+            raise
         except Exception:
             with catalog.transaction():
                 catalog.fail_run(run_id)
@@ -1163,6 +1241,9 @@ def _publish_prepared_embedding(
             embedded_frames=image_input.embedded_info.frames,
             transform_id=image_input.transform_id,
             rendition_relative_path=image_input.rendition_relative_path,
+            derivation_kind=prepared_embedding.derivation_kind,
+            raw_response_sha256=prepared_embedding.raw_response_sha256,
+            response_model=prepared_embedding.response_model,
             stored_vector_sha256=prepared_embedding.stored_vector_sha256,
             vector=prepared_embedding.vector,
         )
@@ -1177,6 +1258,9 @@ def _publish_prepared_embedding(
         publication_date_new_york=article.publication_date_new_york,
         dimensions=profile.dimensions,
         input_sha256=prepared_embedding.input_sha256,
+        derivation_kind=prepared_embedding.derivation_kind,
+        raw_response_sha256=prepared_embedding.raw_response_sha256,
+        response_model=prepared_embedding.response_model,
         stored_vector_sha256=prepared_embedding.stored_vector_sha256,
         vector=prepared_embedding.vector,
     )
@@ -1192,6 +1276,7 @@ def _validate_batch_profile(profile: EmbeddingProfile) -> None:
             profile.batch_max_attempts,
             profile.batch_initial_backoff_seconds,
             profile.batch_max_backoff_seconds,
+            profile.batch_max_response_bytes,
         )
     except (TypeError, ValueError) as error:
         raise ValueError("adapter batch profile is invalid") from error
@@ -1347,7 +1432,11 @@ def _run_rate_aware_work(
                     configuration_identifier=configuration_identifier,
                 )
             )
-            attempt_limits.append(profile.batch_max_attempts)
+            attempt_limits.append(
+                _DETERMINISTIC_IMAGE_ATTEMPT_LIMIT
+                if work.modality == _HEADER_IMAGE_MODALITY
+                else profile.batch_max_attempts
+            )
             continue
         assert work.article_input_sha256 is not None
         prior_attempt_counts.append(
@@ -1397,8 +1486,14 @@ def _run_rate_aware_work(
     ) -> None:
         work = works[index]
         if outcome.vector is not None:
-            vector = _normalized_vector(
-                outcome.vector.stored_vector, work.article.article_id
+            response_vector = outcome.vector
+            vector = _verified_source_vector(
+                response_vector.stored_vector,
+                response_vector.stored_vector_sha256,
+                work.article.article_id,
+            )
+            derivation_kind, raw_response_sha256, response_model = (
+                _response_vector_provenance(response_vector)
             )
             if work.part is not None:
                 assert work.article_input_sha256 is not None
@@ -1409,7 +1504,10 @@ def _run_rate_aware_work(
                         configuration_identifier=configuration_identifier,
                         article_input_sha256=work.article_input_sha256,
                         part_index=work.part.index,
-                        stored_vector_sha256=_vector_hash(vector),
+                        derivation_kind=derivation_kind,
+                        raw_response_sha256=raw_response_sha256,
+                        response_model=response_model,
+                        stored_vector_sha256=response_vector.stored_vector_sha256,
                         vector=vector,
                     )
             else:
@@ -1419,6 +1517,7 @@ def _run_rate_aware_work(
                     configuration_identifier,
                     profile,
                     work,
+                    response_vector,
                     vector,
                 )
         else:
@@ -1495,6 +1594,7 @@ def _run_rate_aware_work(
             profile.batch_max_attempts,
             profile.batch_initial_backoff_seconds,
             profile.batch_max_backoff_seconds,
+            profile.batch_max_response_bytes,
         ),
         **execution_kwargs,
     )
@@ -1600,7 +1700,14 @@ def _successful_catalog_part(
     part: LongTextPart,
 ) -> _SuccessfulLongTextPart:
     try:
-        generation_run_id, vector_sha256, vector_values = (
+        (
+            generation_run_id,
+            vector_sha256,
+            vector_values,
+            derivation_kind,
+            raw_response_sha256,
+            response_model,
+        ) = (
             catalog.long_text_part_generation(
                 article_id=article.article_id,
                 configuration_identifier=configuration_identifier,
@@ -1616,7 +1723,13 @@ def _successful_catalog_part(
             "invalid_long_text_state", article.article_id
         ) from error
     return _SuccessfulLongTextPart(
-        part, str(generation_run_id), str(vector_sha256), vector
+        part,
+        str(generation_run_id),
+        str(vector_sha256),
+        vector,
+        str(derivation_kind),
+        None if raw_response_sha256 is None else str(raw_response_sha256),
+        None if response_model is None else str(response_model),
     )
 
 
@@ -1626,8 +1739,12 @@ def _publish_batched_source_success(
     configuration_identifier: str,
     profile: EmbeddingProfile,
     work: _BatchedHostedWork,
+    response_vector: JinaEmbeddedVector,
     vector: tuple[float, ...],
 ) -> None:
+    derivation_kind, raw_response_sha256, response_model = (
+        _response_vector_provenance(response_vector)
+    )
     with catalog.transaction():
         if work.modality == _HEADER_IMAGE_MODALITY:
             assert work.prepared_image is not None
@@ -1655,7 +1772,10 @@ def _publish_batched_source_success(
                 embedded_frames=image_input.embedded_info.frames,
                 transform_id=image_input.transform_id,
                 rendition_relative_path=image_input.rendition_relative_path,
-                stored_vector_sha256=_vector_hash(vector),
+                derivation_kind=derivation_kind,
+                raw_response_sha256=raw_response_sha256,
+                response_model=response_model,
+                stored_vector_sha256=response_vector.stored_vector_sha256,
                 vector=vector,
             )
             return
@@ -1669,9 +1789,26 @@ def _publish_batched_source_success(
             publication_date_new_york=work.article.publication_date_new_york,
             dimensions=profile.dimensions,
             input_sha256=work.input_sha256,
-            stored_vector_sha256=_vector_hash(vector),
+            derivation_kind=derivation_kind,
+            raw_response_sha256=raw_response_sha256,
+            response_model=response_model,
+            stored_vector_sha256=response_vector.stored_vector_sha256,
             vector=vector,
         )
+
+
+def _response_vector_provenance(
+    vector: JinaEmbeddedVector,
+) -> tuple[str, str | None, str | None]:
+    """Preserve hosted response facts; mark generated fakes explicitly."""
+
+    if vector.response_model is None:
+        return VectorDerivationKind.SYNTHETIC_FIXTURE.value, None, None
+    return (
+        VectorDerivationKind.HOSTED_RESPONSE.value,
+        vector.raw_response_sha256,
+        vector.response_model,
+    )
 
 
 def _register_work(
@@ -2121,11 +2258,21 @@ def _embed_long_text_parts(
                     configuration_identifier=configuration_identifier,
                     article_input_sha256=article_input_sha256,
                     part_index=part.index,
+                    derivation_kind=VectorDerivationKind.SYNTHETIC_FIXTURE.value,
+                    raw_response_sha256=None,
+                    response_model=None,
                     stored_vector_sha256=vector_sha256,
                     vector=vector,
                 )
         try:
-            generation_run_id, vector_sha256, vector_values = (
+            (
+                generation_run_id,
+                vector_sha256,
+                vector_values,
+                derivation_kind,
+                raw_response_sha256,
+                response_model,
+            ) = (
                 catalog.long_text_part_generation(
                     article_id=article.article_id,
                     configuration_identifier=configuration_identifier,
@@ -2148,6 +2295,15 @@ def _embed_long_text_parts(
                 generation_run_id=str(generation_run_id),
                 stored_vector_sha256=str(vector_sha256),
                 vector=vector,
+                derivation_kind=str(derivation_kind),
+                raw_response_sha256=(
+                    None
+                    if raw_response_sha256 is None
+                    else str(raw_response_sha256)
+                ),
+                response_model=(
+                    None if response_model is None else str(response_model)
+                ),
             )
         )
     return tuple(successful)

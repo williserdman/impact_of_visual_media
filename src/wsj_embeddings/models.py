@@ -15,6 +15,15 @@ class EmbeddingModality(StrEnum):
     MULTIMODAL_ARTICLE = "multimodal_article"
 
 
+class VectorDerivationKind(StrEnum):
+    """Truthful origin of the bytes represented by one stored vector."""
+
+    HOSTED_RESPONSE = "hosted_response"
+    LONG_TEXT_AGGREGATE = "long_text_aggregate"
+    MULTIMODAL_MIDPOINT = "multimodal_midpoint"
+    SYNTHETIC_FIXTURE = "synthetic_fixture"
+
+
 class WorkState(StrEnum):
     """Durable lifecycle vocabulary for one modality/configuration item."""
 
@@ -64,8 +73,7 @@ class EmbeddingProfile:
     dimensions: int
     output_type: str = "float"
     normalization: str = "l2-client-float32-v1"
-    observed_model: str = "jina-embeddings-v4"
-    observed_api_version: str = "2026.07.27.1603"
+    client_api_contract_version: str = "openapi-2026.07.27.1603"
     tokenizer_revision: str = (
         "jinaai/jina-embeddings-v4@"
         "d1e5d70b7b34d927a8cddac458583c4fbe50a914:tokenizer.json"
@@ -79,6 +87,7 @@ class EmbeddingProfile:
     batch_max_items: int = 16
     batch_max_estimated_tokens: int = 300_000
     batch_max_encoded_bytes: int = 8_000_000
+    batch_max_response_bytes: int = 2_000_000
     batch_max_concurrency: int = 2
     batch_max_attempts: int = 3
     batch_initial_backoff_seconds: float = 1.0
@@ -92,7 +101,7 @@ class EmbeddingProfile:
         "if-over20000000px-optimize0-progressive0-metadata-none-v1"
     )
     multimodal_formula: str = "l2-normalize-0.5-text-0.5-image-v1"
-    client_configuration_version: str = "wsj-embeddings-config-v4"
+    client_configuration_version: str = "wsj-embeddings-config-v5"
 
 
 @dataclass(frozen=True, slots=True)

@@ -149,3 +149,30 @@ request rejection receives terminal per-item outcomes before the fatal is
 raised. Authentication and authorization behavior remains covered and
 unchanged. The stale-input correction changes no schema shape or configuration
 meaning; it enforces the already documented generation-free state invariant.
+
+## Whole-branch review corrections
+
+The final branch review identified provenance and hard-crash boundaries that
+required schema version 15. The configuration now distinguishes the requested
+model alias and implemented-against API contract from the safe response model
+actually observed per hosted generation. Active source vectors, append-only
+history, mutable long-text parts, and immutable part generations retain the
+adapter-produced raw embedding-array SHA-256 and stored normalized float-byte
+SHA-256 without coordinator recomputation. Local long-text aggregates and
+multimodal midpoints are explicit derived records with no raw hosted
+representation. Exact version-14 output is refused byte-for-byte.
+
+On lock reacquisition, abandoned `running` runs become `interrupted` before
+their invisible reconciliation actions are removed in bounded pages. Fatal
+batched errors now carry completed-exchange metrics so failed runs retain safe
+requests, retries, usage, throttles, and whole-run elapsed time. Indexed
+deterministic image rejection retries only the image through its durable
+three-attempt limit; request-wide HTTP 413 remains immediately terminal and
+fatal. Production urllib response reads use the immutable response ceiling on
+success and error paths and reject ceiling-plus-one without exposing the body.
+
+Focused generated-fixture evidence covered exact schema/refusal, hosted direct
+and long-part provenance, validator acceptance, abandoned-run recovery,
+concurrent fatal sibling telemetry, authentication telemetry, indexed image
+rejection/replay, and bounded success/error reads. No live Jina call, secret,
+licensed archive, or real full run was used.

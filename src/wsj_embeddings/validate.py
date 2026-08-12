@@ -39,6 +39,7 @@ from wsj_embeddings.models import (
     EmbeddingModality,
     EmbeddingProfile,
     SupersessionReason,
+    VectorDerivationKind,
     WorkState,
 )
 from wsj_embeddings.pipeline import (
@@ -632,12 +633,13 @@ def _validate_configurations(
     invalid = False
     rows = connection.execute(
         """
-        SELECT configuration_id, model, observed_model, observed_api_version,
-               task, dimensions, output_type, normalization,
+        SELECT configuration_id, model, client_api_contract_version, task,
+               dimensions, output_type, normalization,
                tokenizer_revision, tokenizer_engine, context_token_limit,
                context_rules, long_text_aggregation,
                long_text_part_attempt_limit, batch_max_items,
                batch_max_estimated_tokens, batch_max_encoded_bytes,
+               batch_max_response_bytes,
                batch_max_concurrency, batch_max_attempts,
                batch_initial_backoff_seconds, batch_max_backoff_seconds,
                image_input_rules,
@@ -650,21 +652,21 @@ def _validate_configurations(
     for row in rows:
         profile = EmbeddingProfile(
             model=row[1],
-            observed_model=row[2],
-            observed_api_version=row[3],
-            task=row[4],
-            dimensions=row[5],
-            output_type=row[6],
-            normalization=row[7],
-            tokenizer_revision=row[8],
-            tokenizer_engine=row[9],
-            context_token_limit=row[10],
-            context_rules=row[11],
-            long_text_aggregation=row[12],
-            long_text_part_attempt_limit=row[13],
-            batch_max_items=row[14],
-            batch_max_estimated_tokens=row[15],
-            batch_max_encoded_bytes=row[16],
+            client_api_contract_version=row[2],
+            task=row[3],
+            dimensions=row[4],
+            output_type=row[5],
+            normalization=row[6],
+            tokenizer_revision=row[7],
+            tokenizer_engine=row[8],
+            context_token_limit=row[9],
+            context_rules=row[10],
+            long_text_aggregation=row[11],
+            long_text_part_attempt_limit=row[12],
+            batch_max_items=row[13],
+            batch_max_estimated_tokens=row[14],
+            batch_max_encoded_bytes=row[15],
+            batch_max_response_bytes=row[16],
             batch_max_concurrency=row[17],
             batch_max_attempts=row[18],
             batch_initial_backoff_seconds=row[19],
@@ -828,6 +830,12 @@ def _validate_reconciliation_actions(
                 action.expected_vector_source_relative_path
            OR vector.input_sha256 IS DISTINCT FROM
                 action.expected_vector_input_sha256
+           OR vector.derivation_kind IS DISTINCT FROM
+                action.expected_derivation_kind
+           OR vector.raw_response_sha256 IS DISTINCT FROM
+                action.expected_raw_response_sha256
+           OR vector.response_model IS DISTINCT FROM
+                action.expected_response_model
            OR vector.stored_vector_sha256 IS DISTINCT FROM
                 action.expected_stored_vector_sha256
         """
@@ -1413,7 +1421,8 @@ def _validate_embeddings(
         """
         SELECT article_id, modality, configuration_id, published_at_utc,
                source_relative_path, publication_date_new_york, dimensions,
-               input_sha256, stored_vector_sha256, vector
+               input_sha256, derivation_kind, raw_response_sha256,
+               response_model, stored_vector_sha256, vector
         FROM embeddings
         WHERE configuration_id = ?
         ORDER BY article_id, modality, configuration_id
@@ -1436,6 +1445,9 @@ def _validate_embeddings(
             publication_date,
             dimensions,
             input_sha256,
+            derivation_kind,
+            raw_response_sha256,
+            response_model,
             stored_vector_sha256,
             vector,
         ) = row
@@ -1476,6 +1488,17 @@ def _validate_embeddings(
                 "embedding rows use an unsupported dimension",
             )
         _validate_vector(vector, stored_vector_sha256, issues)
+        if not _valid_vector_provenance(
+            modality,
+            derivation_kind,
+            raw_response_sha256,
+            response_model,
+        ):
+            _append(
+                issues,
+                "invalid_vector_provenance",
+                "embedding rows have inconsistent hosted or derived provenance",
+            )
         if article is None:
             _append(
                 issues,
@@ -2287,6 +2310,7 @@ def _validate_long_text_parts(
                char_start, char_end, byte_start, byte_end, part_input_sha256,
                token_count, state, attempt_count, error_code, status_code,
                retry_after_seconds, last_run_id, generation_run_id,
+               derivation_kind, raw_response_sha256, response_model,
                stored_vector_sha256, vector
         FROM long_text_parts
         WHERE configuration_id = ?
@@ -2314,6 +2338,9 @@ def _validate_long_text_parts(
             retry_after_seconds,
             last_run_id,
             generation_run_id,
+            derivation_kind,
+            raw_response_sha256,
+            response_model,
             vector_sha256,
             vector,
         ) = row
@@ -2343,6 +2370,9 @@ def _validate_long_text_parts(
                 attempt_count >= 1
                 and not any(value is not None for value in failure_metadata)
                 and generation_run_id in run_ids
+                and _valid_part_provenance(
+                    derivation_kind, raw_response_sha256, response_model
+                )
                 and _is_sha256(vector_sha256)
                 and vector is not None
             )
@@ -2353,6 +2383,9 @@ def _validate_long_text_parts(
         else:
             state_valid = (
                 generation_run_id is None
+                and derivation_kind is None
+                and raw_response_sha256 is None
+                and response_model is None
                 and vector_sha256 is None
                 and vector is None
                 and (
@@ -2394,7 +2427,9 @@ def _validate_long_text_parts(
         """
         SELECT article_id, article_input_sha256, part_index, generation_run_id,
                part_count, char_start, char_end, byte_start, byte_end,
-               part_input_sha256, token_count, stored_vector_sha256, vector
+               part_input_sha256, token_count, derivation_kind,
+               raw_response_sha256, response_model,
+               stored_vector_sha256, vector
         FROM long_text_part_generations
         WHERE configuration_id = ?
         ORDER BY article_id, article_input_sha256, part_index, generation_run_id
@@ -2415,6 +2450,9 @@ def _validate_long_text_parts(
             byte_end,
             part_input_sha256,
             part_token_count,
+            derivation_kind,
+            raw_response_sha256,
+            response_model,
             vector_sha256,
             vector,
         ) = row
@@ -2429,6 +2467,9 @@ def _validate_long_text_parts(
             and isinstance(part_token_count, int)
             and 0 < part_token_count <= token_limit
             and generation_run_id in run_ids
+            and _valid_part_provenance(
+                derivation_kind, raw_response_sha256, response_model
+            )
             and _is_sha256(vector_sha256)
             and vector is not None
         )
@@ -2821,6 +2862,7 @@ def _validate_generation_history(
     rows = connection.execute(
         """
         SELECT modality, source_relative_path, generation_run_id, input_sha256,
+               derivation_kind, raw_response_sha256, response_model,
                stored_vector_sha256, superseded_run_id, superseded_reason
         FROM embedding_generation_history
         WHERE configuration_id = ?
@@ -2832,6 +2874,9 @@ def _validate_generation_history(
         source_relative_path,
         generation_run_id,
         input_sha256,
+        derivation_kind,
+        raw_response_sha256,
+        response_model,
         vector_sha256,
         superseded_run_id,
         reason,
@@ -2876,6 +2921,72 @@ def _validate_generation_history(
                 "invalid_generation_hash",
                 "embedding generation history contains an invalid hash",
             )
+        if not _valid_vector_provenance(
+            modality,
+            derivation_kind,
+            raw_response_sha256,
+            response_model,
+        ):
+            _append(
+                issues,
+                "invalid_generation_provenance",
+                "embedding generation history has inconsistent provenance",
+            )
+
+
+def _valid_part_provenance(
+    derivation_kind: object,
+    raw_response_sha256: object,
+    response_model: object,
+) -> bool:
+    return _valid_vector_provenance(
+        EmbeddingModality.ARTICLE_TEXT.value,
+        derivation_kind,
+        raw_response_sha256,
+        response_model,
+        allow_aggregate=False,
+    )
+
+
+def _valid_vector_provenance(
+    modality: object,
+    derivation_kind: object,
+    raw_response_sha256: object,
+    response_model: object,
+    *,
+    allow_aggregate: bool = True,
+) -> bool:
+    if derivation_kind == VectorDerivationKind.HOSTED_RESPONSE.value:
+        return _is_sha256(raw_response_sha256) and _is_safe_response_model(
+            response_model
+        )
+    if derivation_kind == VectorDerivationKind.SYNTHETIC_FIXTURE.value:
+        return raw_response_sha256 is None and response_model is None
+    if (
+        allow_aggregate
+        and modality == EmbeddingModality.ARTICLE_TEXT.value
+        and derivation_kind == VectorDerivationKind.LONG_TEXT_AGGREGATE.value
+    ):
+        return raw_response_sha256 is None and response_model is None
+    if (
+        allow_aggregate
+        and modality == EmbeddingModality.MULTIMODAL_ARTICLE.value
+        and derivation_kind == VectorDerivationKind.MULTIMODAL_MIDPOINT.value
+    ):
+        return raw_response_sha256 is None and response_model is None
+    return False
+
+
+def _is_safe_response_model(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= 256
+        and all(
+            ord(character) >= 0x20 and ord(character) != 0x7F
+            for character in value
+        )
+    )
 
 
 def _is_sha256(value: object) -> bool:

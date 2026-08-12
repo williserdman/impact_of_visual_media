@@ -28,8 +28,9 @@ class PilotTransport:
         headers: Mapping[str, str],
         body: bytes,
         timeout_seconds: float,
+        max_response_bytes: int,
     ) -> JinaHttpResponse:
-        del url, headers, timeout_seconds
+        del url, headers, timeout_seconds, max_response_bytes
         request = json.loads(body)
         self.requests.append(request)
         count = len(request["input"])
@@ -230,8 +231,9 @@ def test_pilot_stops_on_invalid_credential_without_creating_state(
             headers: Mapping[str, str],
             body: bytes,
             timeout_seconds: float,
+            max_response_bytes: int,
         ) -> JinaHttpResponse:
-            del url, headers, body, timeout_seconds
+            del url, headers, body, timeout_seconds, max_response_bytes
             self.calls += 1
             return JinaHttpResponse(status_code=401, headers={}, body=b"{}")
 

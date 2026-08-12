@@ -8,6 +8,7 @@ import json
 import math
 import struct
 import traceback
+import urllib.error
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +21,7 @@ from wsj_embeddings.adapters import (
     JinaEmbeddingInput,
     JinaHostedAdapterError,
     JinaHttpResponse,
+    UrllibJinaTransport,
 )
 from wsj_embeddings.batching import BatchPolicy, execute_rate_aware_batches
 from wsj_embeddings.tokenizer import PinnedJinaV4Tokenizer, PinnedTokenizerError
@@ -30,7 +32,7 @@ class RecordingTransport:
 
     def __init__(self, response: JinaHttpResponse | BaseException) -> None:
         self.response = response
-        self.calls: list[tuple[str, Mapping[str, str], bytes, float]] = []
+        self.calls: list[tuple[str, Mapping[str, str], bytes, float, int]] = []
 
     def post(
         self,
@@ -39,8 +41,11 @@ class RecordingTransport:
         headers: Mapping[str, str],
         body: bytes,
         timeout_seconds: float,
+        max_response_bytes: int,
     ) -> JinaHttpResponse:
-        self.calls.append((url, headers, body, timeout_seconds))
+        self.calls.append(
+            (url, headers, body, timeout_seconds, max_response_bytes)
+        )
         if isinstance(self.response, BaseException):
             raise self.response
         return self.response
@@ -193,13 +198,14 @@ def test_hosted_adapter_serializes_fixed_contract_and_maps_indexed_vectors():
     )
 
     assert len(transport.calls) == 1
-    url, headers, body, timeout_seconds = transport.calls[0]
+    url, headers, body, timeout_seconds, max_response_bytes = transport.calls[0]
     assert url == "https://api.jina.ai/v1/embeddings"
     assert headers == {
         "Authorization": "Bearer synthetic-secret",
         "Content-Type": "application/json",
     }
     assert timeout_seconds == 12.5
+    assert max_response_bytes == JinaEmbeddingAdapter.profile.batch_max_response_bytes
     assert json.loads(body) == {
         "model": "jina-embeddings-v4",
         "task": "retrieval.passage",
@@ -224,6 +230,7 @@ def test_hosted_adapter_serializes_fixed_contract_and_maps_indexed_vectors():
         json.dumps(_embedding(3.0, 0.0), separators=(",", ":")).encode()
     ).hexdigest()
     assert result.vectors[0].raw_response_sha256 == expected_raw_hash
+    assert result.vectors[0].response_model == "jina-embeddings-v4"
     expected_stored_hash = hashlib.sha256(
         b"".join(struct.pack("<f", value) for value in result.vectors[0].stored_vector)
     ).hexdigest()
@@ -510,8 +517,16 @@ def test_successful_http_date_retry_after_becomes_capped_scheduler_delay():
                 )
             )
 
-        def post(self, _url, *, headers, body, timeout_seconds):
-            del headers, body, timeout_seconds
+        def post(
+            self,
+            _url,
+            *,
+            headers,
+            body,
+            timeout_seconds,
+            max_response_bytes,
+        ):
+            del headers, body, timeout_seconds, max_response_bytes
             return next(self.responses)
 
     adapter = JinaEmbeddingAdapter(
@@ -585,21 +600,85 @@ def test_hosted_adapter_suppresses_unsafe_exception_causes(
     assert secret not in "".join(traceback.format_exception(raised.value))
 
 
-def test_hosted_adapter_rejects_untrusted_model_metadata():
-    """Break caught: an arbitrary server model label reaches durable metadata."""
+def test_hosted_adapter_preserves_safe_response_model_drift_per_vector():
+    """Break caught: the mutable alias response label is replaced by a config claim."""
+
+    result = _adapter(
+        RecordingTransport(
+            _response(
+                [{"index": 0, "embedding": _embedding(1, 0)}],
+                model="jina-embeddings-v4-deployment-2026-08",
+            )
+        )
+    ).embed((JinaEmbeddingInput.text("generated test text"),))
+
+    assert result.response_metadata.model == "jina-embeddings-v4-deployment-2026-08"
+    assert result.vectors[0].response_model == (
+        "jina-embeddings-v4-deployment-2026-08"
+    )
+
+
+@pytest.mark.parametrize("status", [200, 413])
+def test_urllib_transport_rejects_oversized_success_and_error_bodies(
+    monkeypatch, status: int
+) -> None:
+    """Break caught: the production transport reads an unbounded response body."""
+
+    secret = b"response-secret-after-ceiling"
+
+    class BoundedStream:
+        def __init__(self) -> None:
+            self.status = status
+            self.headers = {}
+            self.data = b"12345678" + secret
+            self.offset = 0
+            self.read_sizes: list[int] = []
+
+        def read(self, size: int) -> bytes:
+            assert size >= 0
+            self.read_sizes.append(size)
+            chunk = self.data[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def close(self) -> None:
+            pass
+
+    stream = BoundedStream()
+
+    def open_response(*_args, **_kwargs):
+        if status == 200:
+            return stream
+        raise urllib.error.HTTPError(
+            "https://api.jina.ai/v1/embeddings",
+            status,
+            "synthetic",
+            {},
+            stream,
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", open_response)
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=UrllibJinaTransport(),
+    )
 
     with pytest.raises(JinaHostedAdapterError) as raised:
-        _adapter(
-            RecordingTransport(
-                _response(
-                    [{"index": 0, "embedding": _embedding(1, 0)}],
-                    model="model-secret-123",
-                )
-            )
-        ).embed((JinaEmbeddingInput.text("generated test text"),))
+        adapter.embed_batch(
+            (JinaEmbeddingInput.text("generated"),),
+            limits=JinaBatchLimits(1, 100, 100, 8),
+        )
 
     assert raised.value.code == "invalid_response"
-    assert "model-secret-123" not in "".join(traceback.format_exception(raised.value))
+    assert stream.offset == 9
+    assert sum(stream.read_sizes) == 9
+    assert secret.decode() not in "".join(traceback.format_exception(raised.value))
 
 
 def test_hosted_adapter_retains_only_numeric_named_rate_limit_metadata():
