@@ -742,7 +742,8 @@ def _validate_configurations(
     rows = stream_rows(
         connection,
         """
-        SELECT configuration_id, model, client_api_contract_version, task,
+        SELECT configuration_id, model, observed_model,
+               client_api_contract_version, task,
                dimensions, output_type, normalization,
                tokenizer_revision, tokenizer_engine, context_token_limit,
                context_rules, long_text_aggregation,
@@ -760,31 +761,35 @@ def _validate_configurations(
     for row in rows:
         profile = EmbeddingProfile(
             model=row[1],
-            client_api_contract_version=row[2],
-            task=row[3],
-            dimensions=row[4],
-            output_type=row[5],
-            normalization=row[6],
-            tokenizer_revision=row[7],
-            tokenizer_engine=row[8],
-            context_token_limit=row[9],
-            context_rules=row[10],
-            long_text_aggregation=row[11],
-            long_text_part_attempt_limit=row[12],
-            batch_max_items=row[13],
-            batch_max_estimated_tokens=row[14],
-            batch_max_encoded_bytes=row[15],
-            batch_max_response_bytes=row[16],
-            batch_max_concurrency=row[17],
-            batch_max_attempts=row[18],
-            batch_initial_backoff_seconds=row[19],
-            batch_max_backoff_seconds=row[20],
-            image_input_rules=row[21],
-            image_transform=row[22],
-            multimodal_formula=row[23],
-            client_configuration_version=row[24],
+            observed_model=row[2],
+            client_api_contract_version=row[3],
+            task=row[4],
+            dimensions=row[5],
+            output_type=row[6],
+            normalization=row[7],
+            tokenizer_revision=row[8],
+            tokenizer_engine=row[9],
+            context_token_limit=row[10],
+            context_rules=row[11],
+            long_text_aggregation=row[12],
+            long_text_part_attempt_limit=row[13],
+            batch_max_items=row[14],
+            batch_max_estimated_tokens=row[15],
+            batch_max_encoded_bytes=row[16],
+            batch_max_response_bytes=row[17],
+            batch_max_concurrency=row[18],
+            batch_max_attempts=row[19],
+            batch_initial_backoff_seconds=row[20],
+            batch_max_backoff_seconds=row[21],
+            image_input_rules=row[22],
+            image_transform=row[23],
+            multimodal_formula=row[24],
+            client_configuration_version=row[25],
         )
-        if row[0] != profile_configuration_id(profile):
+        if (
+            row[0] != profile_configuration_id(profile)
+            or not _is_safe_response_model(row[2])
+        ):
             invalid = True
     if invalid:
         issues.append(
@@ -975,6 +980,7 @@ def _validate_reconciliation_actions(
                vector.response_model, vector.stored_vector_sha256, vector.vector,
                configuration.client_api_contract_version,
                configuration.tokenizer_revision, configuration.tokenizer_engine,
+               configuration.observed_model,
                EXISTS (
                    SELECT 1 FROM article_text_aggregation_provenance AS p
                    WHERE p.article_id = vector.article_id
@@ -1006,6 +1012,7 @@ def _validate_reconciliation_actions(
         client_api_contract_version,
         tokenizer_revision,
         tokenizer_engine,
+        observed_model,
         has_aggregation_provenance,
     ) in hidden_vectors:
         synthetic = _is_synthetic_fixture_profile(
@@ -1025,6 +1032,10 @@ def _validate_reconciliation_actions(
                 has_aggregation_provenance=bool(has_aggregation_provenance),
             )
             or not vector_valid
+            or (
+                derivation_kind == VectorDerivationKind.HOSTED_RESPONSE.value
+                and response_model != observed_model
+            )
         ):
             _append(
                 issues,
@@ -1472,6 +1483,18 @@ def _validate_work_items(
                     "embedding_without_success_checkpoint",
                     "embedding rows lack a matching successful work checkpoint",
                 )
+        elif work_state is WorkState.STALE_CONFIGURATION:
+            if (
+                attempt_count != 0
+                or failure_metadata_present
+                or generation_run_id is not None
+                or has_embedding_key
+            ):
+                _append(
+                    issues,
+                    "invalid_stale_configuration_checkpoint",
+                    "stale-configuration work retains generation metadata",
+                )
         elif work_state is WorkState.STALE_INPUT:
             if (
                 input_sha256 is not None
@@ -1595,6 +1618,10 @@ def _validate_work_items(
                     "header_image_queued",
                     "header-image work remains queued",
                 ),
+                WorkState.ELIGIBLE: (
+                    "header_image_eligible",
+                    "header-image work remains eligible",
+                ),
                 WorkState.IN_PROGRESS: (
                     "header_image_in_progress",
                     "header-image work remains in progress",
@@ -1672,9 +1699,9 @@ def _validate_header_disposition_coverage(
                ),
                count(*) FILTER (
                    WHERE state NOT IN (
-                       'queued', 'in_progress', 'succeeded',
+                       'eligible', 'queued', 'in_progress', 'succeeded',
                        'retryable', 'terminal', 'interrupted',
-                       'not_applicable', 'stale_input'
+                       'not_applicable', 'stale_input', 'stale_configuration'
                    )
                )
         FROM embedding_work_items
@@ -1710,6 +1737,7 @@ def _validate_embeddings(
                e.source_relative_path, e.publication_date_new_york, e.dimensions,
                e.input_sha256, e.derivation_kind, e.raw_response_sha256,
                e.response_model, e.stored_vector_sha256, e.vector,
+               configuration.observed_model,
                EXISTS (
                    SELECT 1 FROM article_text_aggregation_provenance AS p
                    WHERE p.article_id = e.article_id
@@ -1719,6 +1747,8 @@ def _validate_embeddings(
         FROM embeddings AS e
         LEFT JOIN embedding_work_items AS w
           USING (article_id, modality, configuration_id)
+        JOIN embedding_configurations AS configuration
+          ON configuration.configuration_id = e.configuration_id
         WHERE e.configuration_id = ?
         ORDER BY e.article_id, e.modality, e.configuration_id
         """,
@@ -1744,6 +1774,7 @@ def _validate_embeddings(
             response_model,
             stored_vector_sha256,
             vector,
+            observed_model,
             has_aggregation_provenance,
         ) = row
         supported_modality = modality in {
@@ -1789,6 +1820,15 @@ def _validate_embeddings(
                 issues,
                 "invalid_vector_provenance",
                 "embedding rows have inconsistent hosted or derived provenance",
+            )
+        if (
+            derivation_kind == VectorDerivationKind.HOSTED_RESPONSE.value
+            and response_model != observed_model
+        ):
+            _append(
+                issues,
+                "hosted_response_model_mismatch",
+                "hosted vector model differs from its configuration observation",
             )
         if article is None:
             _append(
@@ -2865,7 +2905,7 @@ def _validate_long_text_parts(
         """
         SELECT context_token_limit, long_text_aggregation,
                long_text_part_attempt_limit, client_api_contract_version,
-               tokenizer_revision, tokenizer_engine
+               tokenizer_revision, tokenizer_engine, observed_model
         FROM embedding_configurations
         WHERE configuration_id = ?
         """,
@@ -2880,6 +2920,7 @@ def _validate_long_text_parts(
         client_api_contract_version,
         tokenizer_revision,
         tokenizer_engine,
+        observed_model,
     ) = configuration
     synthetic_configuration = _is_synthetic_fixture_profile(
         client_api_contract_version, tokenizer_revision, tokenizer_engine
@@ -2966,6 +3007,7 @@ def _validate_long_text_parts(
                     raw_response_sha256,
                     response_model,
                     synthetic_configuration=synthetic_configuration,
+                    observed_model=observed_model,
                 )
                 and _is_sha256(vector_sha256)
                 and vector is not None
@@ -3056,6 +3098,7 @@ def _validate_long_text_parts(
                 raw_response_sha256,
                 response_model,
                 synthetic_configuration=synthetic_configuration,
+                observed_model=observed_model,
             )
             and _is_sha256(vector_sha256)
             and vector is not None
@@ -3369,6 +3412,7 @@ def _validate_generation_history(
                history.stored_vector_sha256, history.superseded_run_id,
                history.superseded_reason, generation.run_id IS NOT NULL,
                superseding.run_id IS NOT NULL,
+               configuration.observed_model,
                EXISTS (
                    SELECT 1 FROM article_text_aggregation_provenance AS provenance
                    WHERE provenance.article_id = history.article_id
@@ -3376,6 +3420,8 @@ def _validate_generation_history(
                      AND provenance.generation_run_id = history.generation_run_id
                )
         FROM embedding_generation_history AS history
+        JOIN embedding_configurations AS configuration
+          ON configuration.configuration_id = history.configuration_id
         LEFT JOIN runs AS generation ON generation.run_id = history.generation_run_id
           AND generation.configuration_id = history.configuration_id
         LEFT JOIN runs AS superseding
@@ -3399,6 +3445,7 @@ def _validate_generation_history(
         reason,
         generation_run_valid,
         superseded_run_valid,
+        observed_model,
         has_aggregation_provenance,
     ) in rows:
         if modality not in {item.value for item in EmbeddingModality}:
@@ -3454,6 +3501,15 @@ def _validate_generation_history(
                 "invalid_generation_provenance",
                 "embedding generation history has inconsistent provenance",
             )
+        if (
+            derivation_kind == VectorDerivationKind.HOSTED_RESPONSE.value
+            and response_model != observed_model
+        ):
+            _append(
+                issues,
+                "hosted_response_model_mismatch",
+                "hosted generation model differs from configuration observation",
+            )
 
 
 def _valid_part_provenance(
@@ -3462,6 +3518,7 @@ def _valid_part_provenance(
     response_model: object,
     *,
     synthetic_configuration: bool,
+    observed_model: object,
 ) -> bool:
     return _valid_vector_provenance(
         EmbeddingModality.ARTICLE_TEXT.value,
@@ -3470,6 +3527,9 @@ def _valid_part_provenance(
         response_model,
         allow_aggregate=False,
         synthetic_configuration=synthetic_configuration,
+    ) and (
+        derivation_kind != VectorDerivationKind.HOSTED_RESPONSE.value
+        or response_model == observed_model
     )
 
 

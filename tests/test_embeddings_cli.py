@@ -530,6 +530,8 @@ def test_authorized_run_reports_missing_credential_without_output_state(
             "--limit",
             "1",
             "--authorize-hosted-processing",
+            "--observed-model",
+            "jina-embeddings-v4",
         ],
         environment={},
     )
@@ -538,6 +540,41 @@ def test_authorized_run_reports_missing_credential_without_output_state(
     assert exit_code == 1
     assert json.loads(line) == {"error": "missing_credential"}
     assert line == f"{json.dumps(json.loads(line), sort_keys=True)}\n"
+    assert not roots[2].exists()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        (),
+        ("--observed-model", "jina-embeddings-v4-secret-token"),
+    ),
+)
+def test_real_run_requires_safe_pilot_observation_before_output_state(
+    tmp_path: Path,
+    capsys,
+    arguments: tuple[str, ...],
+) -> None:
+    """Break caught: an unobserved hosted deployment is assigned a config ID."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+
+    exit_code = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--limit",
+            "1",
+            "--authorize-hosted-processing",
+            *arguments,
+        ],
+        environment={"JINA_API_KEY": "synthetic-secret"},
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert output == '{"error": "pilot_observation_required"}\n'
+    assert "secret-token" not in output
     assert not roots[2].exists()
 
 

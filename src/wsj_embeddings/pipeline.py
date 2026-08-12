@@ -104,6 +104,8 @@ class _PreparedHeaderImage:
 class EmbeddingPipelineFailpoints:
     """Content-free interruption hooks for durable-boundary verification."""
 
+    after_work_eligibility: Callable[[], None] | None = None
+    after_work_admission: Callable[[], None] | None = None
     after_long_text_part_attempt_checkpoint: (
         Callable[[int, int], None] | None
     ) = None
@@ -322,6 +324,8 @@ def run_embedding_pipeline(
     run_started_at = run_clock()
     if not config.hosted_processing_authorized:
         raise HostedProcessingAuthorizationError
+    if not _is_bound_observed_model(adapter.profile.observed_model):
+        raise EmbeddingPipelineError("pilot_observation_required", "configuration")
     if not isinstance(full, bool):
         raise ValueError("full must be boolean")
     if (limit is None) == (not full):
@@ -466,6 +470,8 @@ def run_embedding_pipeline(
                         prepared_images[article.article_id],
                     )
                 )
+        if active_failpoints.after_work_eligibility is not None:
+            active_failpoints.after_work_eligibility()
         if (
             getattr(adapter, "rate_aware_batching", False)
             and callable(getattr(adapter, "embed_batch", None))
@@ -560,6 +566,15 @@ def run_embedding_pipeline(
                         )
                     if exhausted:
                         continue
+                with catalog.transaction():
+                    catalog.admit_work(
+                        run_id=run_id,
+                        article_id=article.article_id,
+                        modality=modality,
+                        configuration_identifier=configuration_identifier,
+                    )
+                if active_failpoints.after_work_admission is not None:
+                    active_failpoints.after_work_admission()
                 with catalog.transaction():
                     catalog.start_attempt(
                         run_id=run_id,
@@ -1045,6 +1060,8 @@ def _process_full_article_page(
                     prepared_images[article.article_id],
                 )
             )
+    if failpoints.after_work_eligibility is not None:
+        failpoints.after_work_eligibility()
     if (
         getattr(adapter, "rate_aware_batching", False)
         and callable(getattr(adapter, "embed_batch", None))
@@ -1102,6 +1119,15 @@ def _process_full_article_page(
                     )
                 if exhausted:
                     continue
+            with catalog.transaction():
+                catalog.admit_work(
+                    run_id=run_id,
+                    article_id=article.article_id,
+                    modality=modality,
+                    configuration_identifier=configuration_identifier,
+                )
+            if failpoints.after_work_admission is not None:
+                failpoints.after_work_admission()
             with catalog.transaction():
                 catalog.start_attempt(
                     run_id=run_id,
@@ -1282,6 +1308,20 @@ def _validate_batch_profile(profile: EmbeddingProfile) -> None:
         raise ValueError("adapter batch profile is invalid") from error
 
 
+def _is_bound_observed_model(value: object) -> bool:
+    """Accept only bounded content-free runtime identities, including fixtures."""
+
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= 256
+        and all(
+            ord(character) >= 0x20 and ord(character) != 0x7F
+            for character in value
+        )
+    )
+
+
 def _run_rate_aware_work(
     config: EmbeddingPipelineConfig,
     adapter: EmbeddingAdapter,
@@ -1325,6 +1365,15 @@ def _run_rate_aware_work(
                 prepared_image, _MissingHeaderImage
             ):
                 continue
+            with catalog.transaction():
+                catalog.admit_work(
+                    run_id=run_id,
+                    article_id=article.article_id,
+                    modality=modality,
+                    configuration_identifier=configuration_identifier,
+                )
+            if failpoints.after_work_admission is not None:
+                failpoints.after_work_admission()
             if modality == _HEADER_IMAGE_MODALITY:
                 assert isinstance(prepared_image, _PreparedHeaderImage)
                 image_bytes = (
@@ -1455,6 +1504,12 @@ def _run_rate_aware_work(
         work = works[index]
         if work.part is None:
             with catalog.transaction():
+                catalog.admit_work(
+                    run_id=run_id,
+                    article_id=work.article.article_id,
+                    modality=work.modality,
+                    configuration_identifier=configuration_identifier,
+                )
                 catalog.start_attempt(
                     run_id=run_id,
                     article_id=work.article.article_id,
@@ -1464,6 +1519,13 @@ def _run_rate_aware_work(
             return
         assert work.article_input_sha256 is not None
         with catalog.transaction():
+            catalog.admit_long_text_part(
+                run_id=run_id,
+                article_id=work.article.article_id,
+                configuration_identifier=configuration_identifier,
+                article_input_sha256=work.article_input_sha256,
+                part_index=work.part.index,
+            )
             attempt_count = catalog.start_long_text_part_attempt(
                 run_id=run_id,
                 article_id=work.article.article_id,
@@ -1477,6 +1539,7 @@ def _run_rate_aware_work(
             )
 
     failed_long_articles: set[str] = set()
+    configuration_drift_detected = False
 
     def commit_outcome(
         index: int,
@@ -1484,7 +1547,23 @@ def _run_rate_aware_work(
         outcome: JinaBatchItemOutcome,
         final: bool,
     ) -> None:
+        nonlocal configuration_drift_detected
         work = works[index]
+        if (
+            outcome.vector is not None
+            and outcome.vector.response_model is not None
+            and outcome.vector.response_model != profile.observed_model
+        ):
+            configuration_drift_detected = True
+            outcome = JinaBatchItemOutcome(
+                index=outcome.index,
+                vector=None,
+                error_code="configuration_drift",
+                retryable=False,
+                status_code=outcome.status_code,
+                retry_after_seconds=outcome.retry_after_seconds,
+            )
+            final = True
         if outcome.vector is not None:
             response_vector = outcome.vector
             vector = _verified_source_vector(
@@ -1598,6 +1677,8 @@ def _run_rate_aware_work(
         ),
         **execution_kwargs,
     )
+    if configuration_drift_detected:
+        raise JinaHostedAdapterError("configuration_drift", retryable=False)
     for article_id in failed_long_articles:
         with catalog.transaction():
             row = catalog.connection.execute(
@@ -2187,6 +2268,13 @@ def _embed_long_text_parts(
             raise _LongTextTerminal
         if state is not WorkState.SUCCEEDED:
             with catalog.transaction():
+                catalog.admit_long_text_part(
+                    run_id=run_id,
+                    article_id=article.article_id,
+                    configuration_identifier=configuration_identifier,
+                    article_input_sha256=article_input_sha256,
+                    part_index=part.index,
+                )
                 attempt_count = catalog.start_long_text_part_attempt(
                     run_id=run_id,
                     article_id=article.article_id,

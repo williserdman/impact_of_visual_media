@@ -391,6 +391,7 @@ class JinaEmbeddingAdapter:
         environment: Mapping[str, str] | None = None,
         transport: JinaTransport | None = None,
         tokenizer: TextOffsetTokenizer | None = None,
+        observed_model: str | None = None,
         timeout_seconds: float = 30.0,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -400,6 +401,9 @@ class JinaEmbeddingAdapter:
         api_key = credential_environment.get("JINA_API_KEY")
         if not api_key:
             raise JinaHostedAdapterError("missing_credential", retryable=False)
+        if observed_model is not None and not is_safe_jina_model_label(observed_model):
+            raise JinaHostedAdapterError("pilot_observation_required", retryable=False)
+        self.profile = replace(self.__class__.profile, observed_model=observed_model)
         self._authorization = f"Bearer {api_key}"
         self._transport = UrllibJinaTransport() if transport is None else transport
         self._tokenizer = PinnedJinaV4Tokenizer() if tokenizer is None else tokenizer
@@ -454,7 +458,7 @@ class JinaEmbeddingAdapter:
             raise ImageCodecError("ambiguous_image_configuration")
         self.image_codec = codec
         self.profile = replace(
-            JinaEmbeddingAdapter.profile,
+            self.profile,
             image_transform=codec.transform_id,
         )
 
@@ -869,6 +873,12 @@ def _safe_response_model(value: object) -> str | None:
     return value
 
 
+def is_safe_jina_model_label(value: object) -> bool:
+    """Return whether a value is a bounded, non-secret Jina v4 model label."""
+
+    return _safe_response_model(value) is not None
+
+
 def _safe_rate_limit_headers(headers: Mapping[str, str]) -> dict[str, float]:
     safe_headers: dict[str, float] = {}
     for name, value in headers.items():
@@ -930,6 +940,7 @@ class FakeEmbeddingAdapter:
 
     profile = EmbeddingProfile(
         model="fake-jina-embeddings-v4",
+        observed_model="synthetic-fake-jina-v4",
         task="retrieval.passage",
         dimensions=2048,
         output_type="float",

@@ -128,7 +128,7 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
 | `wsj_embeddings/image_rendition.py` | bounded image decode, exact-byte eligibility, deterministic Pillow rendition, and atomic derived-file installation | source-image mutation or hosted requests |
 | `wsj_embeddings/batching.py` | mixed-input payload packing, bounded concurrency, rate-aware retry waves, and safe observations | HTTP serialization or catalog publication |
-| `wsj_embeddings/catalog.py` | separate schema version 15, canonical current views, and bounded lifecycle/generation/provenance/reconciliation transactions | preprocessing catalog mutation |
+| `wsj_embeddings/catalog.py` | separate schema version 16, canonical current views, and bounded lifecycle/generation/provenance/reconciliation transactions | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection/full traversal, text/image encoding, composite derivation, publication, and reconciliation | hosted credential loading |
 | `wsj_embeddings/validate.py` | read-only schema, corpus coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
@@ -153,7 +153,8 @@ both exact-schema catalogs read-only, requires an explicit configuration when
 multiple identities coexist, and returns stable integrity issues plus
 content-free coverage without constructing an adapter. `run` requires
 exactly one of positive `--limit` or explicit `--full`, three explicit disjoint
-roots, and `--authorize-hosted-processing`. Limited mode selects by
+roots, `--authorize-hosted-processing`, and the safe current pilot-returned
+`--observed-model`. Limited mode selects by
 `ORDER BY article_id LIMIT ?` and never reconciles unselected rows. Full mode
 uses bounded lexical keyset pages, durable content-free discovery, bounded
 processing and reconciliation pages, and reconciles only after successful
@@ -268,10 +269,10 @@ ORDER BY published_at_utc, article_id;
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 15 has exactly thirteen base tables, two
+catalog. Embedding schema version 16 has exactly thirteen base tables, two
 canonical views, and no indexes. Exact validation includes normalized
 behavior-bearing SQL fingerprints for both views, so a same-column view that
-bypasses the visibility overlay is malformed. Versions 1 through 14 and
+bypasses the visibility overlay is malformed. Versions 1 through 15 and
 malformed output are refused without migration. `full_run_articles` stores
 only run/article identity and the optional source-relative header association,
 never Markdown or image bytes.
@@ -279,7 +280,7 @@ never Markdown or image bytes.
 | Table | Ordered columns and DuckDB types | Primary key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
-| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `client_api_contract_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_response_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
+| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `client_api_contract_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_response_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `scope VARCHAR`, `status VARCHAR`, `discovery_complete BOOLEAN`, `reconciliation_complete BOOLEAN`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `hosted_requests INTEGER`, `hosted_retries INTEGER`, `usage_json VARCHAR`, `throttles INTEGER`, `elapsed_seconds DOUBLE`, `started_at TIMESTAMPTZ`, `finished_at TIMESTAMPTZ` | `run_id` |
 | `full_run_articles` | `run_id VARCHAR`, `article_id VARCHAR`, `header_image_path VARCHAR` | `(run_id, article_id)` |
 | `embedding_work_storage` | physical columns exposed by `embedding_work_items` | `(article_id, modality, configuration_id)` |
@@ -295,14 +296,15 @@ never Markdown or image bytes.
 | `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
 
 `configuration_id` is the SHA-256 of compact, key-sorted JSON for every
-`EmbeddingProfile` field: requested model alias and implemented-against API
+`EmbeddingProfile` field: requested model alias, exact observed hosted model,
+and implemented-against API
 contract version,
 task, dimensions, output type, normalization, tokenizer artifact/engine,
 context rules/ceiling, long-text aggregation/attempt limit, batching
 payload/response/concurrency/retry policy, image rules/transform, multimodal formula,
-and client configuration version. The
-returned model is observed per hosted generation instead of being invented in
-configuration identity. Hosted generations retain SHA-256 for canonical compact
+and client configuration version. Production runs require the pilot observation
+before output mutation, and each hosted generation must return that exact model
+or fail content-free without publication. Hosted generations retain SHA-256 for canonical compact
 JSON bytes of the raw embedding array and for normalized little-endian float32
 bytes. Local long-text aggregates and multimodal midpoints explicitly have no
 raw hosted representation. The tokenizer engine is pinned as
@@ -325,8 +327,14 @@ only the two source-generation identities/vector hashes and formula. After
 finite/nonzero checks and L2 normalization,
 values are rounded to
 float32; `stored_vector_sha256` covers their concatenated little-endian float32
-representation. Work state is one of `queued`, `in_progress`, `succeeded`,
-`retryable`, `terminal`, `interrupted`, or `not_applicable`. The supported
+representation. Work state is one of `eligible`, `queued`, `in_progress`,
+`succeeded`, `retryable`, `terminal`, `interrupted`, `not_applicable`,
+`stale_input`, or `stale_configuration`. Fresh and invalidated work is first
+durably eligible; an admission transaction moves attemptable eligible,
+interrupted, or retryable work to queued, and only queued work starts an
+attempt. `stale_configuration` is a generation-free terminal vocabulary
+reserved for explicit invalid/unsupported configuration reconciliation, never
+for ordinary coexistence. The supported
 vector modalities are `article_text`, `header_image`, and `multimodal_article`,
 all dimension 2,048.
 `long_text_parts` is mutable operational checkpoint/vector state, not a fourth

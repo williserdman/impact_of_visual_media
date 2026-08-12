@@ -84,7 +84,7 @@ pilot      send fixed generated text/image probes to hosted Jina v4
 inventory  count canonical/text/header eligibility without credentials
 validate   check integrity and content-free coverage without credentials
 run        embed or reprocess exactly one positive limit or explicit full scope
-           after hosted-processing authorization
+           after hosted-processing authorization and a bound pilot observation
 ```
 
 It prints this deterministic, content-free result on success:
@@ -183,8 +183,15 @@ insufficient:
   --preprocessing-output-root data/processed/wsj \
   --embedding-output-root data/embeddings/wsj \
   --limit 5 \
+  --observed-model 'jina-embeddings-v4' \
   --authorize-hosted-processing
 ```
+
+Set `--observed-model` to the exact safe model label returned consistently by
+the current successful pilot probes. Without it, production Jina runs stop
+with `pilot_observation_required` before output mutation. A later response
+model mismatch terminalizes affected work as content-free
+`configuration_drift` and publishes no vector under the old configuration.
 
 Use `--full` in place of `--limit 5` only after reviewing inventory, pilot,
 authorization, cost, and throughput. Full mode keyset-pages canonical articles
@@ -393,7 +400,7 @@ source-relative header association, never Markdown or image bytes:
 | Table | Ordered columns | Key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
-| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `client_api_contract_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_response_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
+| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `client_api_contract_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_response_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `scope VARCHAR`, `status VARCHAR`, `discovery_complete BOOLEAN`, `reconciliation_complete BOOLEAN`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `hosted_requests INTEGER`, `hosted_retries INTEGER`, `usage_json VARCHAR`, `throttles INTEGER`, `elapsed_seconds DOUBLE`, `started_at TIMESTAMPTZ`, `finished_at TIMESTAMPTZ` | `run_id` |
 | `full_run_articles` | `run_id VARCHAR`, `article_id VARCHAR`, `header_image_path VARCHAR` | `(run_id, article_id)` |
 | `embedding_work_storage` | physical columns exposed by `embedding_work_items` | `(article_id, modality, configuration_id)` |
@@ -414,8 +421,10 @@ and only one applicable case: a
 safe-path `retryable` header with `missing_header_image`, zero adapter attempts,
 and no active vector or generation. The three failure-detail columns retain
 classified codes and numeric response/retry metadata, never exception text or
-editorial content. Work states are `queued`, `in_progress`, `succeeded`,
-`retryable`, `terminal`, `interrupted`, `not_applicable`, and `stale_input`.
+editorial content. Work states are `eligible`, `queued`, `in_progress`,
+`succeeded`, `retryable`, `terminal`, `interrupted`, `not_applicable`,
+`stale_input`, and `stale_configuration`. Fresh or invalidated work is first
+durably `eligible`, then admitted to `queued` before an adapter attempt.
 `stale_input` is a generation-free completed-full-run disposition; its header
 path equals the retained canonical association, or is null when the article
 disappeared. `not_applicable` means no canonical header; header failures remain
@@ -424,6 +433,9 @@ prior image generation as `input_changed` and invalidate only that image plus
 its same-configuration multimodal dependent. A changed configuration uses a
 separate work key and
 leaves the prior configuration queryable.
+`stale_configuration` is a generation-free terminal disposition reserved for
+explicit reconciliation of invalid or unsupported recorded configuration
+identity. It is never inferred merely because valid configurations coexist.
 
 Production requests may mix article text, header images, and long-text parts.
 Each request is bounded independently by item count, estimated text tokens,
@@ -473,14 +485,16 @@ absent, non-directory, or inaccessible archive root is an operational
 absent, one transaction archives/removes both its image vector and its
 same-configuration multimodal dependent before recording `not_applicable`.
 `configuration_id` is the SHA-256 of compact,
-key-sorted JSON covering requested model alias, implemented-against API
+key-sorted JSON covering requested model alias, exact observed hosted model,
+implemented-against API
 contract version, task,
 dimensions, output type, normalization, tokenizer artifact and engine,
 context rules/ceiling, long-text aggregation and attempt limit, batching
 payload/response/concurrency/retry policy, image input/transform rules, multimodal
-formula, and client configuration version.
-The provider-returned model is instead recorded per hosted vector generation
-and may differ from the mutable alias. `raw_response_sha256` covers canonical
+formula, and client configuration version. A changed observed model creates a
+separate queryable configuration. The provider-returned model is also recorded
+per hosted vector generation and must equal that immutable observation.
+`raw_response_sha256` covers canonical
 compact JSON bytes for the exact raw embedding array; `stored_vector_sha256`
 covers normalized little-endian float32 bytes. Locally derived long-text
 aggregates and multimodal midpoints have explicit derivation kinds and null

@@ -174,8 +174,23 @@ def _adapter(transport: RecordingTransport) -> JinaEmbeddingAdapter:
     return JinaEmbeddingAdapter(
         environment={"JINA_API_KEY": "synthetic-secret"},
         transport=transport,
+        observed_model="jina-embeddings-v4",
         timeout_seconds=12.5,
     )
+
+
+def test_hosted_adapter_binds_observed_model_into_immutable_profile_identity():
+    """Break caught: runtime model observations are omitted from configuration."""
+
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=RecordingTransport(AssertionError("network transport used")),
+        tokenizer=object(),
+        observed_model="jina-embeddings-v4-deployment-a",
+    )
+
+    assert adapter.profile.observed_model == "jina-embeddings-v4-deployment-a"
+    assert JinaEmbeddingAdapter.profile.observed_model is None
 
 
 def test_hosted_adapter_serializes_fixed_contract_and_maps_indexed_vectors():

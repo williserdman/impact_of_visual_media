@@ -68,6 +68,7 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
     "embedding_configurations": (
         ("configuration_id", "VARCHAR", True, None, True),
         ("model", "VARCHAR", True, None, False),
+        ("observed_model", "VARCHAR", True, None, False),
         ("client_api_contract_version", "VARCHAR", True, None, False),
         ("task", "VARCHAR", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
@@ -632,6 +633,11 @@ class LongTextRecordingBatchAdapter(RecordingBatchAdapter):
 class HostedProvenanceBatchAdapter(RecordingBatchAdapter):
     """Generated transport outcome shaped like a real hosted response."""
 
+    profile = replace(
+        RecordingBatchAdapter.profile,
+        observed_model="jina-embeddings-v4-deployment-a",
+    )
+
     def embed_batch(self, inputs, *, limits):
         response = super().embed_batch(inputs, limits=limits)
         return replace(
@@ -644,7 +650,7 @@ class HostedProvenanceBatchAdapter(RecordingBatchAdapter):
                         if outcome.vector is None
                         else replace(
                             outcome.vector,
-                            response_model="jina-v4-observed-deployment-a",
+                            response_model="jina-embeddings-v4-deployment-a",
                         )
                     ),
                 )
@@ -658,6 +664,7 @@ class HostedProvenanceLongTextAdapter(
 ):
     profile = replace(
         LongTextRecordingBatchAdapter.profile,
+        observed_model="jina-embeddings-v4-deployment-a",
         client_configuration_version="synthetic-hosted-provenance-long-v1",
     )
 
@@ -790,6 +797,7 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
     )
     alternatives = {
         "model": "changed-model-alias",
+        "observed_model": "synthetic-fake-jina-v4-changed",
         "client_api_contract_version": "changed-api-contract-version",
         "task": "changed-task",
         "dimensions": 1024,
@@ -861,6 +869,74 @@ def test_coordinator_refuses_unauthorized_run_before_markdown_or_output(
         run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
 
     assert not config.embedding_output_root.exists()
+
+
+def test_coordinator_refuses_unbound_observed_model_before_output(tmp_path):
+    """Break caught: direct callers publish a guessed hosted model identity."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    adapter = FakeEmbeddingAdapter()
+    adapter.profile = replace(adapter.profile, observed_model=None)
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(config, adapter, limit=1)
+
+    assert raised.value.code == "pilot_observation_required"
+    assert not config.embedding_output_root.exists()
+
+
+def test_observed_model_drift_creates_coexisting_queryable_configuration(tmp_path):
+    """Break caught: a new observed deployment overwrites prior vectors."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    first = FakeEmbeddingAdapter()
+    first.profile = replace(first.profile, observed_model="synthetic-fake-jina-v4-a")
+    second = FakeEmbeddingAdapter()
+    second.profile = replace(second.profile, observed_model="synthetic-fake-jina-v4-b")
+    first_id = configuration_id(first.profile)
+    second_id = configuration_id(second.profile)
+
+    run_embedding_pipeline(config, first, limit=1)
+    run_embedding_pipeline(config, second, limit=1)
+
+    assert first_id != second_id
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT configuration_id, observed_model "
+            "FROM embedding_configurations ORDER BY observed_model"
+        ).fetchall() == [
+            (first_id, "synthetic-fake-jina-v4-a"),
+            (second_id, "synthetic-fake-jina-v4-b"),
+        ]
+        assert db.execute(
+            "SELECT configuration_id FROM embeddings "
+            "WHERE modality = 'article_text' ORDER BY configuration_id"
+        ).fetchall() == sorted([(first_id,), (second_id,)])
+    assert validate_embedding_outputs(config, configuration_id=first_id).ok
+    assert validate_embedding_outputs(config, configuration_id=second_id).ok
+
+
+def test_hosted_response_model_drift_terminalizes_without_publication(tmp_path):
+    """Break caught: a changed deployment is stored under an older config ID."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class DriftedAdapter(HostedProvenanceBatchAdapter):
+        profile = replace(
+            HostedProvenanceBatchAdapter.profile,
+            observed_model="jina-embeddings-v4-expected",
+        )
+
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        run_embedding_pipeline(config, DriftedAdapter(), limit=1)
+
+    assert raised.value.code == "configuration_drift"
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+        assert db.execute(
+            "SELECT state, error_code FROM embedding_work_items "
+            "WHERE modality = 'article_text'"
+        ).fetchone() == ("terminal", "configuration_drift")
 
 
 @pytest.mark.parametrize(
@@ -954,6 +1030,47 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
     assert snapshot_fixture_inputs(config) == before
 
 
+@pytest.mark.parametrize(
+    ("failpoint_name", "expected_state"),
+    (
+        ("after_work_eligibility", "eligible"),
+        ("after_work_admission", "queued"),
+    ),
+)
+def test_work_eligibility_and_admission_are_distinct_durable_checkpoints(
+    tmp_path,
+    failpoint_name,
+    expected_state,
+):
+    """Break caught: discovery is indistinguishable from attempt admission."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    adapter = RecordingMultimodalAdapter()
+
+    def interrupt(*_args):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_embedding_pipeline(
+            config,
+            adapter,
+            limit=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                **{failpoint_name: interrupt}
+            ),
+        )
+
+    assert adapter.calls == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT state, attempt_count FROM embedding_work_items "
+            "WHERE modality = 'article_text'"
+        ).fetchone() == (expected_state, 0)
+
+    resumed = run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
+    assert resumed.succeeded == 1
+
+
 def test_rate_aware_coordinator_batches_mixed_items_and_summarizes_hosted_usage(
     tmp_path,
 ):
@@ -1016,13 +1133,13 @@ def test_hosted_source_hashes_and_response_model_survive_active_and_history(
                 "article_text",
                 "hosted_response",
                 "a" * 64,
-                "jina-v4-observed-deployment-a",
+                "jina-embeddings-v4-deployment-a",
             ),
             (
                 "header_image",
                 "hosted_response",
                 "a" * 64,
-                "jina-v4-observed-deployment-a",
+                "jina-embeddings-v4-deployment-a",
             ),
             ("multimodal_article", "multimodal_midpoint", None, None),
         ]
@@ -1039,7 +1156,7 @@ def test_hosted_source_hashes_and_response_model_survive_active_and_history(
         ).fetchone() == (
             "hosted_response",
             "a" * 64,
-            "jina-v4-observed-deployment-a",
+            "jina-embeddings-v4-deployment-a",
         )
     assert validate_embedding_outputs(config).ok
 
@@ -1064,7 +1181,7 @@ def test_hosted_long_parts_retain_raw_hash_while_aggregate_is_derived(tmp_path):
                 (
                     "hosted_response",
                     "a" * 64,
-                    "jina-v4-observed-deployment-a",
+                    "jina-embeddings-v4-deployment-a",
                 )
             ]
         assert db.execute(
@@ -1133,12 +1250,48 @@ def test_validator_rejects_malformed_hosted_vector_provenance(
     }
 
 
+def test_validator_requires_hosted_response_model_to_match_configuration(tmp_path):
+    """Break caught: safe but different hosted models pass provenance checks."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, HostedProvenanceBatchAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "UPDATE embedding_storage SET response_model = ? "
+            "WHERE modality = 'article_text'",
+            ["jina-embeddings-v4-other"],
+        )
+
+    assert "hosted_response_model_mismatch" in {
+        issue.code for issue in validate_embedding_outputs(config).issues
+    }
+
+
+def test_validator_rejects_stale_configuration_with_generation_metadata(tmp_path):
+    """Break caught: reserved config-stale work can retain an active generation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "UPDATE embedding_work_storage SET state = 'stale_configuration' "
+            "WHERE modality = 'article_text'"
+        )
+
+    assert "invalid_stale_configuration_checkpoint" in {
+        issue.code for issue in validate_embedding_outputs(config).issues
+    }
+
+
 def test_validator_rejects_synthetic_derivation_under_real_jina_profile(tmp_path):
     """Break caught: real hosted generations can masquerade as test fixtures."""
 
     config = write_generated_preprocessing_fixture(tmp_path)
     class RealProfileHostedFixtureAdapter(HostedProvenanceBatchAdapter):
-        profile = JinaEmbeddingAdapter.profile
+        profile = replace(
+            JinaEmbeddingAdapter.profile,
+            observed_model="jina-embeddings-v4-deployment-a",
+        )
 
     run_embedding_pipeline(config, RealProfileHostedFixtureAdapter(), limit=1)
     real_id = configuration_id(RealProfileHostedFixtureAdapter.profile)
@@ -1167,7 +1320,7 @@ def test_validator_rejects_hosted_derivation_for_multimodal_midpoint(tmp_path):
             "UPDATE embedding_storage SET derivation_kind = 'hosted_response', "
             "raw_response_sha256 = ?, response_model = ? "
             "WHERE modality = 'multimodal_article'",
-            ["a" * 64, "jina-v4-observed-deployment-a"],
+            ["a" * 64, "jina-embeddings-v4-deployment-a"],
         )
 
     assert "invalid_vector_provenance" in {
@@ -2156,7 +2309,7 @@ def test_interrupted_long_text_part_resume_does_not_repurchase_committed_part(
         ).fetchall() == [
             (0, "succeeded", 1, True),
             (1, "in_progress", 1, False),
-            (2, "queued", 0, False),
+            (2, "eligible", 0, False),
         ]
 
     resumed_adapter = StablePartVectorAdapter()
@@ -2226,7 +2379,7 @@ def test_failed_long_text_part_is_content_free_and_resumes_remaining_parts(tmp_p
         ).fetchall() == [
             (0, "succeeded", 1, None, None, None),
             (1, "retryable", 1, "rate_limit", 429, 2.0),
-            (2, "queued", 0, None, None, None),
+            (2, "eligible", 0, None, None, None),
         ]
         assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
 
@@ -2419,8 +2572,8 @@ def test_explicit_reprocess_regenerates_terminal_same_input_long_text(tmp_path):
     assert checkpoint_states == [
         [
             (0, "in_progress", 1),
-            (1, "queued", 0),
-            (2, "queued", 0),
+            (1, "eligible", 0),
+            (2, "eligible", 0),
         ]
     ]
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
@@ -3698,6 +3851,43 @@ def test_retryable_header_failure_recovers_without_regenerating_text(tmp_path):
     assert unchanged_adapter.calls == 0
     assert unchanged_adapter.image_calls == 0
 
+
+def test_retryable_admission_clears_failure_metadata_before_attempt(tmp_path):
+    """Break caught: durable queued replay retains retry-only metadata."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated retry admission image")
+
+    class RetryableImageAdapter(RecordingMultimodalAdapter):
+        def embed_image(self, image_base64: str) -> tuple[float, ...]:
+            del image_base64
+            raise JinaHostedAdapterError(
+                "rate_limit",
+                retryable=True,
+                status_code=429,
+                retry_after_seconds=2.0,
+            )
+
+    run_embedding_pipeline(config, RetryableImageAdapter(), limit=1)
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            RecordingMultimodalAdapter(),
+            limit=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_work_admission=lambda: (_ for _ in ()).throw(
+                    SyntheticInterruption()
+                )
+            ),
+        )
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT state, attempt_count, error_code, status_code, "
+            "retry_after_seconds FROM embedding_work_items "
+            "WHERE modality = 'header_image'"
+        ).fetchone() == ("queued", 1, None, None, None)
 
 def test_oversized_header_image_publishes_verified_versioned_rendition(tmp_path):
     """Break caught: oversized source bytes are sent or rendition identity is lost."""
@@ -6588,7 +6778,7 @@ def test_registration_checkpoint_survives_later_registration_interruption(
             ORDER BY article_id, modality
             """
         ).fetchall() == [
-            ("wsj:SYNTHETIC-EMBEDDING", "article_text", "queued"),
+            ("wsj:SYNTHETIC-EMBEDDING", "article_text", "eligible"),
             ("wsj:SYNTHETIC-EMBEDDING", "header_image", "not_applicable"),
         ]
         assert db.execute("SELECT articles FROM runs").fetchall() == [(2,)]
@@ -7345,7 +7535,7 @@ def test_rendition_cleanup_checks_one_candidate_and_preserves_history(tmp_path):
     assert not (namespace / orphan_name).exists()
 
 
-def test_embedding_catalog_has_exact_version_fifteen_provenance_schema(
+def test_embedding_catalog_has_exact_version_sixteen_observed_model_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -7443,7 +7633,33 @@ def test_embedding_catalog_has_exact_version_fifteen_provenance_schema(
     assert view_columns == EXPECTED_EMBEDDING_VIEW_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "15")]
+    assert metadata == [("schema_version", "16")]
+
+
+def test_pipeline_refuses_exact_version_fifteen_catalog_without_migration(
+    tmp_path,
+):
+    """Break caught: observed model identity is silently added to v15 output."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("ALTER TABLE embedding_configurations DROP observed_model")
+        db.execute("UPDATE metadata SET value = '15' WHERE key = 'schema_version'")
+        assert {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info('embedding_configurations')"
+            ).fetchall()
+        }.isdisjoint({"observed_model"})
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
 
 
 def test_pipeline_refuses_exact_version_fourteen_catalog_without_migration(
@@ -7539,6 +7755,7 @@ def test_pipeline_refuses_exact_version_fourteen_catalog_without_migration(
                 not in {
                     "configuration_id",
                     "model",
+                    "observed_model",
                     "client_api_contract_version",
                     "batch_max_response_bytes",
                 }

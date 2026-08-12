@@ -27,7 +27,7 @@ from wsj_embeddings.models import (
 )
 from wsj_embeddings.run_metrics import normalize_safe_usage
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "15"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "16"
 
 _EMBEDDING_CATALOG_TYPES = {
     "article_text_aggregation_provenance",
@@ -58,6 +58,7 @@ _TABLE_COLUMNS = {
     "embedding_configurations": (
         ("configuration_id", "VARCHAR", True, None, True),
         ("model", "VARCHAR", True, None, False),
+        ("observed_model", "VARCHAR", True, None, False),
         ("client_api_contract_version", "VARCHAR", True, None, False),
         ("task", "VARCHAR", True, None, False),
         ("dimensions", "INTEGER", True, None, False),
@@ -747,6 +748,7 @@ class EmbeddingCatalog:
                 CREATE TABLE IF NOT EXISTS embedding_configurations (
                     configuration_id VARCHAR PRIMARY KEY,
                     model VARCHAR NOT NULL,
+                    observed_model VARCHAR NOT NULL,
                     client_api_contract_version VARCHAR NOT NULL,
                     task VARCHAR NOT NULL,
                     dimensions INTEGER NOT NULL,
@@ -1194,7 +1196,8 @@ class EmbeddingCatalog:
         self.connection.execute(
             """
             INSERT INTO embedding_configurations (
-                configuration_id, model, client_api_contract_version,
+                configuration_id, model, observed_model,
+                client_api_contract_version,
                 task, dimensions, output_type, normalization,
                 tokenizer_revision, tokenizer_engine, context_token_limit,
                 context_rules, long_text_aggregation,
@@ -1207,12 +1210,13 @@ class EmbeddingCatalog:
                 multimodal_formula, client_configuration_version
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (configuration_id) DO NOTHING
             """,
             [
                 configuration_identifier,
                 profile.model,
+                profile.observed_model,
                 profile.client_api_contract_version,
                 profile.task,
                 profile.dimensions,
@@ -1289,11 +1293,11 @@ class EmbeddingCatalog:
                     configuration_identifier,
                     source_relative_path,
                     input_sha256,
-                    WorkState.QUEUED.value,
+                    WorkState.ELIGIBLE.value,
                     run_id,
                 ],
             )
-            return WorkState.QUEUED
+            return WorkState.ELIGIBLE
         state = WorkState(str(row[0]))
         prior_input_sha256 = str(row[1])
         if reprocess or prior_input_sha256 != input_sha256:
@@ -1324,7 +1328,7 @@ class EmbeddingCatalog:
                     replacement_source_relative_path=None,
                     replacement_input_sha256=None,
                 )
-            return WorkState.QUEUED
+            return WorkState.ELIGIBLE
         proven_success = state.is_reusable_success and bool(
             self.connection.execute(
                 """
@@ -2057,7 +2061,7 @@ class EmbeddingCatalog:
             [
                 replacement_source_relative_path,
                 replacement_input_sha256,
-                WorkState.QUEUED.value,
+                WorkState.ELIGIBLE.value,
                 run_id,
                 article_id,
                 modality,
@@ -2182,7 +2186,7 @@ class EmbeddingCatalog:
     ) -> None:
         """Checkpoint in-progress before any content read or adapter request."""
 
-        self.connection.execute(
+        row = self.connection.execute(
             """
             UPDATE embedding_work_storage
             SET state = ?, attempt_count = attempt_count + 1,
@@ -2191,6 +2195,8 @@ class EmbeddingCatalog:
                 generation_run_id = NULL,
                 updated_at = current_timestamp
             WHERE article_id = ? AND modality = ? AND configuration_id = ?
+              AND state = ?
+            RETURNING attempt_count
             """,
             [
                 WorkState.IN_PROGRESS.value,
@@ -2198,9 +2204,56 @@ class EmbeddingCatalog:
                 article_id,
                 modality,
                 configuration_identifier,
+                WorkState.QUEUED.value,
             ],
-        )
+        ).fetchone()
+        if row is None:
+            raise ValueError("embedding work is not queued")
         self.increment_run(run_id, "attempted")
+
+    def admit_work(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        modality: str,
+        configuration_identifier: str,
+    ) -> WorkState:
+        """Durably queue one attemptable work item without starting an attempt."""
+
+        row = self.connection.execute(
+            """
+            UPDATE embedding_work_storage
+            SET state = ?, error_code = NULL, status_code = NULL,
+                retry_after_seconds = NULL, last_run_id = ?,
+                updated_at = current_timestamp
+            WHERE article_id = ? AND modality = ? AND configuration_id = ?
+              AND state IN (?, ?, ?)
+            RETURNING state
+            """,
+            [
+                WorkState.QUEUED.value,
+                run_id,
+                article_id,
+                modality,
+                configuration_identifier,
+                WorkState.ELIGIBLE.value,
+                WorkState.INTERRUPTED.value,
+                WorkState.RETRYABLE.value,
+            ],
+        ).fetchone()
+        if row is None:
+            current = self.connection.execute(
+                """
+                SELECT state FROM embedding_work_items
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [article_id, modality, configuration_identifier],
+            ).fetchone()
+            if current is None:
+                raise ValueError("embedding work is not registered")
+            return WorkState(str(current[0]))
+        return WorkState.QUEUED
 
     def register_long_text_parts(
         self,
@@ -2261,11 +2314,11 @@ class EmbeddingCatalog:
                         part.byte_end,
                         part.input_sha256,
                         part.token_count,
-                        WorkState.QUEUED.value,
+                        WorkState.ELIGIBLE.value,
                         run_id,
                     ],
                 )
-                states.append(WorkState.QUEUED)
+                states.append(WorkState.ELIGIBLE)
                 continue
             if tuple(row[:7]) != (
                 part_count,
@@ -2293,7 +2346,7 @@ class EmbeddingCatalog:
                       AND article_input_sha256 = ? AND part_index = ?
                     """,
                     [
-                        WorkState.QUEUED.value,
+                        WorkState.ELIGIBLE.value,
                         run_id,
                         article_id,
                         configuration_identifier,
@@ -2301,7 +2354,7 @@ class EmbeddingCatalog:
                         part.index,
                     ],
                 )
-                states.append(WorkState.QUEUED)
+                states.append(WorkState.ELIGIBLE)
                 continue
             proven_success = (
                 state is WorkState.SUCCEEDED
@@ -2392,6 +2445,7 @@ class EmbeddingCatalog:
                 vector = NULL, updated_at = current_timestamp
             WHERE article_id = ? AND configuration_id = ?
               AND article_input_sha256 = ? AND part_index = ?
+              AND state = ?
             RETURNING attempt_count
             """,
             [
@@ -2401,11 +2455,65 @@ class EmbeddingCatalog:
                 configuration_identifier,
                 article_input_sha256,
                 part_index,
+                WorkState.QUEUED.value,
             ],
         ).fetchone()
         if row is None:
             raise ValueError("long-text part is not registered")
         return int(row[0])
+
+    def admit_long_text_part(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        article_input_sha256: str,
+        part_index: int,
+    ) -> WorkState:
+        """Durably queue one attemptable long-text part."""
+
+        row = self.connection.execute(
+            """
+            UPDATE long_text_parts
+            SET state = ?, error_code = NULL, status_code = NULL,
+                retry_after_seconds = NULL, last_run_id = ?,
+                updated_at = current_timestamp
+            WHERE article_id = ? AND configuration_id = ?
+              AND article_input_sha256 = ? AND part_index = ?
+              AND state IN (?, ?, ?)
+            RETURNING state
+            """,
+            [
+                WorkState.QUEUED.value,
+                run_id,
+                article_id,
+                configuration_identifier,
+                article_input_sha256,
+                part_index,
+                WorkState.ELIGIBLE.value,
+                WorkState.INTERRUPTED.value,
+                WorkState.RETRYABLE.value,
+            ],
+        ).fetchone()
+        if row is None:
+            current = self.connection.execute(
+                """
+                SELECT state FROM long_text_parts
+                WHERE article_id = ? AND configuration_id = ?
+                  AND article_input_sha256 = ? AND part_index = ?
+                """,
+                [
+                    article_id,
+                    configuration_identifier,
+                    article_input_sha256,
+                    part_index,
+                ],
+            ).fetchone()
+            if current is None:
+                raise ValueError("long-text part is not registered")
+            return WorkState(str(current[0]))
+        return WorkState.QUEUED
 
     def record_long_text_part_failure(
         self,

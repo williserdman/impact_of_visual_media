@@ -27,6 +27,7 @@ class VectorDerivationKind(StrEnum):
 class WorkState(StrEnum):
     """Durable lifecycle vocabulary for one modality/configuration item."""
 
+    ELIGIBLE = "eligible"
     QUEUED = "queued"
     IN_PROGRESS = "in_progress"
     SUCCEEDED = "succeeded"
@@ -35,6 +36,7 @@ class WorkState(StrEnum):
     INTERRUPTED = "interrupted"
     NOT_APPLICABLE = "not_applicable"
     STALE_INPUT = "stale_input"
+    STALE_CONFIGURATION = "stale_configuration"
 
     @property
     def is_failure(self) -> bool:
@@ -71,6 +73,7 @@ class EmbeddingProfile:
     model: str
     task: str
     dimensions: int
+    observed_model: str | None = None
     output_type: str = "float"
     normalization: str = "l2-client-float32-v1"
     client_api_contract_version: str = "openapi-2026.07.27.1603"

@@ -15,6 +15,7 @@ from wsj_embeddings.adapters import (
     JinaEmbeddingAdapter,
     JinaHostedAdapterError,
     JinaTransport,
+    is_safe_jina_model_label,
 )
 from wsj_embeddings.catalog import EmbeddingCatalogError, configuration_id
 from wsj_embeddings.config import EmbeddingConfigError, EmbeddingPipelineConfig
@@ -80,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     scope.add_argument("--full", action="store_true")
     run.add_argument("--reprocess", action="store_true")
     run.add_argument("--authorize-hosted-processing", action="store_true")
+    run.add_argument("--observed-model")
     return parser
 
 
@@ -183,11 +185,18 @@ def main(
             )
             if not config.hosted_processing_authorized:
                 raise HostedProcessingAuthorizationError
-            adapter = (
-                JinaEmbeddingAdapter(environment=environment, transport=transport)
-                if adapter_factory is None
-                else adapter_factory()
-            )
+            if adapter_factory is None:
+                if not is_safe_jina_model_label(args.observed_model):
+                    raise JinaHostedAdapterError(
+                        "pilot_observation_required", retryable=False
+                    )
+                adapter = JinaEmbeddingAdapter(
+                    environment=environment,
+                    transport=transport,
+                    observed_model=args.observed_model,
+                )
+            else:
+                adapter = adapter_factory()
             result = run_embedding_pipeline(
                 config,
                 adapter,

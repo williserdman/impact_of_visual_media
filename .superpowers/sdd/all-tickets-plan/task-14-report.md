@@ -299,3 +299,32 @@ the documented command sets, exactly-one scope, and hosted authorization.
 Current-document relative links resolved, whitespace and tracked-artifact
 hygiene checks passed, and no full suite was rerun. The earlier first and final
 full-suite results above remain the complete full-suite chronology.
+
+## Final domain-model correction
+
+Embedding schema version 16 adds the exact pilot-observed hosted model to the
+immutable configuration identity. Production Jina runs require a safe
+`--observed-model` before output mutation, and hosted generations publish only
+when their returned model exactly matches it. A changed observation creates a
+separate configuration while earlier vectors remain explicitly queryable.
+
+The complete work vocabulary now distinguishes durable `eligible` discovery
+from `queued` attempt admission and recognizes generation-free
+`stale_configuration`. Fresh and invalidated parent/part work begins eligible;
+only an explicit admission transaction queues eligible, interrupted, or
+retryable work, and attempt checkpoints require queued state. The stale
+configuration disposition is reserved for explicit invalid-identity
+reconciliation and is never inferred from valid configuration coexistence.
+
+Generated fixtures cover the pre-mutation CLI gate, adapter binding, response
+model drift, configuration coexistence, exact v16 schema/v15 refusal, durable
+eligible/queued crash points and replay, long-part admission, and validator
+tampering. No live API call, credential, licensed archive, or real full run was
+used.
+
+Focused evidence reported six profile/drift/validator cases, five durable
+work/long-part replay cases, three exact schema/refusal cases, four CLI gate
+cases in an isolated project environment, four hosted provenance/recovery
+cases, and all 77 adapter/pilot cases passing. Ruff passed for the complete
+embedding package and changed tests. Both generated smokes returned
+`validation_ok: true`, and live `run --help` exposed `--observed-model`.
