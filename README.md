@@ -385,11 +385,11 @@ references only; the pipeline never downloads them.
 
 ## Text, header-image, and multimodal embedding catalog contract
 
-The downstream catalog is a separate schema-version-15 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-16 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted production CLI.
-Versions 1 through 14 are refused without migration; move reproducible derived
+Versions 1 through 15 are refused without migration; move reproducible derived
 output aside or choose a fresh embedding output root.
 
 The catalog has exactly thirteen base tables, two canonical views, and no

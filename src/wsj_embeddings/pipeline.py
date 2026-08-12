@@ -1678,7 +1678,14 @@ def _run_rate_aware_work(
         **execution_kwargs,
     )
     if configuration_drift_detected:
-        raise JinaHostedAdapterError("configuration_drift", retryable=False)
+        raise BatchExecutionFatal(
+            JinaHostedAdapterError("configuration_drift", retryable=False),
+            requests=metrics.requests,
+            retries=metrics.retries,
+            usage=metrics.usage,
+            throttles=metrics.throttles,
+            elapsed_seconds=metrics.elapsed_seconds,
+        ) from None
     for article_id in failed_long_articles:
         with catalog.transaction():
             row = catalog.connection.execute(

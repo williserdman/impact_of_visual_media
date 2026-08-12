@@ -669,6 +669,13 @@ class HostedProvenanceLongTextAdapter(
     )
 
 
+class DriftedHostedProvenanceBatchAdapter(HostedProvenanceBatchAdapter):
+    profile = replace(
+        HostedProvenanceBatchAdapter.profile,
+        observed_model="jina-embeddings-v4-expected",
+    )
+
+
 class ScenarioImageCodec:
     """Offline image-policy seam with literal, hand-checkable fixture outcomes."""
 
@@ -916,27 +923,101 @@ def test_observed_model_drift_creates_coexisting_queryable_configuration(tmp_pat
     assert validate_embedding_outputs(config, configuration_id=second_id).ok
 
 
-def test_hosted_response_model_drift_terminalizes_without_publication(tmp_path):
-    """Break caught: a changed deployment is stored under an older config ID."""
+def test_limited_hosted_response_model_drift_preserves_completed_telemetry(tmp_path):
+    """Break caught: post-response drift erases completed hosted observations."""
 
     config = write_generated_preprocessing_fixture(tmp_path)
-
-    class DriftedAdapter(HostedProvenanceBatchAdapter):
-        profile = replace(
-            HostedProvenanceBatchAdapter.profile,
-            observed_model="jina-embeddings-v4-expected",
+    adapter = DriftedHostedProvenanceBatchAdapter()
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        run_embedding_pipeline(
+            config,
+            adapter,
+            limit=1,
+            monotonic=iter((10.0, 14.0)).__next__,
         )
 
-    with pytest.raises(JinaHostedAdapterError) as raised:
-        run_embedding_pipeline(config, DriftedAdapter(), limit=1)
-
     assert raised.value.code == "configuration_drift"
+    assert str(raised.value) == (
+        "hosted Jina embedding request failed: configuration_drift"
+    )
+    assert len(adapter.calls) == 1
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
         assert db.execute(
             "SELECT state, error_code FROM embedding_work_items "
             "WHERE modality = 'article_text'"
         ).fetchone() == ("terminal", "configuration_drift")
+        assert db.execute(
+            """
+            SELECT status, hosted_requests, hosted_retries, usage_json, throttles,
+                   elapsed_seconds, finished_at IS NOT NULL
+            FROM runs
+            """
+        ).fetchone() == (
+            "failed",
+            1,
+            0,
+            '{"prompt_tokens":1,"total_tokens":1}',
+            0,
+            4.0,
+            True,
+        )
+
+
+def test_full_page_hosted_model_drift_stops_later_pages_and_keeps_telemetry(
+    tmp_path,
+):
+    """Break caught: a drifted page loses metrics and processing continues."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+
+    adapter = DriftedHostedProvenanceBatchAdapter()
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        run_embedding_pipeline(
+            config,
+            adapter,
+            full=True,
+            page_size=1,
+            monotonic=iter((0.0, 10.0, 16.0)).__next__,
+        )
+
+    assert raised.value.code == "configuration_drift"
+    assert str(raised.value) == (
+        "hosted Jina embedding request failed: configuration_drift"
+    )
+    assert [[item.value for item in call] for call in adapter.calls] == [["#\n"]]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+        assert db.execute(
+            """
+            SELECT article_id, state, error_code
+            FROM embedding_work_items
+            WHERE modality = 'article_text'
+            ORDER BY article_id
+            """
+        ).fetchall() == [
+            ("wsj:SYNTHETIC-EMBEDDING", "terminal", "configuration_drift")
+        ]
+        assert db.execute(
+            """
+            SELECT status, hosted_requests, hosted_retries, usage_json, throttles,
+                   elapsed_seconds, finished_at IS NOT NULL
+            FROM runs
+            """
+        ).fetchone() == (
+            "failed",
+            1,
+            0,
+            '{"prompt_tokens":1,"total_tokens":1}',
+            0,
+            6.0,
+            True,
+        )
 
 
 @pytest.mark.parametrize(
