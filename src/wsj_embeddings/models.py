@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
 
@@ -75,6 +75,13 @@ class EmbeddingProfile:
     context_rules: str = "markdown-block-greedy-no-overlap-truncate-false-v1"
     long_text_aggregation: str = "l2-token-count-weighted-mean-float32-v1"
     long_text_part_attempt_limit: int = 3
+    batch_max_items: int = 16
+    batch_max_estimated_tokens: int = 300_000
+    batch_max_encoded_bytes: int = 8_000_000
+    batch_max_concurrency: int = 2
+    batch_max_attempts: int = 3
+    batch_initial_backoff_seconds: float = 1.0
+    batch_max_backoff_seconds: float = 30.0
     image_input_rules: str = (
         "static-jpeg-png-webp-max5000000b-max20000000px-decode-max40000000px-"
         "exact-source-v1"
@@ -84,7 +91,7 @@ class EmbeddingProfile:
         "if-over20000000px-optimize0-progressive0-metadata-none-v1"
     )
     multimodal_formula: str = "l2-normalize-0.5-text-0.5-image-v1"
-    client_configuration_version: str = "wsj-embeddings-config-v3"
+    client_configuration_version: str = "wsj-embeddings-config-v4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +108,11 @@ class EmbeddingRunResult:
     interrupted: int = 0
     header_absent: int = 0
     header_failed: int = 0
+    hosted_requests: int = 0
+    retries: int = 0
+    usage: dict[str, int | float] = field(default_factory=dict)
+    throttles: int = 0
+    elapsed_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

@@ -213,7 +213,11 @@ def _validate_configurations(
                task, dimensions, output_type, normalization,
                tokenizer_revision, tokenizer_engine, context_token_limit,
                context_rules, long_text_aggregation,
-               long_text_part_attempt_limit, image_input_rules,
+               long_text_part_attempt_limit, batch_max_items,
+               batch_max_estimated_tokens, batch_max_encoded_bytes,
+               batch_max_concurrency, batch_max_attempts,
+               batch_initial_backoff_seconds, batch_max_backoff_seconds,
+               image_input_rules,
                image_transform, multimodal_formula,
                client_configuration_version
         FROM embedding_configurations
@@ -235,10 +239,17 @@ def _validate_configurations(
             context_rules=row[11],
             long_text_aggregation=row[12],
             long_text_part_attempt_limit=row[13],
-            image_input_rules=row[14],
-            image_transform=row[15],
-            multimodal_formula=row[16],
-            client_configuration_version=row[17],
+            batch_max_items=row[14],
+            batch_max_estimated_tokens=row[15],
+            batch_max_encoded_bytes=row[16],
+            batch_max_concurrency=row[17],
+            batch_max_attempts=row[18],
+            batch_initial_backoff_seconds=row[19],
+            batch_max_backoff_seconds=row[20],
+            image_input_rules=row[21],
+            image_transform=row[22],
+            multimodal_formula=row[23],
+            client_configuration_version=row[24],
         )
         if row[0] != profile_configuration_id(profile):
             invalid = True

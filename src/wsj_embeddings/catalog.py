@@ -24,7 +24,7 @@ from wsj_embeddings.models import (
     WorkState,
 )
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "11"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "12"
 
 _EMBEDDING_CATALOG_TABLES = {
     "article_text_aggregation_provenance",
@@ -59,6 +59,13 @@ _TABLE_COLUMNS = {
         ("context_rules", "VARCHAR", True, None, False),
         ("long_text_aggregation", "VARCHAR", True, None, False),
         ("long_text_part_attempt_limit", "INTEGER", True, None, False),
+        ("batch_max_items", "INTEGER", True, None, False),
+        ("batch_max_estimated_tokens", "INTEGER", True, None, False),
+        ("batch_max_encoded_bytes", "BIGINT", True, None, False),
+        ("batch_max_concurrency", "INTEGER", True, None, False),
+        ("batch_max_attempts", "INTEGER", True, None, False),
+        ("batch_initial_backoff_seconds", "DOUBLE", True, None, False),
+        ("batch_max_backoff_seconds", "DOUBLE", True, None, False),
         ("image_input_rules", "VARCHAR", True, None, False),
         ("image_transform", "VARCHAR", True, None, False),
         ("multimodal_formula", "VARCHAR", True, None, False),
@@ -77,6 +84,11 @@ _TABLE_COLUMNS = {
         ("interrupted", "INTEGER", True, None, False),
         ("header_absent", "INTEGER", True, None, False),
         ("header_failed", "INTEGER", True, None, False),
+        ("hosted_requests", "INTEGER", True, None, False),
+        ("hosted_retries", "INTEGER", True, None, False),
+        ("usage_json", "VARCHAR", True, None, False),
+        ("throttles", "INTEGER", True, None, False),
+        ("elapsed_seconds", "DOUBLE", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "embedding_work_items": (
@@ -658,6 +670,13 @@ class EmbeddingCatalog:
                     context_rules VARCHAR NOT NULL,
                     long_text_aggregation VARCHAR NOT NULL,
                     long_text_part_attempt_limit INTEGER NOT NULL,
+                    batch_max_items INTEGER NOT NULL,
+                    batch_max_estimated_tokens INTEGER NOT NULL,
+                    batch_max_encoded_bytes BIGINT NOT NULL,
+                    batch_max_concurrency INTEGER NOT NULL,
+                    batch_max_attempts INTEGER NOT NULL,
+                    batch_initial_backoff_seconds DOUBLE NOT NULL,
+                    batch_max_backoff_seconds DOUBLE NOT NULL,
                     image_input_rules VARCHAR NOT NULL,
                     image_transform VARCHAR NOT NULL,
                     multimodal_formula VARCHAR NOT NULL,
@@ -680,6 +699,11 @@ class EmbeddingCatalog:
                     interrupted INTEGER NOT NULL,
                     header_absent INTEGER NOT NULL,
                     header_failed INTEGER NOT NULL,
+                    hosted_requests INTEGER NOT NULL,
+                    hosted_retries INTEGER NOT NULL,
+                    usage_json VARCHAR NOT NULL,
+                    throttles INTEGER NOT NULL,
+                    elapsed_seconds DOUBLE NOT NULL,
                     started_at TIMESTAMP WITH TIME ZONE NOT NULL
                 )
                 """
@@ -967,10 +991,15 @@ class EmbeddingCatalog:
                 task, dimensions, output_type, normalization,
                 tokenizer_revision, tokenizer_engine, context_token_limit,
                 context_rules, long_text_aggregation,
-                long_text_part_attempt_limit, image_input_rules, image_transform,
+                long_text_part_attempt_limit, batch_max_items,
+                batch_max_estimated_tokens, batch_max_encoded_bytes,
+                batch_max_concurrency, batch_max_attempts,
+                batch_initial_backoff_seconds, batch_max_backoff_seconds,
+                image_input_rules, image_transform,
                 multimodal_formula, client_configuration_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (configuration_id) DO NOTHING
             """,
             [
@@ -988,6 +1017,13 @@ class EmbeddingCatalog:
                 profile.context_rules,
                 profile.long_text_aggregation,
                 profile.long_text_part_attempt_limit,
+                profile.batch_max_items,
+                profile.batch_max_estimated_tokens,
+                profile.batch_max_encoded_bytes,
+                profile.batch_max_concurrency,
+                profile.batch_max_attempts,
+                profile.batch_initial_backoff_seconds,
+                profile.batch_max_backoff_seconds,
                 profile.image_input_rules,
                 profile.image_transform,
                 profile.multimodal_formula,
@@ -999,9 +1035,11 @@ class EmbeddingCatalog:
             INSERT INTO runs (
                 run_id, configuration_id, articles, embeddings, reused,
                 attempted, succeeded, retryable, terminal, interrupted,
-                header_absent, header_failed, started_at
+                header_absent, header_failed, hosted_requests, hosted_retries,
+                usage_json, throttles, elapsed_seconds, started_at
             )
-            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, current_timestamp)
+            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '{}', 0, 0.0,
+                    current_timestamp)
             """,
             [run_id, configuration_identifier, article_count],
         )
@@ -2353,20 +2391,57 @@ class EmbeddingCatalog:
             [run_id],
         )
 
+    def finish_run_metrics(
+        self,
+        run_id: str,
+        *,
+        hosted_requests: int,
+        hosted_retries: int,
+        usage: dict[str, int | float],
+        throttles: int,
+        elapsed_seconds: float,
+    ) -> None:
+        """Persist safe aggregate hosted observations for one returned summary."""
+
+        usage_json = json.dumps(usage, sort_keys=True, separators=(",", ":"))
+        self.connection.execute(
+            """
+            UPDATE runs
+            SET hosted_requests = ?, hosted_retries = ?, usage_json = ?,
+                throttles = ?, elapsed_seconds = ?
+            WHERE run_id = ?
+            """,
+            [
+                hosted_requests,
+                hosted_retries,
+                usage_json,
+                throttles,
+                elapsed_seconds,
+                run_id,
+            ],
+        )
+
     def run_result(self, run_id: str) -> EmbeddingRunResult:
         """Read one completed or interrupted run's stable counters."""
 
         row = self.connection.execute(
             """
             SELECT articles, embeddings, reused, attempted, succeeded,
-                   retryable, terminal, interrupted, header_absent, header_failed
+                   retryable, terminal, interrupted, header_absent, header_failed,
+                   hosted_requests, hosted_retries, usage_json, throttles,
+                   elapsed_seconds
             FROM runs
             WHERE run_id = ?
             """,
             [run_id],
         ).fetchone()
         assert row is not None
-        return EmbeddingRunResult(*(int(value) for value in row))
+        return EmbeddingRunResult(
+            *(int(value) for value in row[:12]),
+            usage=json.loads(row[12]),
+            throttles=int(row[13]),
+            elapsed_seconds=float(row[14]),
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[None]:

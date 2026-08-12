@@ -35,7 +35,14 @@ from wsj_embeddings import (
     run_embedding_pipeline,
     validate_embedding_outputs,
 )
-from wsj_embeddings.adapters import JinaEmbeddingAdapter, JinaHostedAdapterError
+from wsj_embeddings.adapters import (
+    JinaBatchItemOutcome,
+    JinaEmbeddedVector,
+    JinaEmbeddingAdapter,
+    JinaEmbeddingBatchResponse,
+    JinaHostedAdapterError,
+    JinaResponseMetadata,
+)
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingConfigError
 from wsj_embeddings.image_rendition import (
@@ -71,6 +78,13 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("context_rules", "VARCHAR", True, None, False),
         ("long_text_aggregation", "VARCHAR", True, None, False),
         ("long_text_part_attempt_limit", "INTEGER", True, None, False),
+        ("batch_max_items", "INTEGER", True, None, False),
+        ("batch_max_estimated_tokens", "INTEGER", True, None, False),
+        ("batch_max_encoded_bytes", "BIGINT", True, None, False),
+        ("batch_max_concurrency", "INTEGER", True, None, False),
+        ("batch_max_attempts", "INTEGER", True, None, False),
+        ("batch_initial_backoff_seconds", "DOUBLE", True, None, False),
+        ("batch_max_backoff_seconds", "DOUBLE", True, None, False),
         ("image_input_rules", "VARCHAR", True, None, False),
         ("image_transform", "VARCHAR", True, None, False),
         ("multimodal_formula", "VARCHAR", True, None, False),
@@ -89,6 +103,11 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("interrupted", "INTEGER", True, None, False),
         ("header_absent", "INTEGER", True, None, False),
         ("header_failed", "INTEGER", True, None, False),
+        ("hosted_requests", "INTEGER", True, None, False),
+        ("hosted_retries", "INTEGER", True, None, False),
+        ("usage_json", "VARCHAR", True, None, False),
+        ("throttles", "INTEGER", True, None, False),
+        ("elapsed_seconds", "DOUBLE", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
     "embedding_work_items": (
@@ -471,6 +490,75 @@ class RecordingMultimodalAdapter(RecordingAdapter):
         return super().embed_image(image_base64)
 
 
+class RecordingBatchAdapter(FakeEmbeddingAdapter):
+    """Generated mixed-input fake exercising the production batching seam."""
+
+    rate_aware_batching = True
+    profile = replace(
+        FakeEmbeddingAdapter.profile,
+        batch_max_items=8,
+        batch_max_estimated_tokens=1_000,
+        batch_max_encoded_bytes=1_000,
+        batch_max_concurrency=1,
+        batch_max_attempts=1,
+        batch_initial_backoff_seconds=0.0,
+        batch_max_backoff_seconds=0.0,
+        client_configuration_version="synthetic-rate-aware-batching-v1",
+    )
+
+    def __init__(self, scenarios=None) -> None:
+        self.scenarios = list(scenarios or ())
+        self.calls = []
+
+    def embed_batch(self, inputs, *, limits):
+        del limits
+        inputs = tuple(inputs)
+        self.calls.append(inputs)
+        scenario = self.scenarios.pop(0) if self.scenarios else {}
+        if isinstance(scenario, BaseException):
+            raise scenario
+        items = []
+        for index, item in enumerate(inputs):
+            error = scenario.get(index)
+            if error is not None:
+                items.append(
+                    JinaBatchItemOutcome(
+                        index,
+                        None,
+                        error,
+                        retryable=error == "missing_response_item",
+                    )
+                )
+                continue
+            values = (
+                (1.0, *(0.0 for _ in range(2047)))
+                if item.kind == "text"
+                else (0.0, 1.0, *(0.0 for _ in range(2046)))
+            )
+            items.append(
+                JinaBatchItemOutcome(
+                    index,
+                    JinaEmbeddedVector(index, values, values, "a" * 64, "b" * 64),
+                    None,
+                )
+            )
+        return JinaEmbeddingBatchResponse(
+            tuple(items),
+            {"prompt_tokens": len(inputs), "total_tokens": len(inputs)},
+            JinaResponseMetadata(200, self.profile.model, {}),
+        )
+
+
+class LongTextRecordingBatchAdapter(RecordingBatchAdapter):
+    profile = replace(
+        RecordingBatchAdapter.profile,
+        tokenizer_revision="synthetic-batched-character-tokenizer-v1",
+        tokenizer_engine="synthetic-codepoint-tokenizer-v1",
+        context_token_limit=8,
+        client_configuration_version="synthetic-rate-aware-long-batching-v1",
+    )
+
+
 class ScenarioImageCodec:
     """Offline image-policy seam with literal, hand-checkable fixture outcomes."""
 
@@ -615,6 +703,13 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
         "context_rules": "changed-context-rules",
         "long_text_aggregation": "changed-aggregation",
         "long_text_part_attempt_limit": 4,
+        "batch_max_items": 15,
+        "batch_max_estimated_tokens": 15_000,
+        "batch_max_encoded_bytes": 15_000_000,
+        "batch_max_concurrency": 3,
+        "batch_max_attempts": 4,
+        "batch_initial_backoff_seconds": 2.0,
+        "batch_max_backoff_seconds": 60.0,
         "image_input_rules": "changed-image-rules",
         "image_transform": "changed-image-transform",
         "multimodal_formula": "changed-multimodal-formula",
@@ -755,6 +850,300 @@ def test_pipeline_publishes_one_normalized_article_text_embedding(tmp_path):
     assert vector_type == "FLOAT[2048]"
     assert row[7] == (1.0,) + (0.0,) * 2047
     assert snapshot_fixture_inputs(config) == before
+
+
+def test_rate_aware_coordinator_batches_mixed_items_and_summarizes_hosted_usage(
+    tmp_path,
+):
+    """Break caught: production coordination falls back to one call per modality."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated mixed batch image")
+    adapter = RecordingBatchAdapter()
+
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        batch_sleep=lambda _seconds: None,
+        batch_jitter=lambda _attempt: 0.0,
+        monotonic=iter((10.0, 12.5)).__next__,
+    )
+
+    assert [[item.kind for item in call] for call in adapter.calls] == [
+        ["text", "image"]
+    ]
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=3,
+        attempted=2,
+        succeeded=3,
+        hosted_requests=1,
+        usage={"prompt_tokens": 2, "total_tokens": 2},
+        elapsed_seconds=2.5,
+    )
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [
+            ("article_text",),
+            ("header_image",),
+            ("multimodal_article",),
+        ]
+
+
+def test_partial_batch_success_commits_independently_and_resumes_only_failure(
+    tmp_path,
+):
+    """Break caught: a missing response index rolls back or repurchases its sibling."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+    first_adapter = RecordingBatchAdapter([{1: "missing_response_item"}])
+
+    first = run_embedding_pipeline(
+        config,
+        first_adapter,
+        limit=2,
+        batch_sleep=lambda _seconds: None,
+        batch_jitter=lambda _attempt: 0.0,
+        monotonic=iter((1.0, 2.0)).__next__,
+    )
+
+    assert [len(call) for call in first_adapter.calls] == [2]
+    assert first.embeddings == 1
+    assert first.succeeded == 1
+    assert first.retryable == 1
+    assert first.retries == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT article_id, state FROM embedding_work_items
+            WHERE modality = 'article_text' ORDER BY article_id
+            """
+        ).fetchall() == [
+            ("wsj:SYNTHETIC-EMBEDDING", "succeeded"),
+            ("wsj:ZZZ-SYNTHETIC-EMBEDDING", "retryable"),
+        ]
+
+    resumed_adapter = RecordingBatchAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        limit=2,
+        batch_sleep=lambda _seconds: None,
+        batch_jitter=lambda _attempt: 0.0,
+        monotonic=iter((3.0, 4.0)).__next__,
+    )
+
+    assert [[item.value for item in call] for call in resumed_adapter.calls] == [
+        ["# Second generated article\n"]
+    ]
+    assert resumed.reused == 1
+    assert resumed.succeeded == 1
+    assert resumed.hosted_requests == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT count(*) FROM embeddings WHERE modality = 'article_text'"
+        ).fetchone() == (2,)
+
+
+def test_malformed_mixed_item_does_not_erase_valid_sibling(tmp_path):
+    """Break caught: a malformed image vector prevents valid text publication."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated malformed image response")
+    adapter = RecordingBatchAdapter([{1: "invalid_response"}])
+
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        monotonic=iter((1.0, 2.0)).__next__,
+    )
+
+    assert result.embeddings == 1
+    assert result.succeeded == 1
+    assert result.terminal == 1
+    assert result.header_failed == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT modality FROM embeddings"
+        ).fetchall() == [("article_text",)]
+        assert db.execute(
+            """
+            SELECT state, error_code FROM embedding_work_items
+            WHERE modality = 'header_image'
+            """
+        ).fetchone() == ("terminal", "invalid_response")
+
+
+def test_batched_long_part_resume_keeps_sibling_parts_and_header_success(tmp_path):
+    """Break caught: partial long-text response discards parts or image checkpoint."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    article_input_sha256 = replace_generated_embedding_markdown(
+        config, "AAAA\n\nBBBB\n\nCCCC"
+    )
+    attach_generated_header_image(config, b"generated batched long image")
+    first_adapter = LongTextRecordingBatchAdapter(
+        [{1: "missing_response_item"}]
+    )
+
+    first = run_embedding_pipeline(
+        config,
+        first_adapter,
+        limit=1,
+        batch_sleep=lambda _seconds: None,
+        monotonic=iter((1.0, 2.0)).__next__,
+    )
+
+    assert [[item.kind for item in call] for call in first_adapter.calls] == [
+        ["text", "text", "text", "image"]
+    ]
+    assert first.embeddings == 1
+    assert first.retryable == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT part_index, state, attempt_count FROM long_text_parts
+            WHERE article_input_sha256 = ? ORDER BY part_index
+            """,
+            [article_input_sha256],
+        ).fetchall() == [
+            (0, "succeeded", 1),
+            (1, "retryable", 1),
+            (2, "succeeded", 1),
+        ]
+        assert db.execute(
+            "SELECT modality FROM embeddings"
+        ).fetchall() == [("header_image",)]
+
+    resumed_adapter = LongTextRecordingBatchAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        limit=1,
+        monotonic=iter((3.0, 4.0)).__next__,
+    )
+
+    assert [[item.value for item in call] for call in resumed_adapter.calls] == [
+        ["BBBB\n\n"]
+    ]
+    assert resumed.reused == 1
+    assert resumed.succeeded == 2
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [
+            ("article_text",),
+            ("header_image",),
+            ("multimodal_article",),
+        ]
+        assert db.execute(
+            """
+            SELECT part_index, state, attempt_count FROM long_text_parts
+            WHERE article_input_sha256 = ? ORDER BY part_index
+            """,
+            [article_input_sha256],
+        ).fetchall() == [
+            (0, "succeeded", 1),
+            (1, "succeeded", 2),
+            (2, "succeeded", 1),
+        ]
+
+
+def test_rate_limited_batch_retries_in_run_and_reports_throttle(tmp_path):
+    """Break caught: request-wide 429 escapes summary or loses mixed item work."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated throttled image")
+    retry = JinaHostedAdapterError(
+        "rate_limit",
+        retryable=True,
+        status_code=429,
+        retry_after_seconds=2.5,
+        rate_limit_headers={"x-ratelimit-remaining-requests": 0.0},
+    )
+
+    class RetryingBatchAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_attempts=2,
+            batch_initial_backoff_seconds=1.0,
+            batch_max_backoff_seconds=8.0,
+            client_configuration_version="synthetic-rate-retry-v1",
+        )
+
+    adapter = RetryingBatchAdapter([retry, {}])
+    sleeps = []
+
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        batch_sleep=sleeps.append,
+        batch_jitter=lambda _attempt: 0.0,
+        monotonic=iter((1.0, 4.0)).__next__,
+    )
+
+    assert [len(call) for call in adapter.calls] == [2, 2]
+    assert sleeps == [2.5]
+    assert result.embeddings == 3
+    assert result.retryable == 0
+    assert result.hosted_requests == 2
+    assert result.retries == 2
+    assert result.throttles == 1
+
+
+@pytest.mark.parametrize("code", ("authentication", "authorization"))
+def test_batch_auth_failure_stops_run_scope_without_transient_retry(tmp_path, code):
+    """Break caught: credential or permission failure enters item retry policy."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    failure = JinaHostedAdapterError(
+        code,
+        retryable=False,
+        status_code=401 if code == "authentication" else 403,
+    )
+    adapter = RecordingBatchAdapter([failure])
+
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        run_embedding_pipeline(
+            config,
+            adapter,
+            limit=1,
+            batch_sleep=lambda _seconds: None,
+        )
+
+    assert raised.value.code == code
+    assert len(adapter.calls) == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT state, attempt_count FROM embedding_work_items"
+        ).fetchall() == [("in_progress", 1), ("not_applicable", 0)]
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+
+
+def test_invalid_batch_profile_stops_before_run_or_output_mutation(tmp_path):
+    """Break caught: invalid configured concurrency reaches state or transport."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class InvalidBatchAdapter(RecordingBatchAdapter):
+        profile = replace(RecordingBatchAdapter.profile, batch_max_concurrency=0)
+
+    adapter = InvalidBatchAdapter()
+
+    with pytest.raises(ValueError, match="batch profile is invalid"):
+        run_embedding_pipeline(config, adapter, limit=1)
+
+    assert adapter.calls == []
+    assert not config.embedding_output_root.exists()
 
 
 def test_over_context_markdown_packs_complete_blocks_and_aggregates_every_part(
@@ -4961,7 +5350,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_eleven_image_frame_schema(
+def test_embedding_catalog_has_exact_version_twelve_batching_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -5045,7 +5434,7 @@ def test_embedding_catalog_has_exact_version_eleven_image_frame_schema(
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "11")]
+    assert metadata == [("schema_version", "12")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -5445,6 +5834,56 @@ def test_pipeline_refuses_exact_version_ten_catalog_without_migration(tmp_path):
                 "PRAGMA table_info('image_input_provenance')"
             ).fetchall()
         }.isdisjoint({"source_frames", "embedded_frames"})
+
+
+def test_pipeline_refuses_exact_version_eleven_catalog_without_migration(tmp_path):
+    """Break caught: batching policy and run observations are added in place."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    configuration_columns = {
+        "batch_max_items",
+        "batch_max_estimated_tokens",
+        "batch_max_encoded_bytes",
+        "batch_max_concurrency",
+        "batch_max_attempts",
+        "batch_initial_backoff_seconds",
+        "batch_max_backoff_seconds",
+    }
+    run_columns = {
+        "hosted_requests",
+        "hosted_retries",
+        "usage_json",
+        "throttles",
+        "elapsed_seconds",
+    }
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        for column in configuration_columns:
+            db.execute(f"ALTER TABLE embedding_configurations DROP COLUMN {column}")
+        for column in run_columns:
+            db.execute(f"ALTER TABLE runs DROP COLUMN {column}")
+        db.execute("UPDATE metadata SET value = '11' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("11",)
+        assert {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info('embedding_configurations')"
+            ).fetchall()
+        }.isdisjoint(configuration_columns)
+        assert {
+            row[1] for row in db.execute("PRAGMA table_info('runs')").fetchall()
+        }.isdisjoint(run_columns)
 
 
 def test_pipeline_refuses_malformed_current_schema_with_version_eight_label(

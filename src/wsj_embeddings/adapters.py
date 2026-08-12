@@ -74,14 +74,28 @@ class JinaEmbeddingInput:
 
     kind: str
     value: str
+    token_estimate: int
 
     @classmethod
-    def text(cls, value: str) -> JinaEmbeddingInput:
-        return cls("text", value)
+    def text(
+        cls, value: str, *, estimated_tokens: int | None = None
+    ) -> JinaEmbeddingInput:
+        estimate = len(value) if estimated_tokens is None else estimated_tokens
+        if isinstance(estimate, bool) or not isinstance(estimate, int) or estimate < 0:
+            raise ValueError("estimated tokens must be a nonnegative integer")
+        return cls("text", value, estimate)
 
     @classmethod
-    def image_base64(cls, value: str) -> JinaEmbeddingInput:
-        return cls("image", value)
+    def image_base64(
+        cls, value: str, *, estimated_tokens: int = 0
+    ) -> JinaEmbeddingInput:
+        if (
+            isinstance(estimated_tokens, bool)
+            or not isinstance(estimated_tokens, int)
+            or estimated_tokens < 0
+        ):
+            raise ValueError("estimated tokens must be a nonnegative integer")
+        return cls("image", value, estimated_tokens)
 
     def as_request_item(self) -> dict[str, str]:
         if self.kind == "text":
@@ -99,6 +113,38 @@ class JinaEmbeddingInput:
                 ) from None
             return {"image": self.value}
         raise JinaHostedAdapterError("deterministic_request", retryable=False)
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Return a conservative content-free text budget estimate."""
+
+        return self.token_estimate
+
+    @property
+    def encoded_bytes(self) -> int:
+        """Return UTF-8 bytes contributed by this encoded request value."""
+
+        return len(self.value.encode("utf-8"))
+
+
+@dataclass(frozen=True, slots=True)
+class JinaBatchLimits:
+    """Independent hard ceilings for one synchronous hosted request."""
+
+    max_items: int
+    max_estimated_tokens: int
+    max_encoded_bytes: int
+
+    def __post_init__(self) -> None:
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (
+                self.max_items,
+                self.max_estimated_tokens,
+                self.max_encoded_bytes,
+            )
+        ):
+            raise ValueError("batch limits must be positive integers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +230,25 @@ class JinaEmbeddingResponse:
     response_metadata: JinaResponseMetadata
 
 
+@dataclass(frozen=True, slots=True)
+class JinaBatchItemOutcome:
+    """One input-indexed success or content-free response error."""
+
+    index: int
+    vector: JinaEmbeddedVector | None
+    error_code: str | None
+    retryable: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class JinaEmbeddingBatchResponse:
+    """Independent outcomes and shared safe metadata for one hosted call."""
+
+    items: tuple[JinaBatchItemOutcome, ...]
+    usage: dict[str, int | float]
+    response_metadata: JinaResponseMetadata
+
+
 class JinaHostedAdapterError(RuntimeError):
     """A content-free classified hosted-adapter failure."""
 
@@ -194,11 +259,15 @@ class JinaHostedAdapterError(RuntimeError):
         retryable: bool,
         status_code: int | None = None,
         retry_after_seconds: float | None = None,
+        rate_limit_headers: Mapping[str, float] | None = None,
     ) -> None:
         self.code = code
         self.retryable = retryable
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
+        self.rate_limit_headers = (
+            {} if rate_limit_headers is None else dict(rate_limit_headers)
+        )
         suffix = "" if status_code is None else f" status={status_code}"
         super().__init__(f"hosted Jina embedding request failed: {code}{suffix}")
 
@@ -221,8 +290,9 @@ class JinaEmbeddingAdapter:
         image_input_rules=PRODUCTION_IMAGE_INPUT_RULES,
         image_transform=PRODUCTION_IMAGE_TRANSFORM_ID,
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
-        client_configuration_version="wsj-embeddings-config-v3",
+        client_configuration_version="wsj-embeddings-config-v4",
     )
+    rate_aware_batching = True
 
     def __init__(
         self,
@@ -285,9 +355,51 @@ class JinaEmbeddingAdapter:
     def embed(self, inputs: Sequence[JinaEmbeddingInput]) -> JinaEmbeddingResponse:
         """Embed text/image items and return vectors in caller input order."""
 
+        inputs = tuple(inputs)
+        batch = self.embed_batch(
+            inputs,
+            limits=JinaBatchLimits(
+                max_items=max(1, len(inputs)),
+                max_estimated_tokens=max(
+                    1, sum(item.estimated_tokens for item in inputs)
+                ),
+                max_encoded_bytes=max(
+                    1, sum(item.encoded_bytes for item in inputs)
+                ),
+            ),
+        )
+        if any(item.vector is None for item in batch.items):
+            raise JinaHostedAdapterError("invalid_response", retryable=False)
+        return JinaEmbeddingResponse(
+            vectors=tuple(
+                item.vector for item in batch.items if item.vector is not None
+            ),
+            usage=batch.usage,
+            response_metadata=batch.response_metadata,
+        )
+
+    def embed_batch(
+        self,
+        inputs: Sequence[JinaEmbeddingInput],
+        *,
+        limits: JinaBatchLimits,
+    ) -> JinaEmbeddingBatchResponse:
+        """Send one bounded mixed request and preserve unambiguous item outcomes."""
+
         request_items = tuple(item.as_request_item() for item in inputs)
         if not request_items:
             raise JinaHostedAdapterError("deterministic_request", retryable=False)
+        if len(request_items) > limits.max_items:
+            raise JinaHostedAdapterError("batch_item_limit", retryable=False)
+        if sum(item.estimated_tokens for item in inputs) > limits.max_estimated_tokens:
+            raise JinaHostedAdapterError("batch_token_limit", retryable=False)
+        if (
+            sum(item.encoded_bytes for item in inputs)
+            > limits.max_encoded_bytes
+        ):
+            raise JinaHostedAdapterError(
+                "batch_encoded_byte_limit", retryable=False
+            )
         body = json.dumps(
             {
                 "model": _JINA_MODEL,
@@ -304,12 +416,11 @@ class JinaEmbeddingAdapter:
         if not 200 <= response.status_code < 300:
             self._raise_for_status(response)
         payload = self._decode_success(response)
-        vectors = _validated_vectors(payload, expected_count=len(request_items))
         model = payload.get("model")
         if model != _JINA_MODEL:
             raise JinaHostedAdapterError("invalid_response", retryable=False)
-        return JinaEmbeddingResponse(
-            vectors=vectors,
+        return JinaEmbeddingBatchResponse(
+            items=_validated_batch_items(payload, expected_count=len(request_items)),
             usage=_safe_usage(payload.get("usage")),
             response_metadata=JinaResponseMetadata(
                 status_code=response.status_code,
@@ -364,6 +475,7 @@ class JinaEmbeddingAdapter:
             retryable=retryable,
             status_code=status,
             retry_after_seconds=_retry_after_seconds(response.headers),
+            rate_limit_headers=_safe_rate_limit_headers(response.headers),
         )
 
 
@@ -425,6 +537,61 @@ def _validated_vectors(
     if set(by_index) != set(range(expected_count)):
         raise JinaHostedAdapterError("invalid_response", retryable=False)
     return tuple(by_index[index] for index in range(expected_count))
+
+
+def _validated_batch_items(
+    payload: Mapping[str, object], *, expected_count: int
+) -> tuple[JinaBatchItemOutcome, ...]:
+    """Validate each unambiguous response index without discarding siblings."""
+
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return tuple(
+            JinaBatchItemOutcome(index, None, "invalid_response")
+            for index in range(expected_count)
+        )
+    candidates: dict[int, list[Mapping[str, object]]] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or index >= expected_count
+        ):
+            continue
+        candidates.setdefault(index, []).append(item)
+    outcomes: list[JinaBatchItemOutcome] = []
+    for index in range(expected_count):
+        indexed = candidates.get(index, [])
+        if not indexed:
+            outcomes.append(
+                JinaBatchItemOutcome(
+                    index, None, "missing_response_item", retryable=True
+                )
+            )
+            continue
+        if len(indexed) != 1:
+            outcomes.append(JinaBatchItemOutcome(index, None, "invalid_response"))
+            continue
+        try:
+            vector = _validated_vectors(
+                {"data": [{**indexed[0], "index": 0}]},
+                expected_count=1,
+            )[0]
+        except JinaHostedAdapterError:
+            outcomes.append(JinaBatchItemOutcome(index, None, "invalid_response"))
+            continue
+        outcomes.append(
+            JinaBatchItemOutcome(
+                index=index,
+                vector=replace(vector, index=index),
+                error_code=None,
+            )
+        )
+    return tuple(outcomes)
 
 
 def _safe_usage(value: object) -> dict[str, int | float]:
@@ -502,7 +669,7 @@ class FakeEmbeddingAdapter:
         image_input_rules=PRODUCTION_IMAGE_INPUT_RULES,
         image_transform=PRODUCTION_IMAGE_TRANSFORM_ID,
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
-        client_configuration_version="wsj-embeddings-config-v3",
+        client_configuration_version="wsj-embeddings-config-v4",
     )
     image_codec = FixturePassthroughImageCodec()
 

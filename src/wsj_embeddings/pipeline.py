@@ -17,7 +17,16 @@ from uuid import uuid4
 
 import duckdb
 
-from wsj_embeddings.adapters import EmbeddingAdapter, JinaHostedAdapterError
+from wsj_embeddings.adapters import (
+    EmbeddingAdapter,
+    JinaEmbeddingInput,
+    JinaHostedAdapterError,
+)
+from wsj_embeddings.batching import (
+    BatchExecutionResult,
+    BatchPolicy,
+    execute_rate_aware_batches,
+)
 from wsj_embeddings.canonical_markdown import (
     CanonicalMarkdownError,
     read_canonical_markdown,
@@ -111,6 +120,17 @@ class _PreparedEmbedding:
     stored_vector_sha256: str
     vector: tuple[float, ...]
     long_text_parts: tuple[_SuccessfulLongTextPart, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchedHostedWork:
+    article: CanonicalArticle
+    modality: str
+    embedding_input: JinaEmbeddingInput
+    input_sha256: str
+    prepared_image: _PreparedHeaderImage | None = None
+    part: LongTextPart | None = None
+    article_input_sha256: str | None = None
 
 
 class EmbeddingPipelineError(RuntimeError):
@@ -260,6 +280,9 @@ def run_embedding_pipeline(
     reprocess: bool = False,
     failpoints: EmbeddingPipelineFailpoints | None = None,
     image_codec: ImageCodec | None = None,
+    batch_sleep: Callable[[float], None] | None = None,
+    batch_jitter: Callable[[int], float] | None = None,
+    monotonic: Callable[[], float] | None = None,
 ) -> EmbeddingRunResult:
     """Publish source and derived vectors for a bounded canonical slice."""
 
@@ -302,6 +325,7 @@ def run_embedding_pipeline(
         raise ValueError("adapter profile dimensions must be 2048")
     if profile.long_text_part_attempt_limit < 1:
         raise ValueError("long-text part attempt limit must be positive")
+    _validate_batch_profile(profile)
     configuration_identifier = configuration_id(profile)
     run_id = str(uuid4())
     with (
@@ -363,6 +387,45 @@ def run_embedding_pipeline(
                         prepared_images[article.article_id],
                     )
                 )
+        if (
+            getattr(adapter, "rate_aware_batching", False)
+            and callable(getattr(adapter, "embed_batch", None))
+        ):
+            metrics = _run_rate_aware_work(
+                config,
+                adapter,
+                catalog,
+                run_id,
+                configuration_identifier,
+                profile,
+                articles,
+                prepared_images,
+                registered_states,
+                reprocess=reprocess,
+                failpoints=active_failpoints,
+                batch_sleep=batch_sleep,
+                batch_jitter=batch_jitter,
+                monotonic=monotonic,
+            )
+            for article in articles:
+                with catalog.transaction():
+                    _publish_multimodal_article(
+                        catalog,
+                        run_id,
+                        configuration_identifier,
+                        profile,
+                        article,
+                    )
+            with catalog.transaction():
+                catalog.finish_run_metrics(
+                    run_id,
+                    hosted_requests=metrics.requests,
+                    hosted_retries=metrics.retries,
+                    usage=metrics.usage,
+                    throttles=metrics.throttles,
+                    elapsed_seconds=metrics.elapsed_seconds,
+                )
+            return catalog.run_result(run_id)
         for article in articles:
             for modality, prepared_image in (
                 (_ARTICLE_TEXT_MODALITY, None),
@@ -559,6 +622,456 @@ def run_embedding_pipeline(
                 )
         result = catalog.run_result(run_id)
     return result
+
+
+def _validate_batch_profile(profile: EmbeddingProfile) -> None:
+    try:
+        BatchPolicy(
+            profile.batch_max_items,
+            profile.batch_max_estimated_tokens,
+            profile.batch_max_encoded_bytes,
+            profile.batch_max_concurrency,
+            profile.batch_max_attempts,
+            profile.batch_initial_backoff_seconds,
+            profile.batch_max_backoff_seconds,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("adapter batch profile is invalid") from error
+
+
+def _run_rate_aware_work(
+    config: EmbeddingPipelineConfig,
+    adapter: EmbeddingAdapter,
+    catalog: EmbeddingCatalog,
+    run_id: str,
+    configuration_identifier: str,
+    profile: EmbeddingProfile,
+    articles: Sequence[CanonicalArticle],
+    prepared_images: dict[
+        str,
+        _PreparedHeaderImage
+        | _MissingHeaderImage
+        | _TerminalHeaderImage
+        | None,
+    ],
+    registered_states: dict[tuple[str, str], WorkState],
+    *,
+    reprocess: bool,
+    failpoints: EmbeddingPipelineFailpoints,
+    batch_sleep: Callable[[float], None] | None,
+    batch_jitter: Callable[[int], float] | None,
+    monotonic: Callable[[], float] | None,
+) -> BatchExecutionResult:
+    """Stage hosted-only work, then serialize each durable item transition."""
+
+    works: list[_BatchedHostedWork] = []
+    long_plans: dict[str, tuple[str, tuple[LongTextPart, ...]]] = {}
+    for article in articles:
+        for modality, prepared_image in (
+            (_ARTICLE_TEXT_MODALITY, None),
+            (_HEADER_IMAGE_MODALITY, prepared_images[article.article_id]),
+        ):
+            state = registered_states[(article.article_id, modality)]
+            if state is WorkState.NOT_APPLICABLE:
+                continue
+            if state.is_reusable_success:
+                with catalog.transaction():
+                    catalog.increment_run(run_id, "reused")
+                continue
+            if state is WorkState.TERMINAL or isinstance(
+                prepared_image, _MissingHeaderImage
+            ):
+                continue
+            if modality == _HEADER_IMAGE_MODALITY:
+                assert isinstance(prepared_image, _PreparedHeaderImage)
+                image_bytes = (
+                    prepared_image.image_input.data
+                    if prepared_image.image_input is not None
+                    else prepared_image.data
+                )
+                works.append(
+                    _BatchedHostedWork(
+                        article=article,
+                        modality=modality,
+                        embedding_input=JinaEmbeddingInput.image_base64(
+                            base64.b64encode(image_bytes).decode("ascii"),
+                            estimated_tokens=(
+                                math.ceil(
+                                    prepared_image.image_input.embedded_info.width
+                                    / 28
+                                )
+                                * math.ceil(
+                                    prepared_image.image_input.embedded_info.height
+                                    / 28
+                                )
+                                * 10
+                            ),
+                        ),
+                        input_sha256=prepared_image.input_sha256,
+                        prepared_image=prepared_image,
+                    )
+                )
+                continue
+            markdown, input_sha256, parts = _read_planned_article_text(
+                config, adapter, article
+            )
+            if not parts:
+                works.append(
+                    _BatchedHostedWork(
+                        article=article,
+                        modality=modality,
+                        embedding_input=JinaEmbeddingInput.text(
+                            markdown,
+                            estimated_tokens=len(adapter.token_offsets(markdown)),
+                        ),
+                        input_sha256=input_sha256,
+                    )
+                )
+                continue
+            if not reprocess:
+                with catalog.transaction():
+                    exhausted = catalog.terminalize_exhausted_long_text_work(
+                        run_id=run_id,
+                        article_id=article.article_id,
+                        configuration_identifier=configuration_identifier,
+                        article_input_sha256=input_sha256,
+                        attempt_limit=profile.long_text_part_attempt_limit,
+                    )
+                if exhausted:
+                    continue
+            try:
+                with catalog.transaction():
+                    part_states = catalog.register_long_text_parts(
+                        run_id=run_id,
+                        article_id=article.article_id,
+                        configuration_identifier=configuration_identifier,
+                        article_input_sha256=input_sha256,
+                        parts=parts,
+                        reprocess=reprocess,
+                    )
+                    catalog.start_attempt(
+                        run_id=run_id,
+                        article_id=article.article_id,
+                        modality=_ARTICLE_TEXT_MODALITY,
+                        configuration_identifier=configuration_identifier,
+                    )
+            except ValueError as error:
+                raise EmbeddingPipelineError(
+                    "invalid_long_text_state", article.article_id
+                ) from error
+            if WorkState.TERMINAL in part_states:
+                continue
+            long_plans[article.article_id] = (input_sha256, parts)
+            for part, part_state in zip(parts, part_states, strict=True):
+                if part_state is WorkState.SUCCEEDED:
+                    continue
+                works.append(
+                    _BatchedHostedWork(
+                        article=article,
+                        modality=modality,
+                        embedding_input=JinaEmbeddingInput.text(
+                            part.text, estimated_tokens=part.token_count
+                        ),
+                        input_sha256=part.input_sha256,
+                        part=part,
+                        article_input_sha256=input_sha256,
+                    )
+                )
+
+    def checkpoint_attempt(index: int, _attempt: int) -> None:
+        work = works[index]
+        if work.part is None:
+            with catalog.transaction():
+                catalog.start_attempt(
+                    run_id=run_id,
+                    article_id=work.article.article_id,
+                    modality=work.modality,
+                    configuration_identifier=configuration_identifier,
+                )
+            return
+        assert work.article_input_sha256 is not None
+        with catalog.transaction():
+            attempt_count = catalog.start_long_text_part_attempt(
+                run_id=run_id,
+                article_id=work.article.article_id,
+                configuration_identifier=configuration_identifier,
+                article_input_sha256=work.article_input_sha256,
+                part_index=work.part.index,
+            )
+        if failpoints.after_long_text_part_attempt_checkpoint is not None:
+            failpoints.after_long_text_part_attempt_checkpoint(
+                work.part.index, attempt_count
+            )
+
+    execution_kwargs: dict[str, object] = {"before_attempt": checkpoint_attempt}
+    if batch_sleep is not None:
+        execution_kwargs["sleep"] = batch_sleep
+    if batch_jitter is not None:
+        execution_kwargs["jitter"] = batch_jitter
+    if monotonic is not None:
+        execution_kwargs["monotonic"] = monotonic
+    metrics = execute_rate_aware_batches(
+        adapter,
+        tuple(work.embedding_input for work in works),
+        policy=BatchPolicy(
+            profile.batch_max_items,
+            profile.batch_max_estimated_tokens,
+            profile.batch_max_encoded_bytes,
+            profile.batch_max_concurrency,
+            profile.batch_max_attempts,
+            profile.batch_initial_backoff_seconds,
+            profile.batch_max_backoff_seconds,
+        ),
+        **execution_kwargs,
+    )
+    failed_long_articles: set[str] = set()
+    for work, outcome in zip(works, metrics.items, strict=True):
+        if outcome.vector is not None:
+            vector = _normalized_vector(
+                outcome.vector.stored_vector, work.article.article_id
+            )
+            if work.part is not None:
+                assert work.article_input_sha256 is not None
+                with catalog.transaction():
+                    catalog.publish_long_text_part_success(
+                        run_id=run_id,
+                        article_id=work.article.article_id,
+                        configuration_identifier=configuration_identifier,
+                        article_input_sha256=work.article_input_sha256,
+                        part_index=work.part.index,
+                        stored_vector_sha256=_vector_hash(vector),
+                        vector=vector,
+                    )
+                continue
+            _publish_batched_source_success(
+                catalog,
+                run_id,
+                configuration_identifier,
+                profile,
+                work,
+                vector,
+            )
+            continue
+        error_code = outcome.error_code or "invalid_response"
+        failure_state = (
+            WorkState.RETRYABLE if outcome.retryable else WorkState.TERMINAL
+        )
+        if work.part is not None:
+            assert work.article_input_sha256 is not None
+            failed_long_articles.add(work.article.article_id)
+            with catalog.transaction():
+                if failure_state is WorkState.TERMINAL:
+                    catalog.record_terminal_long_text_part_failure(
+                        run_id=run_id,
+                        article_id=work.article.article_id,
+                        configuration_identifier=configuration_identifier,
+                        article_input_sha256=work.article_input_sha256,
+                        part_index=work.part.index,
+                        error_code=error_code,
+                        status_code=None,
+                        retry_after_seconds=None,
+                    )
+                else:
+                    catalog.record_long_text_part_failure(
+                        run_id=run_id,
+                        article_id=work.article.article_id,
+                        configuration_identifier=configuration_identifier,
+                        article_input_sha256=work.article_input_sha256,
+                        part_index=work.part.index,
+                        state=failure_state,
+                        error_code=error_code,
+                        status_code=None,
+                        retry_after_seconds=None,
+                    )
+            continue
+        with catalog.transaction():
+            catalog.record_failure(
+                run_id=run_id,
+                article_id=work.article.article_id,
+                modality=work.modality,
+                configuration_identifier=configuration_identifier,
+                state=failure_state,
+                error_code=error_code,
+                status_code=None,
+                retry_after_seconds=None,
+            )
+            if work.modality == _HEADER_IMAGE_MODALITY:
+                catalog.increment_run(run_id, "header_failed")
+
+    for article_id in failed_long_articles:
+        with catalog.transaction():
+            row = catalog.connection.execute(
+                """
+                SELECT state FROM embedding_work_items
+                WHERE article_id = ? AND modality = ? AND configuration_id = ?
+                """,
+                [article_id, _ARTICLE_TEXT_MODALITY, configuration_identifier],
+            ).fetchone()
+            if row is not None and WorkState(str(row[0])) is not WorkState.TERMINAL:
+                catalog.record_failure(
+                    run_id=run_id,
+                    article_id=article_id,
+                    modality=_ARTICLE_TEXT_MODALITY,
+                    configuration_identifier=configuration_identifier,
+                    state=WorkState.RETRYABLE,
+                    error_code="long_text_part_retryable",
+                    status_code=None,
+                    retry_after_seconds=None,
+                )
+    for article in articles:
+        plan = long_plans.get(article.article_id)
+        if plan is None or article.article_id in failed_long_articles:
+            continue
+        article_input_sha256, parts = plan
+        successful_parts = tuple(
+            _successful_catalog_part(
+                catalog,
+                article,
+                configuration_identifier,
+                article_input_sha256,
+                part,
+            )
+            for part in parts
+        )
+        aggregate = _long_text_vector(successful_parts, article.article_id)
+        with catalog.transaction():
+            catalog.publish_long_text_success(
+                run_id=run_id,
+                article_id=article.article_id,
+                configuration_identifier=configuration_identifier,
+                published_at_utc=article.published_at_utc,
+                publication_date_new_york=article.publication_date_new_york,
+                dimensions=profile.dimensions,
+                input_sha256=article_input_sha256,
+                stored_vector_sha256=_vector_hash(aggregate),
+                vector=aggregate,
+                aggregation_version=profile.long_text_aggregation,
+                parts=tuple(
+                    (
+                        item.part.index,
+                        item.part.input_sha256,
+                        item.part.token_count,
+                        item.generation_run_id,
+                        item.stored_vector_sha256,
+                    )
+                    for item in successful_parts
+                ),
+            )
+    return metrics
+
+
+def _read_planned_article_text(
+    config: EmbeddingPipelineConfig,
+    adapter: EmbeddingAdapter,
+    article: CanonicalArticle,
+) -> tuple[str, str, tuple[LongTextPart, ...]]:
+    try:
+        markdown_bytes = read_canonical_markdown(
+            config.preprocessing_output_root, article.cleaned_markdown_path
+        )
+    except CanonicalMarkdownError as error:
+        code = "read_markdown" if error.status == "missing" else "unsafe_markdown_path"
+        raise EmbeddingPipelineError(code, article.article_id) from error
+    try:
+        markdown = markdown_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise EmbeddingPipelineError("invalid_utf8", article.article_id) from error
+    input_sha256 = hashlib.sha256(markdown_bytes).hexdigest()
+    if input_sha256 != article.cleaned_markdown_sha256:
+        raise EmbeddingPipelineError(
+            "canonical_input_hash_mismatch", article.article_id
+        )
+    try:
+        parts = plan_long_text_parts(
+            markdown, adapter, token_limit=adapter.profile.context_token_limit
+        )
+    except LongTextPlanningError as error:
+        raise EmbeddingPipelineError(
+            "invalid_tokenizer_offsets", article.article_id
+        ) from error
+    return markdown, input_sha256, parts
+
+
+def _successful_catalog_part(
+    catalog: EmbeddingCatalog,
+    article: CanonicalArticle,
+    configuration_identifier: str,
+    article_input_sha256: str,
+    part: LongTextPart,
+) -> _SuccessfulLongTextPart:
+    try:
+        generation_run_id, vector_sha256, vector_values = (
+            catalog.long_text_part_generation(
+                article_id=article.article_id,
+                configuration_identifier=configuration_identifier,
+                article_input_sha256=article_input_sha256,
+                part_index=part.index,
+            )
+        )
+        vector = _verified_source_vector(
+            vector_values, str(vector_sha256), article.article_id
+        )
+    except (EmbeddingPipelineError, ValueError) as error:
+        raise EmbeddingPipelineError(
+            "invalid_long_text_state", article.article_id
+        ) from error
+    return _SuccessfulLongTextPart(
+        part, str(generation_run_id), str(vector_sha256), vector
+    )
+
+
+def _publish_batched_source_success(
+    catalog: EmbeddingCatalog,
+    run_id: str,
+    configuration_identifier: str,
+    profile: EmbeddingProfile,
+    work: _BatchedHostedWork,
+    vector: tuple[float, ...],
+) -> None:
+    with catalog.transaction():
+        if work.modality == _HEADER_IMAGE_MODALITY:
+            assert work.prepared_image is not None
+            assert work.prepared_image.image_input is not None
+            image_input = work.prepared_image.image_input
+            catalog.publish_image_success(
+                run_id=run_id,
+                article_id=work.article.article_id,
+                configuration_identifier=configuration_identifier,
+                source_relative_path=work.prepared_image.source_relative_path,
+                published_at_utc=work.article.published_at_utc,
+                publication_date_new_york=work.article.publication_date_new_york,
+                dimensions=profile.dimensions,
+                source_sha256=image_input.source_sha256,
+                source_format=image_input.source_info.format,
+                source_bytes=len(work.prepared_image.data),
+                source_width=image_input.source_info.width,
+                source_height=image_input.source_info.height,
+                source_frames=image_input.source_info.frames,
+                embedded_input_sha256=image_input.embedded_input_sha256,
+                embedded_format=image_input.embedded_info.format,
+                embedded_bytes=len(image_input.data),
+                embedded_width=image_input.embedded_info.width,
+                embedded_height=image_input.embedded_info.height,
+                embedded_frames=image_input.embedded_info.frames,
+                transform_id=image_input.transform_id,
+                rendition_relative_path=image_input.rendition_relative_path,
+                stored_vector_sha256=_vector_hash(vector),
+                vector=vector,
+            )
+            return
+        catalog.publish_success(
+            run_id=run_id,
+            article_id=work.article.article_id,
+            modality=work.modality,
+            configuration_identifier=configuration_identifier,
+            source_relative_path=None,
+            published_at_utc=work.article.published_at_utc,
+            publication_date_new_york=work.article.publication_date_new_york,
+            dimensions=profile.dimensions,
+            input_sha256=work.input_sha256,
+            stored_vector_sha256=_vector_hash(vector),
+            vector=vector,
+        )
 
 
 def _register_work(

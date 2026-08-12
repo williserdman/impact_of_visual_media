@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from wsj_embeddings.adapters import (
+    JinaBatchLimits,
     JinaEmbeddingAdapter,
     JinaEmbeddingInput,
     JinaHostedAdapterError,
@@ -230,6 +231,104 @@ def test_hosted_adapter_serializes_fixed_contract_and_maps_indexed_vectors():
         1.0,
         abs_tol=1e-6,
     )
+
+
+def test_hosted_batch_returns_independent_indexed_mixed_item_outcomes():
+    """Break caught: one malformed batch item discards validated siblings."""
+
+    transport = RecordingTransport(
+        _response(
+            [
+                {"index": 2, "embedding": _embedding(0.0, 4.0)},
+                {"index": 0, "embedding": _embedding(3.0, 0.0)},
+                {"index": 1, "embedding": _embedding(1.0, 0.0)[:-1]},
+            ],
+            headers={
+                "X-RateLimit-Remaining-Requests": "7",
+                "X-RateLimit-Remaining-Tokens": "101",
+            },
+        )
+    )
+
+    result = _adapter(transport).embed_batch(
+        (
+            JinaEmbeddingInput.text("generated text"),
+            JinaEmbeddingInput.text("malformed vector item"),
+            JinaEmbeddingInput.image_base64(base64.b64encode(b"image").decode()),
+            JinaEmbeddingInput.text("missing response item"),
+        ),
+        limits=JinaBatchLimits(
+            max_items=4,
+            max_estimated_tokens=100,
+            max_encoded_bytes=100,
+        ),
+    )
+
+    assert tuple(item.index for item in result.items) == (0, 1, 2, 3)
+    assert result.items[0].vector is not None
+    assert result.items[0].vector.stored_vector[:2] == (1.0, 0.0)
+    assert result.items[1].vector is None
+    assert result.items[1].error_code == "invalid_response"
+    assert result.items[2].vector is not None
+    assert result.items[2].vector.stored_vector[:2] == (0.0, 1.0)
+    assert result.items[3].vector is None
+    assert result.items[3].error_code == "missing_response_item"
+    assert result.usage == {"prompt_tokens": 11, "total_tokens": 11}
+    assert result.response_metadata.rate_limit_headers == {
+        "x-ratelimit-remaining-requests": 7.0,
+        "x-ratelimit-remaining-tokens": 101.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("inputs", "limits", "code"),
+    [
+        (
+            (JinaEmbeddingInput.text("one"), JinaEmbeddingInput.text("two")),
+            JinaBatchLimits(1, 100, 100),
+            "batch_item_limit",
+        ),
+        (
+            (JinaEmbeddingInput.text("four"),),
+            JinaBatchLimits(2, 3, 100),
+            "batch_token_limit",
+        ),
+        (
+            (JinaEmbeddingInput.image_base64(base64.b64encode(b"image").decode()),),
+            JinaBatchLimits(2, 100, 7),
+            "batch_encoded_byte_limit",
+        ),
+    ],
+)
+def test_hosted_batch_refuses_each_payload_limit_before_transport(
+    inputs, limits, code
+):
+    """Break caught: an independently oversized hosted request reaches transport."""
+
+    transport = RecordingTransport(AssertionError("transport must not be called"))
+
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        _adapter(transport).embed_batch(inputs, limits=limits)
+
+    assert raised.value.code == code
+    assert raised.value.retryable is False
+    assert transport.calls == []
+
+
+def test_hosted_batch_uses_supplied_token_estimate_not_text_byte_length():
+    """Break caught: request budgeting treats UTF-8 characters as model tokens."""
+
+    transport = RecordingTransport(
+        _response([{"index": 0, "embedding": _embedding(1.0, 0.0)}])
+    )
+    item = JinaEmbeddingInput.text("generated text much longer", estimated_tokens=2)
+
+    result = _adapter(transport).embed_batch(
+        (item,), limits=JinaBatchLimits(1, 2, 100)
+    )
+
+    assert result.items[0].vector is not None
+    assert len(transport.calls) == 1
 
 
 def test_hosted_adapter_embeds_one_already_encoded_image_without_remote_url():
