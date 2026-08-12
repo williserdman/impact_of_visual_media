@@ -9093,6 +9093,72 @@ def test_validator_reports_invalid_durable_work_state(tmp_path):
     )
 
 
+def test_validator_rejects_unsupported_work_only_modality(tmp_path):
+    """Break caught: work-only rows accept modalities outside the public domain."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    input_sha256 = hashlib.sha256(b"generated unsupported work").hexdigest()
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(
+            """
+            INSERT INTO embedding_work_storage (
+                article_id, modality, configuration_id, source_relative_path,
+                input_sha256, state, attempt_count, error_code, status_code,
+                retry_after_seconds, last_run_id, generation_run_id, updated_at
+            )
+            SELECT article_id, 'unsupported', configuration_id, NULL, ?,
+                   'eligible', 0, NULL, NULL, NULL, last_run_id, NULL,
+                   current_timestamp
+            FROM embedding_work_storage
+            WHERE modality = 'article_text'
+            """,
+            [input_sha256],
+        )
+
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "invalid_work_modality",
+                "embedding work items use an unsupported modality",
+            ),
+        )
+    )
+
+
+def test_validator_rejects_orphan_applicable_work_only_article(tmp_path):
+    """Break caught: applicable work-only rows need no canonical article."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    input_sha256 = hashlib.sha256(b"generated orphan work").hexdigest()
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(
+            """
+            INSERT INTO embedding_work_storage (
+                article_id, modality, configuration_id, source_relative_path,
+                input_sha256, state, attempt_count, error_code, status_code,
+                retry_after_seconds, last_run_id, generation_run_id, updated_at
+            )
+            SELECT 'wsj:SYNTHETIC-ORPHAN-WORK', 'multimodal_article',
+                   configuration_id, NULL, ?, 'eligible', 0, NULL, NULL, NULL,
+                   last_run_id, NULL, current_timestamp
+            FROM embedding_work_storage
+            WHERE modality = 'article_text'
+            """,
+            [input_sha256],
+        )
+
+    assert validate_embedding_outputs(config) == EmbeddingValidationResult(
+        issues=(
+            EmbeddingValidationIssue(
+                "missing_canonical_work_article",
+                "applicable embedding work items lack a canonical article",
+            ),
+        )
+    )
+
+
 @pytest.mark.parametrize("invalid_hash", (None, "not-a-sha256"))
 def test_validator_rejects_missing_or_malformed_active_work_hash(
     tmp_path,

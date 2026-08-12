@@ -376,6 +376,7 @@ def _validate_stable_state(
     _validate_run_metrics(embedding, issues)
     _validate_run_lifecycle(embedding, issues)
     _validate_reconciliation_actions(embedding, issues)
+    _validate_global_work_identities(embedding, articles, issues)
     _validate_global_public_embedding_checkpoints(embedding, issues)
     _validate_global_generation_history_references(embedding, issues)
     _validate_global_image_provenance_references(embedding, issues)
@@ -1371,6 +1372,48 @@ def _validate_global_public_embedding_checkpoints(
             "invalid_public_embedding_checkpoint",
             "public embeddings lack exact reusable-success work provenance",
         )
+
+
+def _validate_global_work_identities(
+    connection: duckdb.DuckDBPyConnection,
+    articles: _CanonicalArticles,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Require every work-only identity to remain inside its domain."""
+
+    rows = stream_rows(
+        connection,
+        """
+        SELECT article_id, modality, state
+        FROM embedding_work_items
+        ORDER BY article_id, modality, configuration_id
+        """,
+    )
+    supported_modalities = {modality.value for modality in EmbeddingModality}
+    absent_article_states = {
+        WorkState.STALE_INPUT,
+        WorkState.STALE_CONFIGURATION,
+    }
+    for (_article_id, modality, state), article in _rows_with_canonical_articles(
+        rows,
+        articles,
+    ):
+        if modality not in supported_modalities:
+            _append(
+                issues,
+                "invalid_work_modality",
+                "embedding work items use an unsupported modality",
+            )
+        try:
+            work_state = WorkState(state)
+        except ValueError:
+            continue
+        if article is None and work_state not in absent_article_states:
+            _append(
+                issues,
+                "missing_canonical_work_article",
+                "applicable embedding work items lack a canonical article",
+            )
 
 
 def _validate_work_items(

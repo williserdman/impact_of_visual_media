@@ -138,162 +138,18 @@ no implicit root defaults. `inventory`, `validate`, and `run` require explicit s
 preprocessing-output, and embedding-output roots; resolving them must produce
 three pairwise-disjoint paths.
 
-## Safe smoke-to-full workflow
+## Safe preprocessing workflow
 
-First prove the installation without touching the licensed archive:
+First prove the preprocessing installation without touching the licensed
+archive:
 
 ```bash
 .venv/bin/wsj-pipeline smoke
-.venv/bin/wsj-embeddings smoke
 ```
 
-Both commands use generated temporary fixtures. The embedding smoke command
-also snapshots its generated preprocessing inputs and fails if the downstream
-coordinator changes them.
-
-After smoke, an operator who has a valid Jina credential may measure the hosted
-contract without transmitting licensed content:
-
-```bash
-.venv/bin/wsj-embeddings pilot
-```
-
-Keep `JINA_API_KEY` out of shell history, configuration files, command output,
-and committed artifacts. Review the pilot's JSON result before allowing any
-corpus scope.
-
-Inventory canonical embedding eligibility without a credential, adapter, or
-embedding-output mutation:
-
-```bash
-.venv/bin/wsj-embeddings inventory \
-  --source-root data/wsj_archive \
-  --preprocessing-output-root data/processed/wsj \
-  --embedding-output-root data/embeddings/wsj
-```
-
-An embedding run requires exactly one of a strictly positive lexical
-`article_id` limit or explicit `--full`, plus the separate
-`--authorize-hosted-processing` assertion. A configured `JINA_API_KEY` alone is
-insufficient:
-
-```bash
-.venv/bin/wsj-embeddings run \
-  --source-root data/wsj_archive \
-  --preprocessing-output-root data/processed/wsj \
-  --embedding-output-root data/embeddings/wsj \
-  --limit 5 \
-  --observed-model 'jina-embeddings-v4' \
-  --authorize-hosted-processing
-```
-
-Set `--observed-model` to the exact safe model label returned consistently by
-the current successful pilot probes. Without it, production Jina runs stop
-with `pilot_observation_required` before output mutation. A later response
-model mismatch terminalizes affected work as content-free
-`configuration_drift` and publishes no vector under the old configuration.
-
-Use `--full` in place of `--limit 5` only after reviewing inventory, pilot,
-authorization, cost, and throughput. Full mode keyset-pages canonical articles
-from one read-only snapshot in lexical `article_id` order, records a durable
-content-free inventory, and processes it in bounded pages. Only successful
-exhaustion and processing enter bounded reconciliation. Limited, failed,
-interrupted, or cancelled runs never infer deletion.
-
-Do not run a real full-corpus operation unattended. Use a durable terminal,
-monitor the content-free run summaries and provider limits, and keep the
-embedding output on recoverable storage so an interrupted run can be replayed.
-
-Add `--reprocess` only when article text in the selected scope must be
-regenerated despite matching content and configuration. Independent unchanged
-header-image successes remain reusable. Reprocess never expands beyond the
-selected scope.
-
-The run sends each selected canonical Markdown artifact in full, with hosted
-truncation disabled. A static JPEG, PNG, or WebP at or below 5,000,000 bytes
-and 20,000,000 pixels is decoded safely and sent as base64 of its exact source
-bytes. An oversized but safely decodable image is EXIF-oriented, converted to
-RGB, aspect-scaled only when it exceeds the pixel ceiling, and encoded with the
-versioned Pillow 11.3.0 JPEG-85/4:2:0/Lanczos policy. The metadata-free
-rendition is staged, reopened, decoded, hashed, and atomically installed below
-the embedding output root. The full output-root/rendition/transform/leaf chain
-is reanchored after decode and reverified again immediately before run state can
-begin. This conservative
-transform is implementation policy. The operator must compare current synthetic
-image-boundary outcomes with that policy before a corpus run; the pilot never
-mutates the configuration automatically. Changing it creates a new configuration identity. Unsupported,
-animated, corrupt, unsafe, or still-oversized input is terminal and publishes
-no placeholder vector. At runtime the transform identity additionally includes
-the linked JPEG, libjpeg-turbo, zlib, and WebP build versions; an unavailable or
-mismatched build fails before configuration or work publication. The production
-Pillow path is exercised by a generated clean-install regression fixture that
-checks exact-byte pass-through and derived-JPEG publication. Markdown at or
-below the conservative 8,000-token input
-ceiling keeps the single hosted-input path, reserving 192 tokens below the
-confirmed 8,192-token model context. Longer Markdown is greedily partitioned at
-complete blank-line-delimited block boundaries; an individually oversized
-block is partitioned only at tokenizer offsets. The exact substrings concatenate
-back to the original Markdown without overlap or loss. The tokenizer is the
-official `jinaai/jina-embeddings-v4` `tokenizer.json` at immutable revision
-`d1e5d70b7b34d927a8cddac458583c4fbe50a914`; runtime acquisition verifies SHA-256
-`9c5ae00e602b8860cbd784ba82a8aa14e8feecec692e7076590d014d7b7fdafa` before
-loading its verified bytes in memory with pinned `tokenizers-0.21.4`.
-Automated tests inject an offline tokenizer and never download the
-artifact. The run never uses remote inline-image URLs. Run/configuration setup and each selected item's
-queue/recovery registration use separate bounded transactions. Each validated
-source vector and its successful work checkpoint commit before the next
-modality is attempted. Once both sources succeed under the same configuration,
-their float32 normalized vectors produce a 2,048-dimensional, L2-normalized
-equal-weight midpoint in a separate bounded transaction. Replaying the same
-limit reuses unchanged successes without another
-hosted request; when input changes, the mismatched vector is removed atomically
-with checkpoint invalidation before replacement is attempted. Any existing
-same-article/configuration multimodal dependent is archived, removed, and
-requeued in that transaction; the other source modality, other articles, and
-other configurations remain unchanged. A successful source checkpoint whose
-active vector is missing likewise invalidates its composite before recovery is
-attempted. A missing declared local header records
-a retryable, content-free image disposition without failing or regenerating
-successful text. Provider/transport retryable failures and interrupted image
-work are attempted again. Deterministic image-request rejection is attempted at
-most three times before becoming terminal; terminal work stays visible and is
-not retried implicitly. Limited runs never infer removal outside the selected
-scope. Success JSON includes content-free `reused`, `attempted`, `succeeded`,
-`retryable`, `terminal`, `interrupted`, `header_absent`, and `header_failed`
-counts plus the deterministic, content-free `configuration_id` required for
-research queries.
-
-Validate the completed corpus without a Jina credential or hosted request:
-
-```bash
-.venv/bin/wsj-embeddings validate \
-  --source-root data/wsj_archive \
-  --preprocessing-output-root data/processed/wsj \
-  --embedding-output-root data/embeddings/wsj \
-  --configuration-id '<configuration_id>'
-```
-
-`--configuration-id` may be omitted only while the catalog contains zero or
-one configuration. The result reports stable integrity issues and content-free
-counts for canonical articles; text success/failure; header present/absent,
-success/failure; a mutually exclusive multimodal success/unavailable/failure
-partition; stale work;
-unresolved retryable work; and orphan rendition artifacts. A nonempty issue
-list returns a nonzero status. Validation opens both catalogs read-only, does
-not construct an embedding adapter, and never repairs, migrates, deletes, or
-downloads anything.
-
-Validation opens the embedding catalog first and then the preprocessing
-catalog, begins a read transaction before each catalog's first schema query,
-and holds both through the complete pass. These are independently stable read
-snapshots acquired in that order. Because the catalogs have separate writers,
-their pinned versions need not ever have been simultaneously current.
-Validation reports cross-catalog relational inconsistencies, but it is not an
-atomic cross-catalog or filesystem snapshot. Generated files cannot be locked
-by those transactions, so validation records content-free start/end tokens for
-every canonical Markdown/current header, every referenced rendition, and the
-complete no-follow rendition namespace. A detected in-pass filesystem change
-reports `concurrent_validation_state_change` and makes validation unsuccessful.
+The command uses generated temporary fixtures and ignores the configured
+archive and output paths. The separate first-time embedding workflow appears
+after the preprocessing layout and query guidance below.
 
 Then inventory the configured archive without changing either source or
 generated state:
@@ -435,6 +291,9 @@ Start with the generated smoke check:
 wsj-embeddings smoke
 ```
 
+Smoke also snapshots its generated preprocessing inputs and fails if the
+downstream coordinator changes them.
+
 After setting `JINA_API_KEY`, run the pilot manually and review its
 content-free result before authorizing any archive scope:
 
@@ -467,6 +326,11 @@ wsj-embeddings run \
   --observed-model '<pilot-returned-model>'
 ```
 
+A configured key alone is insufficient. Without the reviewed pilot model,
+production stops with `pilot_observation_required` before output mutation; a
+later response-model mismatch records content-free `configuration_drift` and
+publishes no vector under the old configuration.
+
 Then validate the generated catalog offline. Validation is read-only and makes
 no hosted request. When more than one configuration exists, provide its
 explicit ID rather than allowing configurations to be mixed:
@@ -478,6 +342,14 @@ wsj-embeddings validate \
   --embedding-output-root /path/to/embedding-output \
   --configuration-id '<configuration-id>'
 ```
+
+A nonempty issue list returns a nonzero status. The result contains only
+integrity issues and content-free coverage counts; it never repairs, migrates,
+deletes, or downloads anything. The preprocessing and embedding catalogs are
+separately stable read snapshots rather than one atomic cross-catalog or
+filesystem snapshot. See the crash course's
+[validation contract](docs/architecture-crash-course.md#10-validation) for the
+detailed consistency model.
 
 ### Maintainer reference
 
@@ -538,7 +410,9 @@ direct ceiling is submitted once; longer text is processed with durable,
 three-attempt part checkpoints and published as one `article_text` vector.
 Header-image work also has a durable three-attempt policy for deterministic
 request rejection. Operators need only inspect the content-free run counters
-and retryable or terminal states; the batching, long-text, and image-rendition
+and retryable or terminal states. Unsupported, animated, corrupt, unsafe, or
+still-oversized local images publish no placeholder vector, and remote inline
+image URLs are never inputs. The batching, long-text, and image-rendition
 implementation contracts are in the [crash course](docs/architecture-crash-course.md#separate-text-header-image-and-multimodal-embedding-catalog).
 
 ### Repeat runs, reprocessing, and recovery
@@ -546,8 +420,12 @@ implementation contracts are in the [crash course](docs/architecture-crash-cours
 Unchanged matching work is reused. A limited or interrupted run never infers
 deletion; only a successfully completed explicit `--full` run may reconcile a
 disappearance. `--reprocess` is deliberate, bounded regeneration of the
-selected scope, not schema migration. A real `--full` or
-`--full --reprocess` requires explicit authorization in the current task.
+selected article-text scope, not schema migration; unchanged header-image
+successes remain reusable, and reprocessing never expands the selected scope.
+A real `--full` or `--full --reprocess` requires explicit authorization in the
+current task. Never run a real full-corpus operation unattended: use a durable
+terminal, monitor the content-free summaries and provider limits, and keep the
+embedding output on recoverable storage so interruption can be replayed.
 
 If a catalog is incompatible, move the generated embedding output aside or use
 a fresh embedding output root; do not migrate, overwrite, or delete it in
