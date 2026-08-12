@@ -28,8 +28,9 @@ shared preprocessing catalog does not own them.
 
 The downstream embedding slice consumes canonical `articles` rows, Markdown,
 and optional local header images through one coordinator seam and publishes a
-separate embedding catalog. Smoke injects a deterministic fake adapter, while an explicit pilot
-sends only fixed in-memory generated text and PNG bytes through hosted Jina.
+separate embedding catalog. Smoke injects a deterministic fake adapter, while
+an explicit pilot sends only fixed in-memory generated text and PNG bytes
+through hosted Jina.
 The production command exposes only an affirmatively authorized positive limit
 of lexical article IDs or an explicit full scope. Durable per-modality
 checkpoints resume unchanged work;
@@ -81,9 +82,52 @@ flowchart LR
 8. The serialized coordinator updates the winner, candidate, duplicate,
    failure, and
    manifest state. Nonwinners retain metrics and provenance, not cleaned text.
-9. Validation checks the catalog and files while the mutating run still owns
-   the exclusive lock. On the normal result path, the CLI returns a
-   content-free JSON summary.
+9. Validation checks the preprocessing catalog and files while the mutating
+   run still owns the exclusive lock. On the normal result path, the CLI
+   returns a content-free JSON summary.
+10. The downstream coordinator reads the winning `articles` row and canonical
+    Markdown without mutating preprocessing. Before any selected work is
+    registered, it resolves the three pairwise-disjoint roots, verifies schema
+    version 16, and registers the immutable configuration. Its
+    `configuration_id` binds the requested and observed model, tokenizer and
+    long-text rules, batching policy, image policy, multimodal formula, and
+    client contract.
+11. In separate bounded transactions, each applicable modality becomes
+    durably `eligible`, then admitted work becomes `queued`. This is the first
+    replay boundary: interruption before admission leaves eligible work;
+    interruption after admission leaves a durable queued item. A truly absent
+    canonical header is `not_applicable`, not an adapter failure.
+12. The coordinator reopens the exact canonical Markdown and optional local
+    header through no-follow descriptors. `article_text` hashes the exact UTF-8
+    Markdown bytes. `header_image` hashes the exact immutable source bytes;
+    remote `inline_image_urls` never enter the work queue.
+13. Text at or below 8,000 tokens is one hosted input. Longer text is split
+    into exact ordered substrings and each hosted part success is checkpointed
+    before the next call. The locally aggregated article vector is published
+    only when every immutable part generation is proven, so replay repurchases
+    only unproven parts.
+14. A safe in-policy JPEG, PNG, or WebP is sent to the provider as exact bytes.
+    An oversized but safely decodable image is converted by the deterministic
+    versioned rendition policy, staged, reopened, verified, and atomically
+    installed before it is submitted. Unsafe or unsupported image input
+    terminalizes without a hosted request or placeholder vector.
+15. Immediately before each provider attempt, durable work moves from `queued`
+    to `in_progress`. Each validated source response publishes its vector,
+    response model, raw-response hash, stored-vector hash, generation identity,
+    and successful checkpoint in one bounded transaction. A crash before that
+    transaction is replayable; a crash after it reuses the proven generation.
+16. When both source modalities succeed under the same configuration, the
+    coordinator derives `multimodal_article` locally as the normalized
+    equal-weight midpoint. This is a separate bounded publication with source
+    generation provenance and no provider call or raw hosted response.
+17. Offline validation opens stable read snapshots of both catalogs, streams
+    cross-catalog and artifact checks, recomputes hashes and local derivations,
+    and reports content-free issue codes. It neither constructs an adapter nor
+    repairs state.
+18. Research consumers select one explicit `configuration_id` from the
+    canonical `embeddings` view, then join `article_id` to preprocessing
+    `articles` for publication metadata. The README owns the
+    [operator workflow and query examples](../README.md#text-header-image-and-multimodal-embedding-catalog-contract).
 
 The final path is:
 
@@ -116,27 +160,29 @@ are valid only with that scope. Configuration defaults to four workers.
 `inventory` is read-only and inventories the whole configured source root.
 `smoke` ignores configuration and uses a generated temporary archive.
 
-### Article text embedding tracer modules
+### Embedding modules
 
 | Module | Owns | Does not own |
 |---|---|---|
-| `wsj_embeddings/config.py` | resolved disjoint roots and explicit hosted-processing authorization | CLI configuration loading |
-| `wsj_embeddings/adapters.py` | injected adapter protocol, deterministic fake adapter, and fixed hosted Jina adapter | corpus selection or output mutation |
+| `wsj_embeddings/config.py` | resolved disjoint roots, immutable profile construction, and explicit hosted-processing authorization | command parsing or credential loading |
+| `wsj_embeddings/models.py` | immutable records shared across coordinator, adapter, catalog, and validation seams | orchestration or persistence |
+| `wsj_embeddings/adapters.py` | one indexed adapter protocol, deterministic fake implementation, and fixed hosted Jina transport | corpus selection, retries, or catalog mutation |
 | `wsj_embeddings/tokenizer.py` | immutable official v4 tokenizer revision, artifact checksum verification, and lazy in-memory loading with pinned `tokenizers-0.21.4` | hosted inference or model self-hosting |
 | `wsj_embeddings/long_text.py` | exact token accounting, deterministic Markdown block packing, and reversible oversized-block partitioning | API calls or checkpoint mutation |
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
 | `wsj_embeddings/image_rendition.py` | bounded image decode, exact-byte eligibility, deterministic Pillow rendition, and atomic derived-file installation | source-image mutation or hosted requests |
 | `wsj_embeddings/batching.py` | mixed-input payload packing, bounded concurrency, rate-aware retry waves, and safe observations | HTTP serialization or catalog publication |
-| `wsj_embeddings/catalog.py` | separate schema version 16, canonical current views, and bounded lifecycle/generation/provenance/reconciliation transactions | preprocessing catalog mutation |
-| `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection/full traversal, text/image encoding, composite derivation, publication, and reconciliation | hosted credential loading |
+| `wsj_embeddings/catalog.py` | separate schema version 16, canonical current views, and bounded lifecycle/generation/provenance/reconciliation transactions | preprocessing catalog mutation or hosted calls |
+| `wsj_embeddings/pipeline.py` | the coordinator: read-only eligibility inventory, authorization gate, bounded selection/traversal, modality orchestration, publication, and reconciliation | hosted credential loading or transport implementation |
 | `wsj_embeddings/validate.py` | read-only schema, corpus coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
 | `wsj_embeddings/pilot.py` | fixed generated hosted text/image/boundary probes and content-free observations | corpus or filesystem input/output |
 | `wsj_embeddings/cli.py` | `smoke`, `pilot`, credential-free `inventory`/`validate`, and authorized exactly-one-of limit/full production `run` with bounded reprocess | preprocessing mutation |
 
 The installed `wsj-embeddings` command accepts `smoke`, `pilot`, `inventory`,
-`validate`, and `run`. `smoke`
+`validate`, and `run`. The [README operator workflow](../README.md#first-time-embedding-workflow)
+owns command sequences, authorization order, and recovery commands. Architecturally, `smoke`
 creates three disjoint temporary roots, publishes one fake 2,048-dimensional
 `article_text` vector, validates it, emits
 `{"articles": 1, "embeddings": 1, "validation_ok": true}`, and deletes the
@@ -267,7 +313,7 @@ ORDER BY published_at_utc, article_id;
 
 ### Separate text, header-image, and multimodal embedding catalog
 
-The fixture tracer writes a second `catalog.duckdb` only below its disjoint
+The embedding pipeline writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
 catalog. Embedding schema version 16 has exactly thirteen base tables, two
 canonical views, and no indexes. Exact validation includes normalized
@@ -285,7 +331,7 @@ never Markdown or image bytes.
 | `full_run_articles` | `run_id VARCHAR`, `article_id VARCHAR`, `header_image_path VARCHAR` | `(run_id, article_id)` |
 | `embedding_work_storage` | physical columns exposed by `embedding_work_items` | `(article_id, modality, configuration_id)` |
 | `embedding_storage` | physical columns exposed by `embeddings` | `(article_id, modality, configuration_id)` |
-| `reconciliation_actions` | exact target disposition and expected source/input/state/generation/vector identity | `(run_id, article_id, modality, configuration_id)` |
+| `reconciliation_actions` | exact target disposition and expected source/input/state/generation/vector identity plus `staged_at` | `(run_id, article_id, modality, configuration_id)` |
 | `embedding_work_items` (view) | canonical current work interface | — |
 | `embeddings` (view) | canonical current vector interface | — |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `derivation_kind VARCHAR`, `raw_response_sha256 VARCHAR`, `response_model VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
@@ -294,6 +340,20 @@ never Markdown or image bytes.
 | `long_text_parts` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `derivation_kind VARCHAR`, `raw_response_sha256 VARCHAR`, `response_model VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `updated_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index)` |
 | `long_text_part_generations` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `generation_run_id VARCHAR`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `derivation_kind VARCHAR`, `raw_response_sha256 VARCHAR`, `response_model VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index, generation_run_id)` |
 | `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
+
+Physical current rows live only in `embedding_work_storage` and
+`embedding_storage`; maintainers write them through catalog methods, not as a
+public query contract. The canonical `embedding_work_items` and `embeddings`
+views overlay any atomically visible reconciliation actions on that storage.
+They are the only current-state interfaces for validation and consumers. The
+history/provenance tables are append-only evidence, while `long_text_parts` is
+mutable checkpoint state. `reconciliation_actions` holds exact expected-state
+transitions staged by a full run; its rows affect the views only after that
+run's visibility marker commits. This storage/view distinction is defined here
+once; later sections use “current work” and “current vectors” to mean the
+canonical views.
+
+#### Configuration and source-vector provenance
 
 `configuration_id` is the SHA-256 of compact, key-sorted JSON for every
 `EmbeddingProfile` field: requested model alias, exact observed hosted model,
@@ -307,7 +367,11 @@ before output mutation, and each hosted generation must return that exact model
 or fail content-free without publication. Hosted generations retain SHA-256 for canonical compact
 JSON bytes of the raw embedding array and for normalized little-endian float32
 bytes. Local long-text aggregates and multimodal midpoints explicitly have no
-raw hosted representation. The tokenizer engine is pinned as
+raw hosted representation.
+
+#### Long-text tokenization, checkpoints, and aggregation
+
+The tokenizer engine is pinned as
 `tokenizers-0.21.4`. The official local tokenizer artifact is
 `jinaai/jina-embeddings-v4/tokenizer.json` at immutable revision
 `d1e5d70b7b34d927a8cddac458583c4fbe50a914`, accepted only when its bytes match
@@ -327,16 +391,10 @@ only the two source-generation identities/vector hashes and formula. After
 finite/nonzero checks and L2 normalization,
 values are rounded to
 float32; `stored_vector_sha256` covers their concatenated little-endian float32
-representation. Work state is one of `eligible`, `queued`, `in_progress`,
-`succeeded`, `retryable`, `terminal`, `interrupted`, `not_applicable`,
-`stale_input`, or `stale_configuration`. Fresh and invalidated work is first
-durably eligible; an admission transaction moves attemptable eligible,
-interrupted, or retryable work to queued, and only queued work starts an
-attempt. `stale_configuration` is a generation-free terminal vocabulary
-reserved for explicit invalid/unsupported configuration reconciliation, never
-for ordinary coexistence. The supported
-vector modalities are `article_text`, `header_image`, and `multimodal_article`,
-all dimension 2,048.
+representation. The supported vector modalities are `article_text`,
+`header_image`, and `multimodal_article`, all dimension 2,048. The complete
+work lifecycle is in [Incremental state transitions](#8-incremental-state-transitions).
+
 `long_text_parts` is mutable operational checkpoint/vector state, not a fourth
 research modality. `long_text_part_generations` is append-only operational
 history, including exact character/UTF-8 byte spans and vector facts needed to
@@ -356,6 +414,9 @@ article input identity; changed tokenizer, ceiling, boundary rule, or formula
 selects a new `configuration_id`. In both cases stale parts cannot satisfy the
 new aggregate, and normal source invalidation also archives/removes the dependent
 same-configuration multimodal generation.
+
+#### Image admission, rendition, and publication
+
 `source_relative_path` records the archive-relative path only for image work;
 no-header work keeps both path and input hash null and never publishes a vector.
 The only other null input hash is the narrow missing-header retryable
@@ -396,6 +457,8 @@ missing-leaf disposition.
 nullable except on successful active work, is immutable across reuse, and is
 the provenance copied into history when that vector is superseded.
 
+#### Local multimodal derivation
+
 After both normalized source vectors succeed for the same article and immutable
 configuration, the coordinator computes their equal-weight midpoint, L2
 normalizes and float32-quantizes it, and publishes the composite without a
@@ -406,6 +469,38 @@ different-configuration sources cannot publish a composite. Recovery with two
 unchanged successful sources creates only the missing composite; changing one
 source archives/removes its dependent composite while preserving the other
 source, sibling articles, and other configurations.
+
+#### Batching, attempts, and bounded publication
+
+Hosted v4 inputs are greedily packed across direct text, image, and long-text
+part items under independent item, estimated-token, encoded-request-byte, and
+response-byte ceilings. Success and error bodies are read only through the
+response ceiling. At most the immutable profile's request concurrency is
+active. Indexed results are validated and committed one item at a time on the
+coordinator as each wave response is processed, before any later retry sleep or
+wave; a response cannot publish against the wrong payload index.
+
+Durable prior attempts reduce each item's remaining budget. Retryable request
+or indexed-item failures use bounded exponential backoff plus production jitter
+(injectable for tests). Usable numeric or RFC-date `Retry-After` and rate-reset
+headers may lengthen the delay only to the configured maximum. A throttle
+halves subsequent concurrency. Run telemetry retains only allowlisted finite,
+nonnegative usage values plus request, retry, throttle, and elapsed-time
+observations. It never retains response bodies.
+
+Completed concurrent exchanges are processed in stable submission order. A
+request-wide fatal is raised only after completed sibling outcomes cross their
+independent transactions, so the failed run retains those durable results and
+telemetry. Authentication or authorization failure leaves recoverable
+`in_progress` checkpoints for replay after operator correction. A
+request-wide deterministic rejection terminalizes each unresolved item in the
+rejected request before the run fails; ordinary replay does not repurchase
+them. An indexed deterministic image rejection affects only that image and
+uses its durable three-attempt policy, preserving a successful text sibling.
+An intermediate long-text part failure does not prevent later aggregation if
+that exact part subsequently succeeds.
+
+#### Registration and generation publication
 
 The coordinator commits content-free run/configuration setup separately, then
 registers or recovers each selected item in its own bounded transaction. When
@@ -430,19 +525,9 @@ the superseded success's content-free input/vector hashes and run identities in
 and leaves prior-configuration vectors immutable and queryable.
 The applicable-to-absent transition uses that same transaction to invalidate
 both the header generation and its multimodal dependent before persisting
-`not_applicable`. Validation derives required header keys from canonical
-articles with article-text work and reconciles the latest run's absent/failed
-claims against durable header states, so deleting a checkpoint cannot erase a
-coverage gap. It also resolves active and historical multimodal source links and
-requires provenance for every active and historical composite. It recomputes
-each content-free input identity and every active composite, so a
-self-consistent altered vector, retargeted source reference, missing provenance,
-or impossible midpoint is reported without mutation. Run coverage is exact per
-immutable generating run; generations from another run cannot mask deletion.
-Long-text validation separately verifies checkpoint domains/hashes/token
-ceilings and provenance completeness, then recomputes every active aggregate
-from all weighted part vectors. It does not acquire the tokenizer or a hosted
-credential.
+`not_applicable`.
+
+#### Research query boundary
 
 The research query seam is:
 
@@ -525,6 +610,45 @@ stateDiagram-v2
     succeeded --> missing: unseen in a completed full run only
 ```
 
+### Embedding work lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> eligible: selected input/configuration registered
+    eligible --> queued: admitted in a bounded transaction
+    queued --> in_progress: attempt starts durably
+    in_progress --> succeeded: validated vector commits
+    in_progress --> retryable: transient item/transport failure
+    in_progress --> terminal: deterministic failure / budget exhausted
+    in_progress --> interrupted: abandoned run recovered
+    retryable --> queued: later run admits remaining budget
+    interrupted --> queued: later run replays
+```
+
+`eligible -> queued -> in_progress -> succeeded` is the normal provider-backed
+source path. `article_text` parts follow the same durable attempt principle
+inside their checkpoint table; `multimodal_article` reaches success through a
+local derivation transaction after both source generations exist. Registration,
+admission, attempt start, and outcome publication are separate durable
+boundaries. A process loss after attempt start but before an outcome is
+recovered as `interrupted`; a transient classified outcome is `retryable`;
+both may return to `queued` with their already committed attempts intact.
+`terminal` is durable and ordinary replay does not automatically repurchase
+it. New attemptable work requires a changed input/configuration or the
+modality's explicit reprocess rule; the current `--reprocess` surface targets
+article text and does not silently retry terminal header work.
+
+Three states are dispositions outside adapter attempt outcomes:
+
+- `not_applicable` says the canonical article has no local header association;
+  it has no input hash, generation, or vector.
+- `stale_input` is a generation-free reconciliation result for input removed or
+  made ineligible by a completed full run. Limited, failed, or interrupted runs
+  cannot create it by inferring absence.
+- `stale_configuration` is reserved for an explicit invalid or unsupported
+  configuration reconciliation. It is never produced merely because valid
+  configurations coexist.
+
 Runs process lexical discovery in configured-size batches. Within one batch,
 source preparation is submitted to a bounded thread pool and applied by the
 serialized coordinator as results complete. At most one batch is submitted at
@@ -583,6 +707,8 @@ catalog state never points to a new path that was not published. The stored
 hash exposes any temporary file/catalog mismatch. Cleanup never follows an
 unsafe path or directory symlink.
 
+### Embedding publication and attempt recovery
+
 The downstream coordinator applies the same boundary independently. Its three
 roots are resolved and pairwise disjoint, it treats the preprocessing catalog
 and canonical Markdown as read-only, and it holds an embedding-output
@@ -598,6 +724,23 @@ closes that connection, verifies the anchored identity again, then opens the
 writable connection. Descriptor identity checks reject replacement before or
 during the transition. A malformed catalog never reaches writable DuckDB
 access and is not migrated, repaired, or overwritten.
+
+| Embedding failure point | Durable result | Replay behavior |
+|---|---|---|
+| before configuration/work registration commits | no selected work is visible | rerun registers the immutable configuration and `eligible` item |
+| after `eligible` or `queued` commits | durable attemptable work with no unproven success | rerun admits or resumes it without discarding provenance |
+| after `in_progress`, before a classified outcome | attempt start and count remain; recovered abandoned work becomes `interrupted` | rerun admits the interruption subject to its remaining budget |
+| retryable provider, transport, or indexed-item result | `retryable` with safe status/retry metadata and committed attempt count | later admission retries only that item |
+| deterministic indexed image rejection before its limit | retryable image checkpoint; successful sibling text remains current | later admission spends only the image's remaining attempt budget |
+| deterministic item rejection at its limit, unsafe local image, or request-wide deterministic rejection | `terminal`, no placeholder vector; a request-wide rejection first terminalizes every unresolved indexed item | ordinary replay reuses the terminal disposition and does not repurchase it |
+| authentication or authorization stops a wave | completed siblings and telemetry commit; unresolved work remains recoverable `in_progress` | correct operator/provider state, then rerun |
+| validated hosted result before vector transaction | no source success is claimed | rerun may repeat that uncommitted attempt |
+| vector, response provenance, generation, success state, and counters commit | one proven source generation is current | rerun reuses it; changed input or explicit scoped reprocess archives it before replacement |
+| all long-text parts commit but aggregate does not | immutable successful part generations remain | rerun derives the missing aggregate locally without repeating proven parts |
+| both source vectors commit but midpoint does not | two independent source successes remain | rerun publishes only the missing local multimodal generation |
+| rendition installs before catalog publication | safe derived file may be an unreferenced orphan | validation reports it; a later completed full run retries bounded cleanup |
+
+### Full-run reconciliation
 
 Full reconciliation also has a durable retry boundary. Source pages are marked
 missing before affected identities are recomputed. A missing source remains
@@ -628,23 +771,20 @@ must match a retained canonical article or be null when the article disappeared.
 Obsolete derived renditions are descriptor-checked one candidate at a time and
 queried for exact current/historical reference before unlinking. Interrupted
 cleanup leaves a validator-visible harmless orphan for a later full run.
+When a new coordinator recovers an abandoned `running` embedding run, it marks
+that run `interrupted` and discards only its still-invisible staged actions.
+Actions already exposed by the run-marker transaction remain authoritative;
+physical compaction may resume but cannot change their public result.
 
-An unchanged rerun does not sweep a post-commit orphan. To remove one safely:
-
-1. Verify no pipeline process is active and run `validate` to obtain the exact
-   output-relative `text/.../*.md` orphan path.
-2. Query `articles.cleaned_markdown_path` for that exact relative path and
-   continue only if the count is zero.
-3. Resolve the candidate beneath the configured output root. Verify every
-   parent is a real directory, the leaf is a regular non-symlink `.md` file,
-   and the resolved path remains inside the output root's `text/` directory.
-4. Delete only that verified file, leave the dated directories in place, and
-   run `validate` again.
-
-Never delete a directory tree, a catalogued path, a symlink, or anything below
-the source root as orphan recovery.
+An unchanged rerun does not sweep a post-commit preprocessing orphan. The
+[README recovery procedure](../README.md#recovery) owns operator steps for
+locks, incompatible output, and any controlled cleanup; the architectural
+invariant is that cleanup may remove only a verified unreferenced generated
+leaf and never source data, a catalogued path, a symlink, or a directory tree.
 
 ## 10. Validation
+
+### Preprocessing validation
 
 `validate.py` streams catalog rows and generated files instead of accumulating
 the corpus in Python. It reports stable, sorted, content-free issue codes for:
@@ -667,6 +807,8 @@ bounded. Orphan traversal does not follow directory symlinks outside the
 generated tree. Symlink entries in the orphan walk are ignored rather than
 reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
+
+### Embedding cross-catalog and artifact validation
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
 and local header-image embeddings. It checks the exact version-16 embedding
@@ -746,7 +888,10 @@ directories. They must never read the licensed archive.
 | `test_recovery.py` | lock, interruptions, legacy refusal, path moves, orphan and symlink safety |
 | `test_validate.py` | every cross-artifact invariant and streaming behavior |
 | `test_smoke.py` | complete generated-fixture workflow and isolation from configured data |
-| `test_embeddings_pipeline.py` | exact downstream schema, no-follow reads, long-text boundaries/resume/aggregation, publication, run coverage, and validation |
+| `test_embeddings_pipeline.py` | exact downstream schema, no-follow reads, long-text boundaries/resume/aggregation, publication, run coverage, reconciliation, and validation |
+| `test_embedding_batching.py` | mixed-input packing, indexed outcomes, bounded concurrency/retries, rate observations, and fatal-wave durability |
+| `test_embedding_validation_stream.py` | bounded cross-catalog/artifact validation and scratch-index safety |
+| `test_pillow_image_codec.py` | pinned codec identity, exact-byte pass-through, deterministic rendition, and safe publication |
 | `test_embeddings_cli.py` | deterministic smoke, inventory, validation coverage, authorization, and bounded-run public CLI seams |
 
 The standard verification set is `pytest -q`, `ruff check .`,
@@ -766,104 +911,124 @@ The standard verification set is `pytest -q`, `ruff check .`,
 5. Update this contract if semantics changed. Never paste licensed text into a
    test or document.
 
-### Change the catalog schema
+### Change the preprocessing catalog schema
 
 1. Start with schema, malformed-schema, validation, and query tests.
 2. Update table definitions, exact schema validation, catalog methods, pipeline
-   writes, validation, and research queries together.
+   writes, cross-artifact validation, README queries, and this schema narrative
+   together.
 3. Bump `CATALOG_SCHEMA_VERSION`. The current policy is refusal, not automatic
    migration or deletion, so document the fresh-output procedure.
 4. Re-run the generated smoke workflow from an empty temporary output.
 
-### Change discovery or image rules
+### Add or change an embedding modality
+
+Move the modality enum/records, immutable profile fields and configuration
+identity, catalog constraints/tables/views, coordinator registration and
+publication, adapter payload/result mapping, generation provenance, run
+counters, validation coverage partitions, schema/refusal tests, smoke fixture,
+README queries, and this glossary together. Decide explicitly whether the
+modality is provider-backed or locally derived; a local modality must name and
+validate its source generations and must not invent hosted response provenance.
+
+### Change embedding schema version 16
+
+Start with exact relation/column/key/constraint/view-SQL tests and refusal tests
+for the previous and malformed schemas. Then update `wsj_embeddings/catalog.py`
+creation and catalog methods, lifecycle writes, every provenance producer,
+cross-catalog/artifact validation, README table/query references, and this
+schema section together. Bump the embedding schema version and preserve the
+fresh-output/refusal policy; do not add an implicit migration or write through
+the canonical views' visibility contract accidentally.
+
+### Change tokenizer or long-text policy
+
+Move the immutable tokenizer revision, artifact hash, engine identity, context
+ceiling/rules, aggregation identity, and `configuration_id` inputs together.
+Update `tokenizer.py`, `long_text.py`, coordinator part/checkpoint handling,
+`long_text_parts`, append-only part/aggregation provenance, bounded validator
+recomputation, generated boundary/resume/refusal tests, README summary, and
+this section. Prove exact substring reconstruction and that replay never uses a
+part from another input or configuration.
+
+### Change image admission or rendition policy
+
+Move safe decode ceilings, exact-byte pass-through, rendition algorithm and
+runtime codec identity, profile/configuration identity, `source_image.py`,
+`image_rendition.py`, coordinator publication, `image_input_provenance`, orphan
+handling, streaming validation, generated Pillow/boundary/refusal tests, README
+summary, and this section together. Never fetch remote `inline_image_urls`,
+mutate source bytes, or publish a placeholder vector.
+
+### Change batching or retry policy
+
+Move all immutable item/token/request/response/concurrency/attempt/backoff
+limits in the profile and `configuration_id` with `batching.py`, adapter indexed
+result handling, coordinator per-item transactions, run telemetry, lifecycle
+validation, retry/fatal/interruption tests, pilot observations, README summary,
+and this section. Preserve stable indexed outcomes, bounded response reads,
+durable attempt budgets, and already committed sibling results across a fatal
+wave.
+
+### Change discovery or reconciliation rules
 
 Add generated cases for lexical ordering, exclusions, ambiguity, missing
 images, and incremental classification. Preserve remote editorial image URLs
 without downloading them. Keep source and output roots disjoint and source
-paths relative.
+paths relative. For embeddings, move full-run inventory, bounded keyset cursors,
+`reconciliation_actions`, canonical view SQL/fingerprints, exact expected-state
+guards, physical compaction, rendition cleanup, streaming validation, and
+interruption/refusal tests together. Limited or incomplete traversal must
+remain unable to infer disappearance, staged actions must remain invisible,
+and compaction must not change the public view.
 
 ### Change orchestration or recovery
 
 Write an interruption test at the exact boundary first. Preserve exclusive
 locking, bounded transactions, file-before-catalog publication, post-commit
-orphan cleanup, and full-only missing-source reconciliation.
+orphan cleanup, and full-only missing-source reconciliation. If the embedding
+coordinator boundary moves, update work/generation transactions, batching
+callbacks, reconciliation recovery, run counters, validators, README recovery
+text, and the failure table above as one change.
 
 ## 13. Downstream boundaries
 
-Production runs and the generated pilot use the real hosted Jina API; automated
-tests use injected fake adapters or simulated HTTP transports only. Before
-licensed content is transmitted, the operator must have the required license
-authorization and accept the provider's current privacy and data-handling
-terms. The hosted model name is a mutable alias, so returned model/API metadata
-improves provenance but cannot guarantee exact hosted reproducibility. The pilot
-reports returned usage, billing fields, safe rate headers, and a small measured
-concurrency overlap; fields not returned remain unknown, and the observation is
-not a full-corpus cost or throughput promise. A real full-corpus run must not be
-left unattended.
+The [README operator workflow](../README.md#first-time-embedding-workflow) owns
+the authorization, smoke/pilot/run/validation sequence and recovery commands.
+This section defines which side of the architecture is allowed to do each kind
+of work.
 
-- The fixture tracer queries `articles`, opens `cleaned_markdown_path` and any
-  source-relative `header_image_path`, and writes all three vector modalities
-  outside the preprocessing output root. It
-  proves this seam only for generated inputs and an injected fake adapter.
-- The embedding coordinator anchors its disjoint output directory with
-  no-follow descriptors. Catalog and lock mutations remain relative to that
-  anchor even if the pathname changes, and lock cleanup removes only the inode
-  created by the current coordinator.
-- The explicit `wsj-embeddings pilot` sends generated probes only. The client
-  contract revision is never labeled as a live observation. Bounded OpenAPI and
-  model-catalogue reads retain strict allowlisted facts or a classified
-  `not_observed` outcome. Normal text/image/mixed success at the configured
-  dimension makes the result `ready_for_operator_review`; boundary settings are
-  confirmed only by their own generated probe outcomes. This readiness does not
-  authorize or automatically enable a run.
-- The separate `wsj-embeddings run` is the licensed-content Jina call surface: affirmative
-  hosted-processing authorization and exactly one positive lexical article
-  limit or explicit full scope are mandatory. Unchanged successful article
-  text is reused; retryable/interrupted work resumes and terminal work is not retried
-  implicitly. Missing declared images are counted separately from true
-  no-header articles without failing successful text. `--reprocess` regenerates
-  only the selected scope and retains superseded-generation provenance.
-  Completed explicit full runs reconcile disappeared articles and header
-  associations across configurations.
-  Once the embedding lock is reacquired, a new run terminalizes abandoned
-  prior `running` records as `interrupted` and discards only their invisible
-  staged reconciliation actions. Visible completed reconciliation is retained.
-- Hosted v4 work is greedily packed across text, image, and long-part items
-  under independent item, estimated-token, total encoded-byte, and response-byte
-  ceilings. Success and error bodies are read only through the response ceiling.
-  At most the profile's configured request concurrency is active. Indexed
-  results are validated and committed one item at a time on the coordinator as
-  each wave response is processed, before later retry sleeps or waves. Durable
-  prior attempts reduce each item's remaining budget. Retryable request or item
-  failures use bounded exponential backoff plus production jitter (injectable
-  for tests); usable numeric/RFC-date `Retry-After` and rate-reset headers can
-  lengthen the delay only to the configured maximum. A throttle halves
-  subsequent concurrency, while authentication, authorization, and invalid
-  request configuration stop the run. Run state stores only allowlisted finite
-  nonnegative numeric usage, request/retry/throttle counts, and elapsed seconds
-  covering preparation through final aggregation and metric publication.
-  Once a concurrent wave completes, exchanges are handled in stable submission
-  order and any request-wide fatal is raised only after completed sibling
-  outcomes have crossed their independent transactions; the failed run retains
-  those completed request and usage observations. A request-wide
-  deterministic rejection first terminalizes every unresolved item in that
-  rejected request and marks the run failed; replay does not repurchase those
-  items. An indexed deterministic image rejection retries only that image
-  through three durable attempts and preserves a successful text sibling.
-  Authentication and authorization leave recoverable in-progress
-  checkpoints for replay after operator correction. Intermediate long-part
-  failures do not block parent aggregation when that same part later succeeds.
-- Local header images are opened read-only without following symlinks and
-  hashed. Eligible images are base64-encoded from those same bytes; oversized
-  safe images use the verified deterministic rendition below the embedding
-  output root. Remote `inline_image_urls` are never fetched, decoded, queued,
-  or embedded. The bounded coordinator combines independently published text
-  and header-image vectors locally.
-- A temporal graph uses `published_at_utc` as the event instant and
-  `publication_date_new_york` for trading-day/calendar joins.
-- Market data, labels, models, summaries, graphs, and backtests get their own
-  schemas and lifecycles. They must not add fields or tables to this catalog
-  merely for one research project.
+- Preprocessing is immutable to the embedding slice. The coordinator queries
+  `articles`, opens canonical Markdown below the preprocessing output root and
+  any associated local header below the source root, and writes only below the
+  disjoint embedding output root. Remote `inline_image_urls` remain metadata;
+  they are never fetched, decoded, queued, or embedded.
+- The hosted boundary consists only of the generated pilot and authorized
+  production source-vector requests. Production may send canonical Markdown,
+  exact admitted image bytes, or deterministic rendition bytes. Automated
+  tests cross the same seams only through fake adapters or simulated HTTP
+  transports.
+- Provider work produces either one direct `article_text` vector or hosted text
+  part generations, plus `header_image` generations. It never produces the
+  token-count-weighted long-text aggregate or `multimodal_article`; both are
+  local derivations with explicit source-generation provenance and no raw
+  hosted response.
+- The requested hosted model is a mutable alias. `observed_model` records the
+  exact safe label observed by the generated pilot and bound into
+  `configuration_id`; every source response must match it. This strengthens
+  provenance but cannot guarantee exact hosted reproducibility if provider
+  behavior changes behind the label. The pilot's bounded usage, billing, rate,
+  and concurrency observations are not a corpus cost or throughput promise.
+- The output coordinator owns the exclusive lock, no-follow root anchoring,
+  durable lifecycle, batching, local derivation, publication, and full-run
+  reconciliation. The adapter owns transport and indexed responses. Detailed
+  mechanics live under [the embedding catalog](#separate-text-header-image-and-multimodal-embedding-catalog),
+  [recovery](#9-atomicity-and-recovery), and
+  [validation](#embedding-cross-catalog-and-artifact-validation).
+- Temporal graphs use `published_at_utc` as the event instant and
+  `publication_date_new_york` for trading-day/calendar joins. Market data,
+  labels, models, summaries, graphs, and backtests own separate schemas and
+  lifecycles; research-project fields do not belong in either shared catalog.
 
 ## 14. Code-reading order
 
@@ -873,7 +1038,7 @@ methods in `catalog.py`, followed by the lifecycle, ranking, and publication
 helpers in `pipeline.py`. Finish with `validate.py`, `cli.py`, and the matching
 test files. This order follows one source from discovery to research query.
 
-For the tracer slice, read `wsj_embeddings/config.py`, `models.py`, and
+For the embedding slice, read `wsj_embeddings/config.py`, `models.py`, and
 `adapters.py`; then `canonical_markdown.py`, `source_image.py`,
 `image_rendition.py`, `catalog.py`, and `pipeline.py`;
 finish with `validate.py`, `smoke.py`, `pilot.py`, `cli.py`, and the embedding
@@ -891,6 +1056,31 @@ catalog and the separate generated hosted probe.
   source root.
 - **article text embedding**: vector representation of a canonical article's
   complete editorial text; avoid the ambiguous term “article embedding.”
+- **configuration**: one immutable embedding behavior contract, including the
+  requested and observed model, tokenizer/long-text rules, batching and retry
+  limits, image policy, local formula, and client contract, identified by
+  `configuration_id`; multiple valid configurations may coexist.
+- **observed model**: the exact safe hosted model label returned consistently by
+  successful generated pilot probes, included in configuration identity and
+  required on each hosted source generation; it is an observation, not a
+  promise that a mutable provider alias can never change behavior.
+- **modality**: one vector role. `article_text` and `header_image` have hosted
+  source generations; `multimodal_article` is their locally derived midpoint.
+- **work item**: the durable current lifecycle record keyed by article,
+  modality, and configuration. It records admission, attempt, disposition, and
+  active generation identity without storing editorial content.
+- **generation**: one successfully published vector identity under a run and
+  immutable configuration. Reuse preserves it; replacement archives its
+  content-free facts rather than rewriting history.
+- **provenance**: append-only, content-free evidence linking a generation to
+  its hosted response facts, image input facts, immutable long-text parts, or
+  multimodal source generations and stored-vector hashes.
+- **rendition**: a deterministic, verified image artifact derived below the
+  embedding output root when safe source bytes exceed hosted limits;
+  exact-byte pass-through has no rendition path.
+- **reconciliation action**: an exact expected-state transition staged during
+  a completed full embedding run, invisible until one run-marker transaction
+  exposes all of that run's actions through the canonical views.
 - **inline image URL**: remote HTTP(S) editorial reference preserved in order,
   never downloaded here.
 - **manifest**: cheap source/image fingerprints plus processing status used for
@@ -904,6 +1094,9 @@ catalog and the separate generated hosted probe.
 - **stale input**: content-free work disposition for an input removed or made
   ineligible by completed full reconciliation; it retains no input hash or
   active generation.
+- **stale configuration**: reserved generation-free disposition for explicit
+  invalid or unsupported configuration reconciliation; ordinary coexistence of
+  valid configuration identities never creates it.
 - **orphan**: generated Markdown not referenced by the current `articles`
   table.
 - **content-free failure**: stable code/message that contains no licensed
