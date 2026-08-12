@@ -459,17 +459,26 @@ wsj-embeddings validate \
   --configuration-id '<configuration-id>'
 ```
 
-The downstream catalog is a separate schema-version-16 `catalog.duckdb` below a
-root that must be disjoint from both the licensed source root and preprocessing
-output root. The generated smoke and injected-adapter coordinator exercise the
-same catalog contract as the explicitly rooted production CLI.
-Versions 1 through 15 are refused without migration; move reproducible derived
-output aside or choose a fresh embedding output root.
+### Maintainer reference
 
-The catalog has exactly thirteen base tables, two canonical views, and no
-indexes. The operational
-`full_run_articles` relation stores only run/article identity and optional
-source-relative header association, never Markdown or image bytes:
+For the detailed contracts behind this reference, see the crash course's
+[embedding schema](docs/architecture-crash-course.md#separate-text-header-image-and-multimodal-embedding-catalog),
+[atomicity and recovery](docs/architecture-crash-course.md#9-atomicity-and-recovery),
+[validation](docs/architecture-crash-course.md#10-validation),
+[downstream boundary](docs/architecture-crash-course.md#13-downstream-boundaries),
+and [glossary](docs/architecture-crash-course.md#15-glossary).
+
+### Schema-v16 catalog reference
+
+The downstream catalog is a separate schema-version-16 `catalog.duckdb` below
+an embedding output root that must be disjoint from both the licensed source
+root and preprocessing output root. Versions 1 through 15 are refused without
+migration: move reproducible derived output aside or choose a fresh embedding
+output root. The catalog has exactly thirteen base tables, two canonical views,
+and no indexes. `full_run_articles` stores only run/article identity and an
+optional source-relative header association, never Markdown or image bytes.
+
+The operational table and view inventory is:
 
 | Table | Ordered columns | Key |
 |---|---|---|
@@ -489,206 +498,92 @@ source-relative header association, never Markdown or image bytes:
 | `long_text_part_generations` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `generation_run_id VARCHAR`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `derivation_kind VARCHAR`, `raw_response_sha256 VARCHAR`, `response_model VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index, generation_run_id)` |
 | `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
 
-The source path is nullable for article text and absent images. The input hash
-is nullable for content-free `stale_input` work, `not_applicable` image work,
-and only one applicable case: a
-safe-path `retryable` header with `missing_header_image`, zero adapter attempts,
-and no active vector or generation. The three failure-detail columns retain
-classified codes and numeric response/retry metadata, never exception text or
-editorial content. Work states are `eligible`, `queued`, `in_progress`,
-`succeeded`, `retryable`, `terminal`, `interrupted`, `not_applicable`,
-`stale_input`, and `stale_configuration`. Fresh or invalidated work is first
-durably `eligible`, then admitted to `queued` before an adapter attempt.
-`stale_input` is a generation-free completed-full-run disposition; its header
-path equals the retained canonical association, or is null when the article
-disappeared. `not_applicable` means no canonical header; header failures remain
-distinct and count in `header_failed`. Changed exact image bytes archive the
-prior image generation as `input_changed` and invalidate only that image plus
-its same-configuration multimodal dependent. A changed configuration uses a
-separate work key and
-leaves the prior configuration queryable.
-`stale_configuration` is a generation-free terminal disposition reserved for
-explicit reconciliation of invalid or unsupported recorded configuration
-identity. It is never inferred merely because valid configurations coexist.
+`configuration_id` is the SHA-256 of compact, key-sorted configuration JSON,
+including the requested model alias and exact observed hosted model. A changed
+observed model creates a separate valid, queryable configuration; valid
+configurations coexist, so select one explicitly for validation and research.
 
-Production requests may mix article text, header images, and long-text parts.
-Each request is bounded independently by item count, estimated text tokens,
-total encoded input bytes, response bytes, and configured concurrency. HTTP
-success and error bodies are read only through that response ceiling. Response indexes are
-validated independently and every item commits in its own transaction, so a
-valid sibling survives a missing or malformed response item. Retryable
-timeouts, connection errors, rate limits, and eligible server failures use
-bounded exponential backoff with real bounded jitter (injectable in tests).
-Numeric or RFC 9110 HTTP-date `Retry-After` and zero-remaining rate-reset
-headers are honored up to the configured maximum wait; throttling halves later
-concurrency without exceeding its configured maximum. Authentication,
-authorization, and invalid request configuration stop the run. Summaries and
-`runs` store only nonnegative counts, allowlisted numeric token usage,
-retry/throttle observations, and whole-run elapsed seconds—never request
-content. Each durable prior attempt reduces the remaining request budget, so
-replay cannot purchase beyond the configured ceiling.
-All completed exchanges in a concurrent wave are processed in stable submission
-order before a request-wide fatal error is raised, preserving successful sibling
-work and its usage telemetry. A request-wide deterministic rejection terminalizes every unresolved
-item in the rejected request before the run is marked failed; replay does not
-repurchase those terminal items. An indexed deterministic image rejection
-retries only that image through its durable three-attempt limit, preserving a
-successful text sibling. Authentication and authorization failures
-remain recoverable in-progress checkpoints after the operator corrects access.
-A long part that succeeds on an in-run retry no longer leaves its parent
-marked failed and therefore participates in immediate complete-part aggregation.
-Every successful image generation has content-free `image_input_provenance`:
-source and exact embedded-input hashes, formats, byte counts, dimensions, frame counts,
-transform identity, and an optional output-relative rendition path. It stores
-no image bytes. Pass-through uses `exact-source-bytes-v1`; derived rows name
-the pinned transform and exact JPEG rendition supplied to the adapter.
-Read-only validation decodes current source and embedded bytes with the matching
-profile codec, proves their recorded hashes/formats/byte counts/dimensions/frame
-counts, enforces the safe source-decode ceiling for current and archived
-generations, and proves the pass-through-versus-JPEG decision. Malformed
-dimensions become stable validation issues rather than aborting validation.
-Validation rejects unknown provenance configuration
-references, and descriptor-scans the rendition namespace without following
-symlinks. Unreferenced final and interrupted temporary renditions are reported
-as harmless orphans rather than deleted.
-The configured archive root is opened as an accessible, no-follow directory
-before the preprocessing catalog, any item, or embedding output is touched. An
-absent, non-directory, or inaccessible archive root is an operational
-`source_root` failure; only an absent optional leaf below a proven root becomes
-`missing_header_image`. If a formerly applicable canonical header becomes
-absent, one transaction archives/removes both its image vector and its
-same-configuration multimodal dependent before recording `not_applicable`.
-`configuration_id` is the SHA-256 of compact,
-key-sorted JSON covering requested model alias, exact observed hosted model,
-implemented-against API
-contract version, task,
-dimensions, output type, normalization, tokenizer artifact and engine,
-context rules/ceiling, long-text aggregation and attempt limit, batching
-payload/response/concurrency/retry policy, image input/transform rules, multimodal
-formula, and client configuration version. A changed observed model creates a
-separate queryable configuration. The provider-returned model is also recorded
-per hosted vector generation and must equal that immutable observation.
-`raw_response_sha256` covers canonical
-compact JSON bytes for the exact raw embedding array; `stored_vector_sha256`
-covers normalized little-endian float32 bytes. Locally derived long-text
-aggregates and multimodal midpoints have explicit derivation kinds and null
-raw-response/model fields.
-The tokenizer engine is exactly `tokenizers-0.21.4`; checksum-verified artifact
-bytes are decoded and loaded directly from memory, so a path replacement after
-verification cannot change the tokenizer. The current long-text rule is
-`l2-token-count-weighted-mean-float32-v1`. The input ceiling is 8,000 tokens,
-leaving 192 tokens of framing headroom below the confirmed 8,192-token model
-context. Inputs through that ceiling receive one provider-pooled vector.
-Longer inputs commit each normalized operational part vector independently,
-then publish one canonical `article_text` vector as the float32 L2-normalized
-token-count-weighted mean. Retryable part requests become terminal after three
-committed attempts. The part, parent article work, and terminal run count change
-in one transaction. If attempt three was checkpointed before an interruption,
-replay terminalizes the work without another hosted call. Mutable checkpoints
-remain terminal on ordinary replay; bounded explicit reprocess atomically resets
-every part before making new hosted calls. Mutable checkpoints point to
-append-only part-generation
-rows; explicit reprocess clears only the checkpoint, never a generation named
-by active or archived aggregate provenance. Part vectors and their append-only
-aggregate linkage are audit/resume state, never additional research
-observations in `embeddings`. `input_sha256` hashes the exact canonical Markdown or
-local header-image bytes. For `multimodal_article`, it hashes the content-free
-source-generation identity and formula. `stored_vector_sha256` hashes the
-normalized vector encoded as little-endian float32 values. Current modalities
-are `article_text`, `header_image`, and `multimodal_article`; vectors must be
-finite, nonzero, L2-normalized, and exactly 2,048-dimensional. A composite is
-published only while both successful sources belong to its exact configuration.
-Its append-only provenance records both source generation IDs/vector hashes and
-`l2-normalize-0.5-text-0.5-image-v1`; it stores no editorial content. Superseded
-research-vector history stores only identities, hashes, run IDs, reason, and
-time. Append-only operational part generations retain their vectors for audit
-and aggregate reconstruction, but never Markdown, image bytes, or excerpts.
-`last_run_id` records the latest observation or attempt, while nullable
-`generation_run_id` is set only for a successful active vector and remains
-unchanged across reuse. Supersession history therefore names the run that
-actually generated the archived vector rather than a later replay.
+Work states are `eligible`, `queued`, `in_progress`, `succeeded`, `retryable`,
+`terminal`, `interrupted`, `not_applicable`, `stale_input`, and
+`stale_configuration`. Fresh or invalidated work begins durably `eligible`, is
+admitted to `queued`, and becomes `in_progress` before an adapter attempt.
+`not_applicable` means an article has no canonical header. `stale_input` and
+`stale_configuration` are explicit reconciliation dispositions; coexistence of
+valid configurations never creates `stale_configuration`.
 
-Full reconciliation first stages exact identity-bound actions in bounded action
-pages using strict monotonic `(article_id, modality, configuration_id)` cursors.
-Failed staging is invisible. One run-marker commit exposes the complete action
-set atomically through the canonical views, then bounded idempotent compaction
-materializes the same state with a monotonic cursor that also includes
-`run_id`. Exact schema validation fingerprints the normalized behavior-bearing
-SQL of both canonical views. Header association changes preserve a
-configuration already matching the new path and stale only mismatched header
-and dependent multimodal work. Derived renditions are removed only after their
-catalog references commit, with one exact history-reference query per scanned
-candidate rather than a corpus-sized set. If cleanup is interrupted, offline
-validation reports the unreferenced file as `orphan_image_rendition`; a later
-completed full run safely retries cleanup without touching source or
-preprocessing output.
-After the exclusive embedding lock is reacquired, a new run first marks any
-prior `running` records `interrupted` and then discards their still-invisible
-reconciliation actions in bounded pages. Completed visible reconciliation is
-never changed by this crash recovery.
+The supported modalities are `article_text`, `header_image`, and
+`multimodal_article`. All published vectors are finite, normalized float32
+vectors with 2,048 dimensions. Canonical Markdown at or below the 8,000-token
+direct ceiling is submitted once; longer text is processed with durable,
+three-attempt part checkpoints and published as one `article_text` vector.
+Header-image work also has a durable three-attempt policy for deterministic
+request rejection. Operators need only inspect the content-free run counters
+and retryable or terminal states; the batching, long-text, and image-rendition
+implementation contracts are in the [crash course](docs/architecture-crash-course.md#separate-text-header-image-and-multimodal-embedding-catalog).
 
-A retained catalog can be queried without joining back to article bodies:
+### Repeat runs, reprocessing, and recovery
+
+Unchanged matching work is reused. A limited or interrupted run never infers
+deletion; only a successfully completed explicit `--full` run may reconcile a
+disappearance. `--reprocess` is deliberate, bounded regeneration of the
+selected scope, not schema migration. A real `--full` or
+`--full --reprocess` requires explicit authorization in the current task.
+
+If a catalog is incompatible, move the generated embedding output aside or use
+a fresh embedding output root; do not migrate, overwrite, or delete it in
+place. After a process dies, verify that no embedding pipeline process is
+active, remove only the exact stale `<embedding-output-root>/pipeline.lock`,
+then rerun the same idempotent command. Validation reports harmless orphan
+renditions; a later successfully completed full run safely retries their
+cleanup. Never delete source data, a broad directory tree, a catalog, or an
+active lock for recovery. See the crash course's
+[recovery boundary](docs/architecture-crash-course.md#9-atomicity-and-recovery)
+and [validation contract](docs/architecture-crash-course.md#10-validation).
+
+### Maintainer queries
+
+Select an explicit configuration before reading vectors:
 
 ```sql
 SELECT
     e.article_id,
-    e.source_relative_path,
+    e.modality,
     e.published_at_utc,
-    e.publication_date_new_york,
-    c.model,
-    c.task,
+    e.stored_vector_sha256,
     e.vector
 FROM embeddings AS e
-JOIN embedding_configurations AS c USING (configuration_id)
-WHERE e.modality IN ('article_text', 'header_image', 'multimodal_article')
-  AND e.configuration_id = '<configuration_id>'
-  AND e.publication_date_new_york
-      BETWEEN DATE '2024-01-01' AND DATE '2024-01-31'
+WHERE e.configuration_id = '<configuration_id>'
+  AND e.modality = 'article_text'
 ORDER BY e.published_at_utc, e.article_id;
 ```
 
-Embedding validation opens both catalogs read-only, checks exact schemas before
-data, links each vector to a canonical `articles` row, rehashes canonical
-Markdown and local header images through no-follow descriptors, checks
-publication metadata and both hashes, and verifies that successful run counts
-exactly match the active or superseded generations that name that run as their
-immutable generator. It requires provenance for every active and superseded
-composite, re-derives its content-free input identity, resolves both source
-links, and recomputes each active equal-weight normalized midpoint. An
-impossible midpoint is reported rather than skipped.
-Corpus scans use bounded cursor pages rather than loading article, work,
-provenance, or vector relations into Python. The largest vector page contains
-32 vectors, or eight rows for three-vector multimodal recomputation. Long-text
-aggregation retains one fixed 2,048-value accumulator and one current Markdown
-artifact. Rendition orphan checks use a content-free temporary SQLite reference
-index. Validation probes a writable scratch parent only after proving it is
-neither inside nor an ancestor of the source, preprocessing, or embedding root.
-It retains the verified parent descriptor, creates and opens its private child
-descriptor-relatively, and accesses SQLite only through that held descriptor's
-Linux `/proc/self/fd` path. Parent-path replacement therefore cannot redirect a
-write. If no safe candidate or descriptor filesystem is available, it reports
-`validation_scratch_unavailable` without a pathname fallback. The scratch
-directory is removed descriptor-relatively on return.
-It also validates part identities, limits, bounded attempts,
-lifecycle/vector checkpoints, and aggregate linkage. Every active and archived
-long-text aggregate must resolve all of its immutable part generations and
-recompute to the recorded aggregate hash; active vectors must also equal that
-recomputation. For aggregates matching current canonical input, validation
-reopens Markdown and proves the recorded character and UTF-8 byte spans are
-ordered, gapless, non-overlapping, cover the whole file, and hash to each part.
-Missing provenance or self-consistent part tampering is therefore reported
-without loading a tokenizer or credential.
-It emits stable issues without article text or vector values, including
-distinct missing, queued, in-progress, interrupted, retryable, and terminal
-header-image dispositions; a true no-header `not_applicable` row is valid and
-silent. It also requires a header disposition for every article/configuration
-selected by article-text work and reconciles the latest run's `header_absent`
-and `header_failed` claims against durable header work. When more than one
-configuration exists, callers must select an explicit `configuration_id`;
-validation never silently mixes generations.
-Every vector exposed by the canonical `embeddings` view must also join the
-same public article/modality/configuration work key in `succeeded` state with
-matching source path, input hash, and a same-configuration generating run.
+List the valid configuration identities and their requested and observed models:
+
+```sql
+SELECT configuration_id, model, observed_model, task, dimensions
+FROM embedding_configurations
+ORDER BY configuration_id;
+```
+
+Inspect recent content-free run summaries:
+
+```sql
+SELECT run_id, configuration_id, scope, status, reused, attempted, succeeded,
+       retryable, terminal, interrupted, header_absent, header_failed,
+       started_at, finished_at
+FROM runs
+ORDER BY started_at DESC;
+```
+
+Inspect durable coverage states for one configuration:
+
+```sql
+SELECT modality, state, count(*) AS items
+FROM embedding_work_items
+WHERE configuration_id = '<configuration_id>'
+GROUP BY modality, state
+ORDER BY modality, state;
+```
 
 ## Incremental runs and reprocessing
 
