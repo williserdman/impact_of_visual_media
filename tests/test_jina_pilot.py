@@ -36,7 +36,7 @@ class PilotTransport:
         del headers, timeout_seconds, max_response_bytes
         self.metadata_requests.append(url)
         if url == "https://api.jina.ai/openapi.json":
-            payload = {"info": {"version": "live-contract-test-v2"}}
+            payload = {"info": {"version": "2026.07.27.1603"}}
         elif url == "https://api.jina.ai/v1/models":
             payload = {
                 "data": [
@@ -158,12 +158,26 @@ def _run_pilot(transport, *, capsys) -> dict[str, object]:
                 200,
                 {},
                 (
-                    '{"info":{"version":"safe"},"data":[],"number":'
+                        '{"info":{"version":"2026.07.27.1603"},"data":[],"number":'
                     + ("9" * 500)
                     + "}"
                 ).encode(),
             ),
-            {"outcome": "observed", "status_code": 200, "version": "safe"},
+            {
+                "outcome": "observed",
+                "status_code": 200,
+                "version": "2026.07.27.1603",
+            },
+        ),
+        (
+            JinaHttpResponse(
+                200,
+                {},
+                b'{"info":{"version":"2026.07.27.1603"},"number":'
+                + (b"9" * 5_000)
+                + b"}",
+            ),
+            {"outcome": "not_observed", "reason": "invalid_response"},
         ),
     ],
 )
@@ -212,6 +226,22 @@ def test_pilot_classifies_unavailable_malformed_and_oversized_metadata(
             {"info": {"version": "Bearer metadata-secret-token"}},
         ),
         (
+            "openapi.json",
+            {"info": {"version": "metadata-secret-token"}},
+        ),
+        (
+            "openapi.json",
+            {"info": {"version": "secret-token"}},
+        ),
+        (
+            "v1/models",
+            {"data": [{"id": "jina_secret_token"}]},
+        ),
+        (
+            "v1/models",
+            {"data": [{"id": "jina-embeddings-v4-secret-token"}]},
+        ),
+        (
             "v1/models",
             {
                 "data": [
@@ -219,6 +249,28 @@ def test_pilot_classifies_unavailable_malformed_and_oversized_metadata(
                         "id": "jina-embeddings-v4",
                         "context_length": 10**500,
                         "input_modalities": ["text"],
+                    }
+                ]
+            },
+        ),
+        (
+            "v1/models",
+            {
+                "data": [
+                    {
+                        "id": "jina-embeddings-v4",
+                        "input_modalities": ["text", "metadata-secret-token"],
+                    }
+                ]
+            },
+        ),
+        (
+            "v1/models",
+            {
+                "data": [
+                    {
+                        "id": "jina-embeddings-v4",
+                        "output_modalities": ["secret-token"],
                     }
                 ]
             },
@@ -275,14 +327,25 @@ def test_pilot_rejects_unsafe_allowlisted_metadata_values_content_free(
     assert "metadata-secret-token" not in output
 
 
-def test_pilot_rejects_secret_like_returned_model_without_echo(capsys) -> None:
+@pytest.mark.parametrize(
+    "unsafe_model",
+    (
+        "Bearer response-model-secret",
+        "jina-embeddings-v4-secret-token",
+        "jina-embeddings-v4-metadata-secret-token",
+        "jina_secret_token",
+    ),
+)
+def test_pilot_rejects_secret_like_returned_model_without_echo(
+    unsafe_model: str, capsys
+) -> None:
     """Break caught: printable response model labels can carry arbitrary secrets."""
 
     class UnsafeModelTransport(PilotTransport):
         def post(self, url: str, **kwargs) -> JinaHttpResponse:
             response = super().post(url, **kwargs)
             payload = json.loads(response.body)
-            payload["model"] = "Bearer response-model-secret"
+            payload["model"] = unsafe_model
             return JinaHttpResponse(
                 response.status_code,
                 response.headers,
@@ -294,7 +357,7 @@ def test_pilot_rejects_secret_like_returned_model_without_echo(capsys) -> None:
 
     assert result["probes"][0]["status"] == "rejected"
     assert result["probes"][0]["error"] == "invalid_response"
-    assert "response-model-secret" not in output
+    assert unsafe_model not in output
 
 
 def test_pilot_metadata_is_observed_from_fixed_live_endpoints(capsys) -> None:
@@ -611,7 +674,7 @@ def test_pilot_reports_absent_billing_and_operator_review_readiness(capsys) -> N
         "openapi": {
             "outcome": "observed",
             "status_code": 200,
-            "version": "live-contract-test-v2",
+            "version": "2026.07.27.1603",
         },
     }
 

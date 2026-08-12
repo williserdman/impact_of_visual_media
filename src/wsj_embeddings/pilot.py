@@ -25,9 +25,15 @@ from wsj_embeddings.batching import (
 )
 
 _SAFE_METADATA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_SAFE_API_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,127}$")
-_SAFE_MODEL_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,127}$")
-_SAFE_MODALITY = re.compile(r"^[a-z][a-z0-9._+\-]{0,63}$")
+_SAFE_API_VERSION = re.compile(r"^\d{4}\.\d{2}\.\d{2}\.\d{4}$")
+_SAFE_JINA_MODEL_LABEL = re.compile(
+    r"^jina-embeddings-v4(?:-[a-z0-9][a-z0-9._-]{0,95})?$"
+)
+_UNSAFE_MODEL_COMPONENTS = frozenset(
+    {"bearer", "credential", "key", "password", "secret", "token"}
+)
+_SAFE_INPUT_MODALITIES = frozenset({"image", "pdf", "text"})
+_SAFE_OUTPUT_MODALITIES = frozenset({"embedding"})
 _SAFE_CURRENCY = re.compile(r"^[A-Z]{3}$")
 _MAX_SAFE_METADATA_NUMBER = 1_000_000_000_000_000.0
 _SAFE_MODEL_NUMERIC_FIELDS = (
@@ -395,8 +401,7 @@ def _observe_model_catalogue(adapter: JinaEmbeddingAdapter) -> dict[str, object]
             item
             for item in data
             if isinstance(item, Mapping)
-            and _safe_domain_label(item.get("id"), _SAFE_MODEL_LABEL)
-            == adapter.profile.model
+            and _safe_jina_model_label(item.get("id")) == adapter.profile.model
         ),
         None,
     )
@@ -414,10 +419,13 @@ def _observe_model_catalogue(adapter: JinaEmbeddingAdapter) -> dict[str, object]
         if number is None:
             return _malformed_metadata(status_code)
         safe_model[name] = number
-    for name in ("input_modalities", "output_modalities"):
+    for name, allowed in (
+        ("input_modalities", _SAFE_INPUT_MODALITIES),
+        ("output_modalities", _SAFE_OUTPUT_MODALITIES),
+    ):
         if name not in model:
             continue
-        labels = _safe_label_list(model.get(name), pattern=_SAFE_MODALITY)
+        labels = _safe_label_list(model.get(name), allowed=allowed)
         if labels is None:
             return _malformed_metadata(status_code)
         safe_model[name] = labels
@@ -474,13 +482,23 @@ def _safe_pricing(value: object) -> dict[str, object] | None:
     return pricing
 
 
-def _safe_label_list(value: object, *, pattern: re.Pattern[str]) -> list[str] | None:
+def _safe_label_list(
+    value: object, *, allowed: frozenset[str]
+) -> list[str] | None:
     if not isinstance(value, list) or len(value) > 32:
         return None
-    labels = [_safe_domain_label(item, pattern) for item in value]
-    if any(label is None for label in labels):
+    if any(not isinstance(item, str) or item not in allowed for item in value):
         return None
-    return [label for label in labels if label is not None]
+    return list(value)
+
+
+def _safe_jina_model_label(value: object) -> str | None:
+    if not isinstance(value, str) or _SAFE_JINA_MODEL_LABEL.fullmatch(value) is None:
+        return None
+    components = frozenset(re.split(r"[-._]", value.lower()))
+    if components & _UNSAFE_MODEL_COMPONENTS:
+        return None
+    return value
 
 
 def _safe_domain_label(value: object, pattern: re.Pattern[str]) -> str | None:

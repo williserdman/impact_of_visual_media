@@ -61,7 +61,12 @@ _SAFE_RATE_LIMIT_HEADERS = frozenset(
     }
 )
 _MAX_SAFE_RATE_LIMIT_VALUE = 1_000_000_000_000_000.0
-_SAFE_MODEL_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,127}$")
+_SAFE_JINA_MODEL_LABEL = re.compile(
+    r"^jina-embeddings-v4(?:-[a-z0-9][a-z0-9._-]{0,95})?$"
+)
+_UNSAFE_MODEL_COMPONENTS = frozenset(
+    {"bearer", "credential", "key", "password", "secret", "token"}
+)
 _SAFE_CURRENCY = re.compile(r"^[A-Z]{3}$")
 
 
@@ -617,7 +622,7 @@ class JinaEmbeddingAdapter:
     def _decode_success(response: JinaHttpResponse) -> Mapping[str, object]:
         try:
             payload = json.loads(response.body)
-        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             raise JinaHostedAdapterError("invalid_response", retryable=False) from None
         if not isinstance(payload, dict):
             raise JinaHostedAdapterError("invalid_response", retryable=False)
@@ -856,7 +861,10 @@ def _safe_billing(value: object) -> dict[str, int | float | str]:
 def _safe_response_model(value: object) -> str | None:
     """Retain a bounded content-free model label exactly as returned."""
 
-    if not isinstance(value, str) or _SAFE_MODEL_LABEL.fullmatch(value) is None:
+    if not isinstance(value, str) or _SAFE_JINA_MODEL_LABEL.fullmatch(value) is None:
+        return None
+    components = frozenset(re.split(r"[-._]", value.lower()))
+    if components & _UNSAFE_MODEL_COMPONENTS:
         return None
     return value
 
