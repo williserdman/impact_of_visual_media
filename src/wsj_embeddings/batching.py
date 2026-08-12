@@ -133,6 +133,9 @@ def execute_rate_aware_batches(
     jitter: Callable[[int], float] = _production_jitter,
     monotonic: Callable[[], float] = time.monotonic,
     before_attempt: Callable[[int, int], None] | None = None,
+    before_wave: (
+        Callable[[tuple[tuple[JinaEmbeddingInput, ...], ...]], None] | None
+    ) = None,
     on_outcome: Callable[[int, int, JinaBatchItemOutcome, bool], None] | None = None,
     prior_attempt_counts: Sequence[int] | None = None,
     attempt_limits: Sequence[int] | None = None,
@@ -185,6 +188,10 @@ def execute_rate_aware_batches(
             for batch in wave:
                 for item in batch:
                     before_attempt(item.index, item.attempt)
+        if before_wave is not None:
+            before_wave(
+                tuple(tuple(item.value for item in batch) for batch in wave)
+            )
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [
                 executor.submit(

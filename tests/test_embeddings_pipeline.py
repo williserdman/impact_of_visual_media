@@ -1207,6 +1207,110 @@ def test_rate_aware_coordinator_batches_mixed_items_and_summarizes_hosted_usage(
         ]
 
 
+def test_bounded_text_run_waits_for_durable_request_quota(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:SYNTHETIC-SECOND-QUOTA",
+        markdown="# Second quota article\n",
+    )
+
+    class OnePerMinuteAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_concurrency=1,
+            batch_max_attempts=2,
+            quota_max_requests=1,
+            quota_max_estimated_tokens=90_000,
+            client_configuration_version="synthetic-one-request-minute-v1",
+        )
+
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    adapter = OnePerMinuteAdapter()
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=2,
+        batch_sleep=advance,
+        batch_jitter=lambda _attempt: 0.0,
+        quota_clock=lambda: now[0],
+    )
+
+    assert [len(call) for call in adapter.calls] == [1, 1]
+    assert sleeps == [60.0]
+    assert result.embeddings == 2
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT count(*) FROM hosted_request_reservations"
+        ).fetchone() == (2,)
+
+
+def test_quota_reservation_survives_interruption_before_transport_and_replay(
+    tmp_path,
+):
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class OnePerMinuteAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_concurrency=1,
+            batch_max_attempts=2,
+            quota_max_requests=1,
+            quota_max_estimated_tokens=90_000,
+            client_configuration_version="synthetic-quota-crash-v1",
+        )
+
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    interrupted_adapter = OnePerMinuteAdapter()
+
+    def interrupt(_reservation_ids: tuple[str, ...]) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_embedding_pipeline(
+            config,
+            interrupted_adapter,
+            limit=1,
+            quota_clock=lambda: now[0],
+            failpoints=EmbeddingPipelineFailpoints(
+                after_quota_reservation=interrupt
+            ),
+        )
+
+    assert interrupted_adapter.calls == []
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT count(*) FROM hosted_request_reservations"
+        ).fetchone() == (1,)
+
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    resumed_adapter = OnePerMinuteAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        limit=1,
+        quota_clock=lambda: now[0],
+        batch_sleep=advance,
+    )
+
+    assert sleeps == [60.0]
+    assert len(resumed_adapter.calls) == 1
+    assert resumed.succeeded == 1
+
+
 def test_hosted_source_hashes_and_response_model_survive_active_and_history(
     tmp_path,
 ):
