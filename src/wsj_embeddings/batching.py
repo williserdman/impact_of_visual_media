@@ -286,10 +286,20 @@ def execute_rate_aware_batches(
                     _rate_header_delay(headers, policy.max_backoff_seconds)
                 )
             if len(exchange.items) != len(batch):
-                raise JinaHostedAdapterError("invalid_response", retryable=False)
+                fatal_errors.append(
+                    JinaHostedAdapterError("invalid_response", retryable=False)
+                )
+                continue
+            malformed_indexes = any(
+                outcome.index != local_index
+                for local_index, outcome in enumerate(exchange.items)
+            )
+            if malformed_indexes:
+                fatal_errors.append(
+                    JinaHostedAdapterError("invalid_response", retryable=False)
+                )
+                continue
             for item, outcome in zip(batch, exchange.items, strict=True):
-                if outcome.index != batch.index(item):
-                    raise JinaHostedAdapterError("invalid_response", retryable=False)
                 deterministic_image_retry = (
                     outcome.vector is None
                     and outcome.error_code == "deterministic_request"

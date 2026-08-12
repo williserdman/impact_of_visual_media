@@ -16,7 +16,11 @@ from wsj_embeddings.adapters import (
     JinaHostedAdapterError,
     JinaResponseMetadata,
 )
-from wsj_embeddings.batching import BatchPolicy, execute_rate_aware_batches
+from wsj_embeddings.batching import (
+    BatchExecutionFatal,
+    BatchPolicy,
+    execute_rate_aware_batches,
+)
 
 
 def _vector(index: int) -> JinaEmbeddedVector:
@@ -236,6 +240,49 @@ def test_scheduler_waits_for_rate_reset_before_deferred_work():
     assert sleeps == [3.0]
     assert result.throttles == 1
     assert result.retries == 0
+
+
+@pytest.mark.parametrize("malformed_kind", ("count", "index"))
+def test_scheduler_wraps_malformed_later_response_with_accumulated_metrics(
+    malformed_kind,
+):
+    """Break caught: shape validation discards safe earlier observations."""
+
+    malformed_items = (
+        ()
+        if malformed_kind == "count"
+        else (JinaBatchItemOutcome(1, _vector(1), None),)
+    )
+    adapter = ScenarioBatchAdapter(
+        [
+            _response(
+                1,
+                headers={"x-ratelimit-remaining-requests": 0.0},
+                usage={"prompt_tokens": 7},
+            ),
+            JinaEmbeddingBatchResponse(
+                malformed_items,
+                {"prompt_tokens": 3},
+                JinaResponseMetadata(200, "jina-embeddings-v4", {}),
+            ),
+        ]
+    )
+
+    with pytest.raises(BatchExecutionFatal) as caught:
+        execute_rate_aware_batches(
+            adapter,
+            (JinaEmbeddingInput.text("first"), JinaEmbeddingInput.text("second")),
+            policy=BatchPolicy(1, 100, 100, 1, 2, 0.0, 0.0),
+            sleep=lambda _seconds: None,
+            jitter=lambda _attempt: 0.0,
+            monotonic=iter((1.0, 2.0)).__next__,
+        )
+
+    assert caught.value.code == "invalid_response"
+    assert caught.value.requests == 2
+    assert caught.value.usage == {"prompt_tokens": 10}
+    assert caught.value.throttles == 1
+    assert caught.value.elapsed_seconds == 1.0
 
 
 def test_scheduler_emits_each_wave_outcome_before_later_fatal_request():
