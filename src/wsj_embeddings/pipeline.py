@@ -40,6 +40,7 @@ from wsj_embeddings.image_rendition import (
     ImageCodecError,
     PillowImageCodec,
     PreparedImageInput,
+    cleanup_orphan_image_renditions,
     install_image_rendition,
     prepare_image_input,
     verify_image_rendition,
@@ -95,6 +96,10 @@ class EmbeddingPipelineFailpoints:
     after_long_text_terminal_transition: Callable[[int], None] | None = None
     after_image_rendition_install: Callable[[str], None] | None = None
     after_batched_item_outcome_commit: Callable[[int, bool], None] | None = None
+    after_full_discovery_page: Callable[[int], None] | None = None
+    after_full_processing_page: Callable[[int], None] | None = None
+    during_full_reconciliation_page: Callable[[int], None] | None = None
+    before_full_rendition_cleanup: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,13 +284,15 @@ def run_embedding_pipeline(
     config: EmbeddingPipelineConfig,
     adapter: EmbeddingAdapter,
     *,
-    limit: int,
+    limit: int | None = None,
+    full: bool = False,
     reprocess: bool = False,
     failpoints: EmbeddingPipelineFailpoints | None = None,
     image_codec: ImageCodec | None = None,
     batch_sleep: Callable[[float], None] | None = None,
     batch_jitter: Callable[[int], float] | None = None,
     monotonic: Callable[[], float] | None = None,
+    page_size: int = 100,
 ) -> EmbeddingRunResult:
     """Publish source and derived vectors for a bounded canonical slice."""
 
@@ -293,13 +300,34 @@ def run_embedding_pipeline(
     run_started_at = run_clock()
     if not config.hosted_processing_authorized:
         raise HostedProcessingAuthorizationError
-    if limit < 1:
+    if not isinstance(full, bool):
+        raise ValueError("full must be boolean")
+    if (limit is None) == (not full):
+        raise ValueError("exactly one positive limit or full scope is required")
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+    ):
         raise ValueError("limit must be positive")
     if not isinstance(reprocess, bool):
         raise ValueError("reprocess must be boolean")
+    if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size < 1:
+        raise ValueError("page size must be positive")
     config.validate()
     _ensure_source_root(config.source_root)
     active_failpoints = failpoints or EmbeddingPipelineFailpoints()
+    if full:
+        return _run_full_embedding_pipeline(
+            config,
+            adapter,
+            reprocess=reprocess,
+            failpoints=active_failpoints,
+            image_codec=image_codec,
+            batch_sleep=batch_sleep,
+            batch_jitter=batch_jitter,
+            monotonic=monotonic,
+            page_size=page_size,
+        )
+    assert limit is not None
     articles = _read_articles(config, limit)
     prepared_images = {
         article.article_id: _prepare_header_image(config, article)
@@ -368,7 +396,11 @@ def run_embedding_pipeline(
                 ) from error
         with catalog.transaction():
             catalog.begin_run(
-                run_id, configuration_identifier, profile, len(articles)
+                run_id,
+                configuration_identifier,
+                profile,
+                len(articles),
+                scope="full" if full else "limited",
             )
         registered_states: dict[tuple[str, str], WorkState] = {}
         for article in articles:
@@ -430,6 +462,7 @@ def run_embedding_pipeline(
                     throttles=metrics.throttles,
                     elapsed_seconds=max(0.0, run_clock() - run_started_at),
                 )
+                catalog.finish_run(run_id, reconciled=False)
             return catalog.run_result(run_id)
         for article in articles:
             for modality, prepared_image in (
@@ -625,8 +658,478 @@ def run_embedding_pipeline(
                     profile,
                     article,
                 )
+        with catalog.transaction():
+            catalog.finish_run(run_id, reconciled=False)
         result = catalog.run_result(run_id)
     return result
+
+
+def _run_full_embedding_pipeline(
+    config: EmbeddingPipelineConfig,
+    adapter: EmbeddingAdapter,
+    *,
+    reprocess: bool,
+    failpoints: EmbeddingPipelineFailpoints,
+    image_codec: ImageCodec | None,
+    batch_sleep: Callable[[float], None] | None,
+    batch_jitter: Callable[[int], float] | None,
+    monotonic: Callable[[], float] | None,
+    page_size: int,
+) -> EmbeddingRunResult:
+    """Traverse, process, and reconcile one explicit full run in bounded pages."""
+
+    run_clock = time.monotonic if monotonic is None else monotonic
+    run_started_at = run_clock()
+    active_image_codec = image_codec or getattr(adapter, "image_codec", None)
+    bind_image_codec = getattr(adapter, "bind_image_codec", None)
+    if active_image_codec is None and callable(bind_image_codec):
+        try:
+            active_image_codec = PillowImageCodec()
+        except ImageCodecError as error:
+            raise EmbeddingPipelineError(error.code, "image_preparation") from error
+    if callable(bind_image_codec) and active_image_codec is not None:
+        try:
+            bind_image_codec(active_image_codec)
+        except ImageCodecError as error:
+            raise EmbeddingPipelineError(error.code, "image_preparation") from error
+    profile = adapter.profile
+    if profile.dimensions != _VECTOR_DIMENSIONS:
+        raise ValueError("adapter profile dimensions must be 2048")
+    if profile.long_text_part_attempt_limit < 1:
+        raise ValueError("long-text part attempt limit must be positive")
+    _validate_batch_profile(profile)
+    configuration_identifier = configuration_id(profile)
+    run_id = str(uuid4())
+    totals = {
+        "requests": 0,
+        "retries": 0,
+        "usage": {},
+        "throttles": 0,
+    }
+    with (
+        embedding_pipeline_lock(config.embedding_lock_path) as output_descriptor,
+        EmbeddingCatalog.open_in(output_descriptor) as catalog,
+    ):
+        with catalog.transaction():
+            catalog.begin_run(
+                run_id,
+                configuration_identifier,
+                profile,
+                0,
+                scope="full",
+            )
+        try:
+            with _preprocessing_snapshot(config) as preprocessing_db:
+                after_article_id: str | None = None
+                while True:
+                    articles = _read_article_page(
+                        config,
+                        after_article_id=after_article_id,
+                        page_size=page_size,
+                        connection=preprocessing_db,
+                    )
+                    if not articles:
+                        break
+                    with catalog.transaction():
+                        catalog.record_full_discovery_page(run_id, articles)
+                    if failpoints.after_full_discovery_page is not None:
+                        failpoints.after_full_discovery_page(len(articles))
+                    after_article_id = articles[-1].article_id
+                with catalog.transaction():
+                    catalog.mark_full_discovery_complete(run_id)
+
+                after_article_id = None
+                while True:
+                    article_ids = catalog.full_run_article_ids(
+                        run_id,
+                        after_article_id=after_article_id,
+                        page_size=page_size,
+                    )
+                    if not article_ids:
+                        break
+                    articles = _read_articles_by_ids(
+                        config,
+                        article_ids,
+                        connection=preprocessing_db,
+                    )
+                    if tuple(article.article_id for article in articles) != article_ids:
+                        raise EmbeddingPipelineError(
+                            "preprocessing_catalog", "unknown"
+                        )
+                    metrics = _process_full_article_page(
+                        config,
+                        adapter,
+                        catalog,
+                        output_descriptor,
+                        run_id,
+                        configuration_identifier,
+                        profile,
+                        articles,
+                        reprocess=reprocess,
+                        failpoints=failpoints,
+                        image_codec=active_image_codec,
+                        batch_sleep=batch_sleep,
+                        batch_jitter=batch_jitter,
+                        monotonic=monotonic,
+                    )
+                    if metrics is not None:
+                        totals["requests"] += metrics.requests
+                        totals["retries"] += metrics.retries
+                        totals["throttles"] += metrics.throttles
+                        for key, value in metrics.usage.items():
+                            totals["usage"][key] = (
+                                totals["usage"].get(key, 0) + value
+                            )
+                    if failpoints.after_full_processing_page is not None:
+                        failpoints.after_full_processing_page(len(articles))
+                    after_article_id = article_ids[-1]
+
+            while True:
+                with catalog.transaction():
+                    reconciled = catalog.reconcile_full_page(
+                        run_id,
+                        page_size=page_size,
+                        before_commit=(
+                            failpoints.during_full_reconciliation_page
+                        ),
+                    )
+                if not reconciled:
+                    break
+            referenced_renditions = {
+                str(row[0])
+                for row in catalog.connection.execute(
+                    """
+                    SELECT rendition_relative_path FROM image_input_provenance
+                    WHERE rendition_relative_path IS NOT NULL
+                    """
+                ).fetchall()
+            }
+            with catalog.transaction():
+                catalog.finish_run_metrics(
+                    run_id,
+                    hosted_requests=int(totals["requests"]),
+                    hosted_retries=int(totals["retries"]),
+                    usage=dict(totals["usage"]),
+                    throttles=int(totals["throttles"]),
+                    elapsed_seconds=max(0.0, run_clock() - run_started_at),
+                )
+                catalog.finish_run(run_id, reconciled=True)
+            result = catalog.run_result(run_id)
+            if failpoints.before_full_rendition_cleanup is not None:
+                failpoints.before_full_rendition_cleanup()
+            try:
+                cleanup_orphan_image_renditions(
+                    output_descriptor,
+                    referenced_renditions,
+                )
+            except ImageCodecError as error:
+                raise EmbeddingPipelineError(
+                    error.code, "rendition_cleanup"
+                ) from error
+            return result
+        except Exception:
+            with catalog.transaction():
+                catalog.fail_run(run_id)
+            raise
+        except BaseException:
+            with catalog.transaction():
+                catalog.interrupt_run(run_id)
+            raise
+
+
+def _process_full_article_page(
+    config: EmbeddingPipelineConfig,
+    adapter: EmbeddingAdapter,
+    catalog: EmbeddingCatalog,
+    output_descriptor: int,
+    run_id: str,
+    configuration_identifier: str,
+    profile: EmbeddingProfile,
+    articles: Sequence[CanonicalArticle],
+    *,
+    reprocess: bool,
+    failpoints: EmbeddingPipelineFailpoints,
+    image_codec: ImageCodec | None,
+    batch_sleep: Callable[[float], None] | None,
+    batch_jitter: Callable[[int], float] | None,
+    monotonic: Callable[[], float] | None,
+) -> BatchExecutionResult | None:
+    """Process one already-inventoried bounded page under the full-run lock."""
+
+    prepared_images = {
+        article.article_id: _prepare_header_image(config, article)
+        for article in articles
+    }
+    active_image_codec = image_codec
+    if active_image_codec is None and any(
+        isinstance(image, _PreparedHeaderImage) for image in prepared_images.values()
+    ):
+        try:
+            active_image_codec = PillowImageCodec()
+        except ImageCodecError as error:
+            raise EmbeddingPipelineError(error.code, "image_preparation") from error
+    if active_image_codec is not None:
+        prepared_images = {
+            article_id: _prepare_image_input(
+                prepared_image,
+                profile,
+                active_image_codec,
+                output_descriptor,
+                failpoints,
+            )
+            for article_id, prepared_image in prepared_images.items()
+        }
+        try:
+            for prepared_image in prepared_images.values():
+                if (
+                    isinstance(prepared_image, _PreparedHeaderImage)
+                    and prepared_image.image_input is not None
+                    and prepared_image.image_input.rendition_identity is not None
+                ):
+                    verify_image_rendition(
+                        output_descriptor,
+                        prepared_image.image_input.rendition_identity,
+                        prepared_image.image_input.data,
+                        prepared_image.image_input.embedded_info,
+                        active_image_codec,
+                    )
+        except ImageCodecError as error:
+            raise EmbeddingPipelineError(error.code, "image_preparation") from error
+    registered_states: dict[tuple[str, str], WorkState] = {}
+    for article in articles:
+        with catalog.transaction():
+            registered_states[(article.article_id, _ARTICLE_TEXT_MODALITY)] = (
+                _register_work(
+                    catalog,
+                    run_id,
+                    configuration_identifier,
+                    article,
+                    reprocess=reprocess,
+                )
+            )
+        with catalog.transaction():
+            registered_states[(article.article_id, _HEADER_IMAGE_MODALITY)] = (
+                _register_header_work(
+                    catalog,
+                    run_id,
+                    configuration_identifier,
+                    article,
+                    prepared_images[article.article_id],
+                )
+            )
+    if (
+        getattr(adapter, "rate_aware_batching", False)
+        and callable(getattr(adapter, "embed_batch", None))
+    ):
+        metrics = _run_rate_aware_work(
+            config,
+            adapter,
+            catalog,
+            run_id,
+            configuration_identifier,
+            profile,
+            articles,
+            prepared_images,
+            registered_states,
+            reprocess=reprocess,
+            failpoints=failpoints,
+            batch_sleep=batch_sleep,
+            batch_jitter=batch_jitter,
+            monotonic=monotonic,
+        )
+        for article in articles:
+            with catalog.transaction():
+                _publish_multimodal_article(
+                    catalog,
+                    run_id,
+                    configuration_identifier,
+                    profile,
+                    article,
+                )
+        return metrics
+    for article in articles:
+        for modality, prepared_image in (
+            (_ARTICLE_TEXT_MODALITY, None),
+            (_HEADER_IMAGE_MODALITY, prepared_images[article.article_id]),
+        ):
+            state = registered_states[(article.article_id, modality)]
+            if state is WorkState.NOT_APPLICABLE:
+                continue
+            if state.is_reusable_success:
+                with catalog.transaction():
+                    catalog.increment_run(run_id, "reused")
+                continue
+            if state is WorkState.TERMINAL:
+                continue
+            if isinstance(prepared_image, _MissingHeaderImage):
+                continue
+            if modality == _ARTICLE_TEXT_MODALITY and not reprocess:
+                with catalog.transaction():
+                    exhausted = catalog.terminalize_exhausted_long_text_work(
+                        run_id=run_id,
+                        article_id=article.article_id,
+                        configuration_identifier=configuration_identifier,
+                        article_input_sha256=article.cleaned_markdown_sha256,
+                        attempt_limit=profile.long_text_part_attempt_limit,
+                    )
+                if exhausted:
+                    continue
+            with catalog.transaction():
+                catalog.start_attempt(
+                    run_id=run_id,
+                    article_id=article.article_id,
+                    modality=modality,
+                    configuration_identifier=configuration_identifier,
+                )
+            try:
+                prepared_embedding = _prepare_embedding(
+                    config,
+                    adapter,
+                    catalog,
+                    run_id,
+                    configuration_identifier,
+                    article,
+                    modality=modality,
+                    prepared_image=prepared_image,
+                    reprocess=reprocess,
+                    failpoints=failpoints,
+                )
+            except _LongTextTerminal:
+                continue
+            except JinaHostedAdapterError as error:
+                with catalog.transaction():
+                    attempt_count = catalog.attempt_count(
+                        article_id=article.article_id,
+                        modality=modality,
+                        configuration_identifier=configuration_identifier,
+                    )
+                    bounded_image = (
+                        modality == _HEADER_IMAGE_MODALITY
+                        and error.code == "deterministic_request"
+                        and attempt_count < _DETERMINISTIC_IMAGE_ATTEMPT_LIMIT
+                    )
+                    failure_state = (
+                        WorkState.RETRYABLE
+                        if error.retryable or bounded_image
+                        else WorkState.TERMINAL
+                    )
+                    catalog.record_failure(
+                        run_id=run_id,
+                        article_id=article.article_id,
+                        modality=modality,
+                        configuration_identifier=configuration_identifier,
+                        state=failure_state,
+                        error_code=error.code,
+                        status_code=error.status_code,
+                        retry_after_seconds=error.retry_after_seconds,
+                    )
+                    if modality == _HEADER_IMAGE_MODALITY:
+                        catalog.increment_run(run_id, "header_failed")
+                if modality == _HEADER_IMAGE_MODALITY:
+                    continue
+                raise
+            with catalog.transaction():
+                _publish_prepared_embedding(
+                    catalog,
+                    run_id,
+                    configuration_identifier,
+                    profile,
+                    article,
+                    modality,
+                    prepared_image,
+                    prepared_embedding,
+                )
+    for article in articles:
+        with catalog.transaction():
+            _publish_multimodal_article(
+                catalog,
+                run_id,
+                configuration_identifier,
+                profile,
+                article,
+            )
+    return None
+
+
+def _publish_prepared_embedding(
+    catalog: EmbeddingCatalog,
+    run_id: str,
+    configuration_identifier: str,
+    profile: EmbeddingProfile,
+    article: CanonicalArticle,
+    modality: str,
+    prepared_image: _PreparedHeaderImage | _MissingHeaderImage | None,
+    prepared_embedding: _PreparedEmbedding,
+) -> None:
+    """Publish one validated non-batched source result inside a transaction."""
+
+    if prepared_embedding.long_text_parts:
+        catalog.publish_long_text_success(
+            run_id=run_id,
+            article_id=article.article_id,
+            configuration_identifier=configuration_identifier,
+            published_at_utc=article.published_at_utc,
+            publication_date_new_york=article.publication_date_new_york,
+            dimensions=profile.dimensions,
+            input_sha256=prepared_embedding.input_sha256,
+            stored_vector_sha256=prepared_embedding.stored_vector_sha256,
+            vector=prepared_embedding.vector,
+            aggregation_version=profile.long_text_aggregation,
+            parts=tuple(
+                (
+                    item.part.index,
+                    item.part.input_sha256,
+                    item.part.token_count,
+                    item.generation_run_id,
+                    item.stored_vector_sha256,
+                )
+                for item in prepared_embedding.long_text_parts
+            ),
+        )
+        return
+    if modality == _HEADER_IMAGE_MODALITY:
+        assert isinstance(prepared_image, _PreparedHeaderImage)
+        assert prepared_image.image_input is not None
+        image_input = prepared_image.image_input
+        catalog.publish_image_success(
+            run_id=run_id,
+            article_id=article.article_id,
+            configuration_identifier=configuration_identifier,
+            source_relative_path=prepared_image.source_relative_path,
+            published_at_utc=article.published_at_utc,
+            publication_date_new_york=article.publication_date_new_york,
+            dimensions=profile.dimensions,
+            source_sha256=image_input.source_sha256,
+            source_format=image_input.source_info.format,
+            source_bytes=len(prepared_image.data),
+            source_width=image_input.source_info.width,
+            source_height=image_input.source_info.height,
+            source_frames=image_input.source_info.frames,
+            embedded_input_sha256=image_input.embedded_input_sha256,
+            embedded_format=image_input.embedded_info.format,
+            embedded_bytes=len(image_input.data),
+            embedded_width=image_input.embedded_info.width,
+            embedded_height=image_input.embedded_info.height,
+            embedded_frames=image_input.embedded_info.frames,
+            transform_id=image_input.transform_id,
+            rendition_relative_path=image_input.rendition_relative_path,
+            stored_vector_sha256=prepared_embedding.stored_vector_sha256,
+            vector=prepared_embedding.vector,
+        )
+        return
+    catalog.publish_success(
+        run_id=run_id,
+        article_id=article.article_id,
+        modality=modality,
+        configuration_identifier=configuration_identifier,
+        source_relative_path=None,
+        published_at_utc=article.published_at_utc,
+        publication_date_new_york=article.publication_date_new_york,
+        dimensions=profile.dimensions,
+        input_sha256=prepared_embedding.input_sha256,
+        stored_vector_sha256=prepared_embedding.stored_vector_sha256,
+        vector=prepared_embedding.vector,
+    )
 
 
 def _validate_batch_profile(profile: EmbeddingProfile) -> None:
@@ -1239,25 +1742,122 @@ def inventory_embedding_articles(
 
 def _read_articles(
     config: EmbeddingPipelineConfig,
-    limit: int,
+    limit: int | None,
 ) -> tuple[CanonicalArticle, ...]:
     try:
         with Catalog.read_only(config.preprocessing_catalog) as db:
             Catalog.validate_schema(db)
-            rows = db.execute(
-                """
+            sql = """
                 SELECT article_id, cleaned_markdown_path, published_at_utc,
                        publication_date_new_york, cleaned_markdown_sha256,
                        header_image_path
                 FROM articles
                 ORDER BY article_id
-                LIMIT ?
-                """,
-                [limit],
-            ).fetchall()
+            """
+            rows = (
+                db.execute(sql).fetchall()
+                if limit is None
+                else db.execute(f"{sql} LIMIT ?", [limit]).fetchall()
+            )
     except (CatalogError, duckdb.Error, OSError) as error:
         raise EmbeddingPipelineError("preprocessing_catalog", "unknown") from error
     return tuple(CanonicalArticle(*row) for row in rows)
+
+
+def _read_article_page(
+    config: EmbeddingPipelineConfig,
+    *,
+    after_article_id: str | None,
+    page_size: int,
+    connection: duckdb.DuckDBPyConnection | None = None,
+) -> tuple[CanonicalArticle, ...]:
+    """Read one stable lexical keyset page from the canonical catalog."""
+
+    if connection is None:
+        with _preprocessing_snapshot(config) as database:
+            return _read_article_page(
+                config,
+                after_article_id=after_article_id,
+                page_size=page_size,
+                connection=database,
+            )
+    try:
+        if after_article_id is None:
+            rows = connection.execute(
+                """
+                SELECT article_id, cleaned_markdown_path, published_at_utc,
+                       publication_date_new_york, cleaned_markdown_sha256,
+                       header_image_path
+                FROM articles ORDER BY article_id LIMIT ?
+                """,
+                [page_size],
+            ).fetchmany(page_size)
+        else:
+            rows = connection.execute(
+                """
+                SELECT article_id, cleaned_markdown_path, published_at_utc,
+                       publication_date_new_york, cleaned_markdown_sha256,
+                       header_image_path
+                FROM articles WHERE article_id > ?
+                ORDER BY article_id LIMIT ?
+                """,
+                [after_article_id, page_size],
+            ).fetchmany(page_size)
+    except (CatalogError, duckdb.Error, OSError) as error:
+        raise EmbeddingPipelineError("preprocessing_catalog", "unknown") from error
+    return tuple(CanonicalArticle(*row) for row in rows)
+
+
+def _read_articles_by_ids(
+    config: EmbeddingPipelineConfig,
+    article_ids: Sequence[str],
+    *,
+    connection: duckdb.DuckDBPyConnection | None = None,
+) -> tuple[CanonicalArticle, ...]:
+    """Reopen one bounded inventory page from immutable preprocessing state."""
+
+    if not article_ids:
+        return ()
+    if connection is None:
+        with _preprocessing_snapshot(config) as database:
+            return _read_articles_by_ids(
+                config,
+                article_ids,
+                connection=database,
+            )
+    try:
+        rows = connection.execute(
+            """
+            SELECT article_id, cleaned_markdown_path, published_at_utc,
+                   publication_date_new_york, cleaned_markdown_sha256,
+                   header_image_path
+            FROM articles
+            WHERE article_id IN (SELECT unnest(?))
+            ORDER BY article_id
+            """,
+            [list(article_ids)],
+        ).fetchmany(len(article_ids))
+    except (CatalogError, duckdb.Error, OSError) as error:
+        raise EmbeddingPipelineError("preprocessing_catalog", "unknown") from error
+    return tuple(CanonicalArticle(*row) for row in rows)
+
+
+@contextmanager
+def _preprocessing_snapshot(
+    config: EmbeddingPipelineConfig,
+) -> Iterator[duckdb.DuckDBPyConnection]:
+    """Hold one validated read-only preprocessing snapshot across full pages."""
+
+    try:
+        with Catalog.read_only(config.preprocessing_catalog) as connection:
+            Catalog.validate_schema(connection)
+            connection.execute("BEGIN TRANSACTION")
+            try:
+                yield connection
+            finally:
+                connection.execute("ROLLBACK")
+    except (CatalogError, duckdb.Error, OSError) as error:
+        raise EmbeddingPipelineError("preprocessing_catalog", "unknown") from error
 
 
 def _prepare_embedding(

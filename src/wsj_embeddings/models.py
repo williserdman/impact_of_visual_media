@@ -25,6 +25,7 @@ class WorkState(StrEnum):
     TERMINAL = "terminal"
     INTERRUPTED = "interrupted"
     NOT_APPLICABLE = "not_applicable"
+    STALE_INPUT = "stale_input"
 
     @property
     def is_failure(self) -> bool:

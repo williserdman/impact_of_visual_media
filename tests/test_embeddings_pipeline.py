@@ -93,6 +93,10 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
     "runs": (
         ("run_id", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, False),
+        ("scope", "VARCHAR", True, None, False),
+        ("status", "VARCHAR", True, None, False),
+        ("discovery_complete", "BOOLEAN", True, None, False),
+        ("reconciliation_complete", "BOOLEAN", True, None, False),
         ("articles", "INTEGER", True, None, False),
         ("embeddings", "INTEGER", True, None, False),
         ("reused", "INTEGER", True, None, False),
@@ -109,6 +113,12 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("throttles", "INTEGER", True, None, False),
         ("elapsed_seconds", "DOUBLE", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+        ("finished_at", "TIMESTAMP WITH TIME ZONE", False, None, False),
+    ),
+    "full_run_articles": (
+        ("run_id", "VARCHAR", True, None, True),
+        ("article_id", "VARCHAR", True, None, True),
+        ("header_image_path", "VARCHAR", False, None, False),
     ),
     "embedding_work_items": (
         ("article_id", "VARCHAR", True, None, True),
@@ -239,6 +249,7 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     ("metadata", ("key",)),
     ("embedding_configurations", ("configuration_id",)),
     ("runs", ("run_id",)),
+    ("full_run_articles", ("run_id", "article_id")),
     (
         "embedding_work_items",
         ("article_id", "modality", "configuration_id"),
@@ -5623,7 +5634,353 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_twelve_batching_schema(
+def test_interrupted_full_discovery_never_reconciles_unseen_articles(tmp_path):
+    """Break caught: partial full discovery treats unseen canonical rows as gone."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            "DELETE FROM articles WHERE article_id = ?",
+            ["wsj:ZZZ-SYNTHETIC-EMBEDDING"],
+        )
+
+    def interrupt_first_page(_count: int) -> None:
+        raise SyntheticInterruption
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            FakeEmbeddingAdapter(),
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_full_discovery_page=interrupt_first_page,
+            ),
+        )
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT article_id FROM embeddings ORDER BY article_id"
+        ).fetchall() == [
+            ("wsj:SYNTHETIC-EMBEDDING",),
+            ("wsj:ZZZ-SYNTHETIC-EMBEDDING",),
+        ]
+        assert db.execute(
+            """
+            SELECT status, discovery_complete, reconciliation_complete
+            FROM runs ORDER BY started_at DESC, run_id DESC LIMIT 1
+            """
+        ).fetchone() == ("interrupted", False, False)
+
+
+def test_completed_full_reconciles_disappeared_article_across_configurations(
+    tmp_path,
+):
+    """Break caught: a completed full leaves disappeared active vectors queryable."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            "DELETE FROM articles WHERE article_id = ?",
+            ["wsj:ZZZ-SYNTHETIC-EMBEDDING"],
+        )
+
+    result = run_embedding_pipeline(
+        config,
+        FakeEmbeddingAdapter(),
+        full=True,
+        page_size=1,
+    )
+
+    assert result.articles == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT DISTINCT article_id FROM embeddings ORDER BY article_id"
+        ).fetchall() == [("wsj:SYNTHETIC-EMBEDDING",)]
+        assert db.execute(
+            """
+            SELECT DISTINCT state FROM embedding_work_items
+            WHERE article_id = 'wsj:ZZZ-SYNTHETIC-EMBEDDING'
+            """
+        ).fetchall() == [("stale_input",)]
+        assert db.execute(
+            """
+            SELECT status, discovery_complete, reconciliation_complete
+            FROM runs ORDER BY started_at DESC, run_id DESC LIMIT 1
+            """
+        ).fetchone() == ("succeeded", True, True)
+
+
+def test_failed_reconciliation_page_rolls_back_and_resumed_full_finishes(
+    tmp_path,
+):
+    """Break caught: one failed reconciliation page half-removes its identities."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+
+    def interrupt_page(_count: int) -> None:
+        raise SyntheticInterruption
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            FakeEmbeddingAdapter(),
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                during_full_reconciliation_page=interrupt_page,
+            ),
+        )
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (2,)
+
+    resumed = run_embedding_pipeline(
+        config,
+        FakeEmbeddingAdapter(),
+        full=True,
+        page_size=1,
+    )
+
+    assert resumed.articles == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
+        assert db.execute(
+            "SELECT DISTINCT state FROM embedding_work_items"
+        ).fetchall() == [("stale_input",)]
+
+
+def test_full_discovery_and_processing_are_bounded_lexical_pages(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: full mode inventories or processes the corpus as one tuple."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    for suffix in ("B", "C", "D", "E"):
+        add_generated_embedding_article(
+            config,
+            article_id=f"wsj:SYNTHETIC-EMBEDDING-{suffix}",
+            markdown=f"# Generated article {suffix}\n",
+        )
+    discovered_pages: list[tuple[str, ...]] = []
+    processed_pages: list[tuple[str, ...]] = []
+    real_read_page = embedding_pipeline_module._read_article_page
+    real_process_page = embedding_pipeline_module._process_full_article_page
+
+    def record_read_page(*args, **kwargs):
+        page = real_read_page(*args, **kwargs)
+        discovered_pages.append(tuple(article.article_id for article in page))
+        return page
+
+    def record_process_page(*args, **kwargs):
+        processed_pages.append(tuple(article.article_id for article in args[7]))
+        return real_process_page(*args, **kwargs)
+
+    monkeypatch.setattr(
+        embedding_pipeline_module,
+        "_read_article_page",
+        record_read_page,
+    )
+    monkeypatch.setattr(
+        embedding_pipeline_module,
+        "_process_full_article_page",
+        record_process_page,
+    )
+
+    result = run_embedding_pipeline(
+        config,
+        FakeEmbeddingAdapter(),
+        full=True,
+        page_size=2,
+    )
+
+    assert result.articles == 5
+    assert [len(page) for page in discovered_pages] == [2, 2, 1, 0]
+    assert [len(page) for page in processed_pages] == [2, 2, 1]
+    assert tuple(article_id for page in processed_pages for article_id in page) == (
+        "wsj:SYNTHETIC-EMBEDDING",
+        "wsj:SYNTHETIC-EMBEDDING-B",
+        "wsj:SYNTHETIC-EMBEDDING-C",
+        "wsj:SYNTHETIC-EMBEDDING-D",
+        "wsj:SYNTHETIC-EMBEDDING-E",
+    )
+
+
+def test_full_header_disappearance_reconciles_every_configuration(tmp_path):
+    """Break caught: a completed full removes header work from one config only."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated disappearing header")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            """
+            UPDATE articles SET header_image_path = NULL
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+            """
+        )
+
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT configuration_id, modality FROM embeddings ORDER BY 1, 2"
+        ).fetchall() == sorted(
+            [
+                (configuration_id(FakeEmbeddingAdapter.profile), "article_text"),
+                (configuration_id(PriorConfigurationAdapter.profile), "article_text"),
+            ]
+        )
+        assert db.execute(
+            """
+            SELECT DISTINCT modality, state FROM embedding_work_items
+            WHERE modality <> 'article_text' ORDER BY modality, state
+            """
+        ).fetchall() == [
+            ("header_image", "not_applicable"),
+            ("multimodal_article", "stale_input"),
+        ]
+
+
+def test_failed_full_traversal_preserves_publications_without_reconciliation(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: a traversal error still enters stale-work reconciliation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            "DELETE FROM articles WHERE article_id = ?",
+            ["wsj:ZZZ-SYNTHETIC-EMBEDDING"],
+        )
+    real_read_page = embedding_pipeline_module._read_article_page
+    calls = 0
+
+    def fail_during_traversal(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise EmbeddingPipelineError("preprocessing_catalog", "unknown")
+        return real_read_page(*args, **kwargs)
+
+    monkeypatch.setattr(
+        embedding_pipeline_module,
+        "_read_article_page",
+        fail_during_traversal,
+    )
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+
+    assert raised.value.code == "preprocessing_catalog"
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (2,)
+        assert db.execute(
+            """
+            SELECT status, discovery_complete, reconciliation_complete
+            FROM runs ORDER BY started_at DESC, run_id DESC LIMIT 1
+            """
+        ).fetchone() == ("failed", False, False)
+
+
+def test_full_rendition_cleanup_occurs_after_commit_and_is_resumable(tmp_path):
+    """Break caught: cleanup precedes catalog commit or misses durable orphans."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated cleanup oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        full=True,
+        page_size=1,
+        image_codec=codec,
+    )
+    namespace = next(
+        path
+        for path in (config.embedding_output_root / "renditions").iterdir()
+        if path.is_dir()
+    )
+    orphan = namespace / f"{'f' * 64}.jpg"
+    orphan.write_bytes(b"generated obsolete rendition")
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            ScenarioImageAdapter(),
+            full=True,
+            page_size=1,
+            image_codec=codec,
+            failpoints=EmbeddingPipelineFailpoints(
+                before_full_rendition_cleanup=lambda: (_ for _ in ()).throw(
+                    SyntheticInterruption()
+                ),
+            ),
+        )
+
+    assert orphan.is_file()
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT status, discovery_complete, reconciliation_complete
+            FROM runs ORDER BY started_at DESC, run_id DESC LIMIT 1
+            """
+        ).fetchone() == ("succeeded", True, True)
+    assert "orphan_image_rendition" in {
+        issue.code
+        for issue in validate_embedding_outputs(config, image_codec=codec).issues
+    }
+
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        full=True,
+        page_size=1,
+        image_codec=codec,
+    )
+
+    assert not orphan.exists()
+    assert validate_embedding_outputs(config, image_codec=codec).ok
+
+
+def test_embedding_catalog_has_exact_version_thirteen_full_run_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -5695,6 +6052,7 @@ def test_embedding_catalog_has_exact_version_twelve_batching_schema(
         "article_text_aggregation_provenance": "BASE TABLE",
         "embedding_configurations": "BASE TABLE",
         "embedding_generation_history": "BASE TABLE",
+        "full_run_articles": "BASE TABLE",
         "image_input_provenance": "BASE TABLE",
         "embedding_work_items": "BASE TABLE",
         "embeddings": "BASE TABLE",
@@ -5707,7 +6065,7 @@ def test_embedding_catalog_has_exact_version_twelve_batching_schema(
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "12")]
+    assert metadata == [("schema_version", "13")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -6159,6 +6517,43 @@ def test_pipeline_refuses_exact_version_eleven_catalog_without_migration(tmp_pat
         }.isdisjoint(run_columns)
 
 
+def test_pipeline_refuses_exact_version_twelve_catalog_without_migration(tmp_path):
+    """Break caught: full-run lifecycle state is silently added to v12 output."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    lifecycle_columns = {
+        "scope",
+        "status",
+        "discovery_complete",
+        "reconciliation_complete",
+        "finished_at",
+    }
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP TABLE full_run_articles")
+        for column in lifecycle_columns:
+            db.execute(f"ALTER TABLE runs DROP COLUMN {column}")
+        db.execute("UPDATE metadata SET value = '12' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("12",)
+        assert "full_run_articles" not in {
+            row[0] for row in db.execute("SHOW TABLES").fetchall()
+        }
+        assert {
+            row[1] for row in db.execute("PRAGMA table_info('runs')").fetchall()
+        }.isdisjoint(lifecycle_columns)
+
+
 def test_pipeline_refuses_malformed_current_schema_with_version_eight_label(
     tmp_path,
 ):
@@ -6216,6 +6611,30 @@ def test_validator_rejects_unsafe_usage_or_run_metric_ranges(tmp_path, run_updat
     codes = {issue.code for issue in validate_embedding_outputs(config).issues}
 
     assert "invalid_run_metrics" in codes
+
+
+@pytest.mark.parametrize(
+    "run_update",
+    (
+        "scope = 'unknown'",
+        "status = 'unknown'",
+        "status = 'running'",
+        "discovery_complete = true",
+        "reconciliation_complete = true",
+        "finished_at = NULL",
+    ),
+)
+def test_validator_rejects_invalid_limited_run_lifecycle(tmp_path, run_update):
+    """Break caught: contradictory terminal/scope state validates as complete."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(f"UPDATE runs SET {run_update}")
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_run_lifecycle" in codes
 
 
 @pytest.mark.parametrize("disposition", ("absent", "missing"))

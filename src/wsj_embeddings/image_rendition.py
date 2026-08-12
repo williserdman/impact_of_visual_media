@@ -463,6 +463,82 @@ def verify_image_rendition(
     )
 
 
+def cleanup_orphan_image_renditions(
+    output_descriptor: int,
+    referenced_paths: set[str],
+    *,
+    after_unlink: Callable[[str], None] | None = None,
+) -> tuple[str, ...]:
+    """Delete only safe unreferenced final renditions from anchored namespaces."""
+
+    try:
+        rendition_descriptor = os.open(
+            "renditions", _DIRECTORY_FLAGS, dir_fd=output_descriptor
+        )
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise ImageCodecError("unsafe_rendition_output") from error
+    removed: list[str] = []
+    try:
+        with os.scandir(rendition_descriptor) as namespaces:
+            for namespace in namespaces:
+                if (
+                    namespace.is_symlink()
+                    or not namespace.is_dir(follow_symlinks=False)
+                    or re.fullmatch(r"[0-9a-f]{64}", namespace.name) is None
+                ):
+                    continue
+                try:
+                    namespace_descriptor = os.open(
+                        namespace.name,
+                        _DIRECTORY_FLAGS,
+                        dir_fd=rendition_descriptor,
+                    )
+                except OSError:
+                    continue
+                try:
+                    with os.scandir(namespace_descriptor) as entries:
+                        for entry in entries:
+                            if (
+                                entry.is_symlink()
+                                or not entry.is_file(follow_symlinks=False)
+                                or re.fullmatch(r"[0-9a-f]{64}\.jpg", entry.name)
+                                is None
+                            ):
+                                continue
+                            relative_path = (
+                                f"renditions/{namespace.name}/{entry.name}"
+                            )
+                            if relative_path in referenced_paths:
+                                continue
+                            before = entry.stat(follow_symlinks=False)
+                            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                                continue
+                            observed = os.stat(
+                                entry.name,
+                                dir_fd=namespace_descriptor,
+                                follow_symlinks=False,
+                            )
+                            if (before.st_dev, before.st_ino) != (
+                                observed.st_dev,
+                                observed.st_ino,
+                            ):
+                                continue
+                            os.unlink(entry.name, dir_fd=namespace_descriptor)
+                            os.fsync(namespace_descriptor)
+                            removed.append(relative_path)
+                            if after_unlink is not None:
+                                after_unlink(relative_path)
+                finally:
+                    os.close(namespace_descriptor)
+    except OSError as error:
+        raise ImageCodecError("unsafe_rendition_output") from error
+    finally:
+        os.close(rendition_descriptor)
+    return tuple(removed)
+
+
 def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
     if not name or name in {".", ".."} or os.path.basename(name) != name:
         raise ImageCodecError("unsafe_rendition_output")

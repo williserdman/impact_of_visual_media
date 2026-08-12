@@ -94,6 +94,7 @@ def validate_embedding_outputs(
             if articles is not None:
                 _validate_configurations(catalog.connection, issues)
                 _validate_run_metrics(catalog.connection, issues)
+                _validate_run_lifecycle(catalog.connection, issues)
                 _validate_global_image_provenance_references(
                     catalog.connection,
                     issues,
@@ -305,6 +306,75 @@ def _validate_run_metrics(
             "invalid_run_metrics",
             "embedding run observations are not finite content-free metrics",
         )
+
+
+def _validate_run_lifecycle(
+    connection: duckdb.DuckDBPyConnection,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Reject contradictory scope, terminal, and full-inventory state."""
+
+    inventory_counts = dict(
+        connection.execute(
+            """
+            SELECT run_id, count(*) FROM full_run_articles GROUP BY run_id
+            """
+        ).fetchall()
+    )
+    invalid = bool(
+        connection.execute(
+            """
+            SELECT count(*) FROM full_run_articles AS inventory
+            LEFT JOIN runs USING (run_id)
+            WHERE runs.run_id IS NULL OR runs.scope <> 'full'
+            """
+        ).fetchone()[0]
+    )
+    rows = connection.execute(
+        """
+        SELECT run_id, scope, status, discovery_complete,
+               reconciliation_complete, articles, finished_at
+        FROM runs
+        """
+    ).fetchall()
+    for (
+        run_id,
+        scope,
+        status,
+        discovery_complete,
+        reconciliation_complete,
+        articles,
+        finished_at,
+    ) in rows:
+        inventory_count = int(inventory_counts.get(run_id, 0))
+        if scope not in {"limited", "full"}:
+            invalid = True
+            continue
+        if status not in {"running", "succeeded", "failed", "interrupted"}:
+            invalid = True
+            continue
+        if status == "running":
+            invalid |= finished_at is not None or reconciliation_complete
+        else:
+            invalid |= finished_at is None
+        if status != "succeeded":
+            invalid |= reconciliation_complete
+        if scope == "limited":
+            invalid |= bool(
+                discovery_complete or reconciliation_complete or inventory_count
+            )
+        else:
+            invalid |= inventory_count != articles
+            if status == "succeeded":
+                invalid |= not discovery_complete or not reconciliation_complete
+    if invalid:
+        _append(
+            issues,
+            "invalid_run_lifecycle",
+            "embedding run scope, terminal state, or full inventory is contradictory",
+        )
+
+
 def _select_configuration_id(
     connection: duckdb.DuckDBPyConnection,
     requested: str | None,
@@ -2078,12 +2148,15 @@ def _validate_generation_history(
     configuration_id: str,
     issues: list[EmbeddingValidationIssue],
 ) -> None:
-    run_ids = {
+    generation_run_ids = {
         row[0]
         for row in connection.execute(
             "SELECT run_id FROM runs WHERE configuration_id = ?",
             [configuration_id],
         ).fetchall()
+    }
+    all_run_ids = {
+        row[0] for row in connection.execute("SELECT run_id FROM runs").fetchall()
     }
     reasons = {reason.value for reason in SupersessionReason}
     rows = connection.execute(
@@ -2123,7 +2196,10 @@ def _validate_generation_history(
                 "invalid_generation_source_path",
                 "non-image generation history retains a source path",
             )
-        if generation_run_id not in run_ids or superseded_run_id not in run_ids:
+        if (
+            generation_run_id not in generation_run_ids
+            or superseded_run_id not in all_run_ids
+        ):
             _append(
                 issues,
                 "invalid_generation_run_reference",

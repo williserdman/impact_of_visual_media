@@ -8,7 +8,7 @@ import math
 import os
 import stat
 from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import asdict
 from pathlib import Path
@@ -26,7 +26,7 @@ from wsj_embeddings.models import (
 )
 from wsj_embeddings.run_metrics import normalize_safe_usage
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "12"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "13"
 
 _EMBEDDING_CATALOG_TABLES = {
     "article_text_aggregation_provenance",
@@ -34,6 +34,7 @@ _EMBEDDING_CATALOG_TABLES = {
     "embedding_generation_history",
     "embedding_work_items",
     "embeddings",
+    "full_run_articles",
     "image_input_provenance",
     "long_text_parts",
     "long_text_part_generations",
@@ -76,6 +77,10 @@ _TABLE_COLUMNS = {
     "runs": (
         ("run_id", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, False),
+        ("scope", "VARCHAR", True, None, False),
+        ("status", "VARCHAR", True, None, False),
+        ("discovery_complete", "BOOLEAN", True, None, False),
+        ("reconciliation_complete", "BOOLEAN", True, None, False),
         ("articles", "INTEGER", True, None, False),
         ("embeddings", "INTEGER", True, None, False),
         ("reused", "INTEGER", True, None, False),
@@ -92,6 +97,12 @@ _TABLE_COLUMNS = {
         ("throttles", "INTEGER", True, None, False),
         ("elapsed_seconds", "DOUBLE", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+        ("finished_at", "TIMESTAMP WITH TIME ZONE", False, None, False),
+    ),
+    "full_run_articles": (
+        ("run_id", "VARCHAR", True, None, True),
+        ("article_id", "VARCHAR", True, None, True),
+        ("header_image_path", "VARCHAR", False, None, False),
     ),
     "embedding_work_items": (
         ("article_id", "VARCHAR", True, None, True),
@@ -222,6 +233,7 @@ _KEY_CONSTRAINTS = {
     ("metadata", "PRIMARY KEY", ("key",)),
     ("embedding_configurations", "PRIMARY KEY", ("configuration_id",)),
     ("runs", "PRIMARY KEY", ("run_id",)),
+    ("full_run_articles", "PRIMARY KEY", ("run_id", "article_id")),
     (
         "embedding_work_items",
         "PRIMARY KEY",
@@ -691,6 +703,10 @@ class EmbeddingCatalog:
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id VARCHAR PRIMARY KEY,
                     configuration_id VARCHAR NOT NULL,
+                    scope VARCHAR NOT NULL,
+                    status VARCHAR NOT NULL,
+                    discovery_complete BOOLEAN NOT NULL,
+                    reconciliation_complete BOOLEAN NOT NULL,
                     articles INTEGER NOT NULL,
                     embeddings INTEGER NOT NULL,
                     reused INTEGER NOT NULL,
@@ -706,7 +722,18 @@ class EmbeddingCatalog:
                     usage_json VARCHAR NOT NULL,
                     throttles INTEGER NOT NULL,
                     elapsed_seconds DOUBLE NOT NULL,
-                    started_at TIMESTAMP WITH TIME ZONE NOT NULL
+                    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    finished_at TIMESTAMP WITH TIME ZONE
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS full_run_articles (
+                    run_id VARCHAR NOT NULL,
+                    article_id VARCHAR NOT NULL,
+                    header_image_path VARCHAR,
+                    PRIMARY KEY (run_id, article_id)
                 )
                 """
             )
@@ -983,6 +1010,8 @@ class EmbeddingCatalog:
         configuration_identifier: str,
         profile: EmbeddingProfile,
         article_count: int,
+        *,
+        scope: str = "limited",
     ) -> None:
         """Persist one immutable configuration and content-free run record."""
 
@@ -1035,15 +1064,16 @@ class EmbeddingCatalog:
         self.connection.execute(
             """
             INSERT INTO runs (
-                run_id, configuration_id, articles, embeddings, reused,
+                run_id, configuration_id, scope, status, discovery_complete,
+                reconciliation_complete, articles, embeddings, reused,
                 attempted, succeeded, retryable, terminal, interrupted,
                 header_absent, header_failed, hosted_requests, hosted_retries,
-                usage_json, throttles, elapsed_seconds, started_at
+                usage_json, throttles, elapsed_seconds, started_at, finished_at
             )
-            VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '{}', 0, 0.0,
-                    current_timestamp)
+            VALUES (?, ?, ?, 'running', false, false, ?, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, '{}', 0, 0.0, current_timestamp, NULL)
             """,
-            [run_id, configuration_identifier, article_count],
+            [run_id, configuration_identifier, scope, article_count],
         )
 
     def register_work(
@@ -1206,6 +1236,264 @@ class EmbeddingCatalog:
             if modality == EmbeddingModality.HEADER_IMAGE.value:
                 self.increment_run(run_id, "header_failed")
         return state
+
+    def record_full_discovery_page(
+        self,
+        run_id: str,
+        articles: Sequence[object],
+    ) -> None:
+        """Persist one bounded, content-free page of canonical identities."""
+
+        self.connection.executemany(
+            """
+            INSERT INTO full_run_articles VALUES (?, ?, ?)
+            ON CONFLICT (run_id, article_id) DO NOTHING
+            """,
+            [
+                [run_id, article.article_id, article.header_image_path]
+                for article in articles
+            ],
+        )
+        self.connection.execute(
+            """
+            UPDATE runs
+            SET articles = (
+                SELECT count(*) FROM full_run_articles WHERE run_id = ?
+            )
+            WHERE run_id = ?
+            """,
+            [run_id, run_id],
+        )
+
+    def mark_full_discovery_complete(self, run_id: str) -> None:
+        """Record successful exhaustion of the canonical lexical traversal."""
+
+        self.connection.execute(
+            "UPDATE runs SET discovery_complete = true WHERE run_id = ?",
+            [run_id],
+        )
+
+    def full_run_article_ids(
+        self,
+        run_id: str,
+        *,
+        after_article_id: str | None,
+        page_size: int,
+    ) -> tuple[str, ...]:
+        """Return one bounded lexical page from a completed full inventory."""
+
+        if page_size < 1:
+            raise ValueError("page size must be positive")
+        if after_article_id is None:
+            rows = self.connection.execute(
+                """
+                SELECT article_id FROM full_run_articles
+                WHERE run_id = ? ORDER BY article_id LIMIT ?
+                """,
+                [run_id, page_size],
+            ).fetchmany(page_size)
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT article_id FROM full_run_articles
+                WHERE run_id = ? AND article_id > ?
+                ORDER BY article_id LIMIT ?
+                """,
+                [run_id, after_article_id, page_size],
+            ).fetchmany(page_size)
+        return tuple(str(row[0]) for row in rows)
+
+    def reconcile_full_page(
+        self,
+        run_id: str,
+        *,
+        page_size: int,
+        before_commit: Callable[[int], None] | None = None,
+    ) -> int:
+        """Invalidate one bounded page absent from the completed full inventory."""
+
+        if page_size < 1:
+            raise ValueError("page size must be positive")
+        run = self.connection.execute(
+            """
+            SELECT scope, discovery_complete FROM runs WHERE run_id = ?
+            """,
+            [run_id],
+        ).fetchone()
+        if run != ("full", True):
+            raise EmbeddingCatalogError(
+                "full reconciliation requires completed discovery"
+            )
+        article_ids = tuple(
+            str(row[0])
+            for row in self.connection.execute(
+                """
+                SELECT work.article_id
+                FROM embedding_work_items AS work
+                LEFT JOIN full_run_articles AS seen
+                  ON seen.run_id = ? AND seen.article_id = work.article_id
+                WHERE work.state <> ?
+                  AND (
+                      seen.article_id IS NULL
+                      OR (
+                          work.modality = ?
+                          AND work.source_relative_path IS DISTINCT FROM
+                              seen.header_image_path
+                      )
+                  )
+                GROUP BY work.article_id
+                ORDER BY work.article_id
+                LIMIT ?
+                """,
+                [
+                    run_id,
+                    WorkState.STALE_INPUT.value,
+                    EmbeddingModality.HEADER_IMAGE.value,
+                    page_size,
+                ],
+            ).fetchmany(page_size)
+        )
+        for article_id in article_ids:
+            disappeared = not bool(
+                self.connection.execute(
+                    """
+                    SELECT count(*) FROM full_run_articles
+                    WHERE run_id = ? AND article_id = ?
+                    """,
+                    [run_id, article_id],
+                ).fetchone()[0]
+            )
+            seen_header_path = None
+            if not disappeared:
+                seen_header_path = self.connection.execute(
+                    """
+                    SELECT header_image_path FROM full_run_articles
+                    WHERE run_id = ? AND article_id = ?
+                    """,
+                    [run_id, article_id],
+                ).fetchone()[0]
+            if disappeared:
+                rows = self.connection.execute(
+                    """
+                    SELECT modality, configuration_id
+                    FROM embedding_work_items WHERE article_id = ?
+                    ORDER BY configuration_id, modality
+                    """,
+                    [article_id],
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    """
+                    SELECT modality, configuration_id
+                    FROM embedding_work_items
+                    WHERE article_id = ? AND modality IN (?, ?)
+                    ORDER BY configuration_id, modality
+                    """,
+                    [
+                        article_id,
+                        EmbeddingModality.HEADER_IMAGE.value,
+                        EmbeddingModality.MULTIMODAL_ARTICLE.value,
+                    ],
+                ).fetchall()
+            for modality, configuration_identifier in rows:
+                if (
+                    not disappeared
+                    and seen_header_path is None
+                    and modality == EmbeddingModality.HEADER_IMAGE.value
+                ):
+                    self._invalidate_work_generation(
+                        run_id=run_id,
+                        article_id=article_id,
+                        modality=str(modality),
+                        configuration_identifier=str(configuration_identifier),
+                        reason=SupersessionReason.INPUT_CHANGED,
+                        replacement_source_relative_path=None,
+                        replacement_input_sha256=None,
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE embedding_work_items
+                        SET source_relative_path = NULL, input_sha256 = NULL,
+                            state = ?, attempt_count = 0, error_code = NULL,
+                            status_code = NULL, retry_after_seconds = NULL,
+                            last_run_id = ?, generation_run_id = NULL,
+                            updated_at = current_timestamp
+                        WHERE article_id = ? AND modality = ?
+                          AND configuration_id = ?
+                        """,
+                        [
+                            WorkState.NOT_APPLICABLE.value,
+                            run_id,
+                            article_id,
+                            modality,
+                            configuration_identifier,
+                        ],
+                    )
+                    continue
+                self._invalidate_work_generation(
+                    run_id=run_id,
+                    article_id=article_id,
+                    modality=str(modality),
+                    configuration_identifier=str(configuration_identifier),
+                    reason=SupersessionReason.INPUT_CHANGED,
+                    replacement_source_relative_path=None,
+                    replacement_input_sha256=None,
+                )
+                self.connection.execute(
+                    """
+                    UPDATE embedding_work_items
+                    SET state = ?, attempt_count = 0, error_code = NULL,
+                        status_code = NULL, retry_after_seconds = NULL,
+                        last_run_id = ?, generation_run_id = NULL,
+                        updated_at = current_timestamp
+                    WHERE article_id = ? AND modality = ?
+                      AND configuration_id = ?
+                    """,
+                    [
+                        WorkState.STALE_INPUT.value,
+                        run_id,
+                        article_id,
+                        modality,
+                        configuration_identifier,
+                    ],
+                )
+        if before_commit is not None and article_ids:
+            before_commit(len(article_ids))
+        return len(article_ids)
+
+    def finish_run(self, run_id: str, *, reconciled: bool) -> None:
+        """Mark one normally returned run terminal after all required work."""
+
+        self.connection.execute(
+            """
+            UPDATE runs SET status = 'succeeded',
+                reconciliation_complete = ?, finished_at = current_timestamp
+            WHERE run_id = ?
+            """,
+            [reconciled, run_id],
+        )
+
+    def interrupt_run(self, run_id: str) -> None:
+        """Record a caught interruption without asserting discovery/removal."""
+
+        self.connection.execute(
+            """
+            UPDATE runs SET status = 'interrupted', finished_at = current_timestamp
+            WHERE run_id = ? AND status = 'running'
+            """,
+            [run_id],
+        )
+
+    def fail_run(self, run_id: str) -> None:
+        """Record an operational failure without claiming traversal completion."""
+
+        self.connection.execute(
+            """
+            UPDATE runs SET status = 'failed', finished_at = current_timestamp
+            WHERE run_id = ? AND status = 'running'
+            """,
+            [run_id],
+        )
 
     def register_not_applicable(
         self,

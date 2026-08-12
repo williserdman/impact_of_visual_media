@@ -69,7 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_root_arguments(inventory)
     run = commands.add_parser("run")
     _add_root_arguments(run)
-    run.add_argument("--limit", required=True, type=_positive_int)
+    scope = run.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--limit", type=_positive_int)
+    scope.add_argument("--full", action="store_true")
     run.add_argument("--reprocess", action="store_true")
     run.add_argument("--authorize-hosted-processing", action="store_true")
     return parser
@@ -164,6 +166,7 @@ def main(
                 config,
                 adapter,
                 limit=args.limit,
+                full=args.full,
                 reprocess=args.reprocess,
             )
         except _OPERATIONAL_ERRORS as error:

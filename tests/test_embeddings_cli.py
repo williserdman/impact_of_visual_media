@@ -83,6 +83,59 @@ def root_arguments(
     ]
 
 
+@pytest.mark.parametrize(
+    "scope_arguments",
+    (
+        (),
+        ("--limit", "1", "--full"),
+        ("--limit", "0"),
+        ("--limit", "-1"),
+    ),
+    ids=("missing", "combined", "zero", "negative"),
+)
+def test_run_requires_exactly_one_explicit_valid_scope(
+    tmp_path: Path,
+    scope_arguments: tuple[str, ...],
+) -> None:
+    """Break caught: an absent, ambiguous, or nonpositive run scope is accepted."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+
+    with pytest.raises(SystemExit) as raised:
+        main(["run", *root_arguments(*roots), *scope_arguments])
+
+    assert raised.value.code == 2
+    assert not roots[2].exists()
+
+
+def test_authorized_full_scope_is_explicit_and_processes_generated_catalog(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Break caught: the explicit full scope is rejected or silently limited."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+    adapter = RecordingFakeAdapter()
+
+    exit_code = main(
+        [
+            "run",
+            *root_arguments(*roots),
+            "--full",
+            "--authorize-hosted-processing",
+        ],
+        adapter_factory=lambda: adapter,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["articles"] == 2
+    assert adapter.texts == [
+        "# Complete A\n\nFirst paragraph.\n",
+        "# Complete B\n\nSecond paragraph.\n",
+    ]
+
+
 def test_embedding_smoke_is_fixture_safe_and_deterministic(capsys) -> None:
     exit_code = main(["smoke"])
     line = capsys.readouterr().out
@@ -201,14 +254,19 @@ def test_authorized_limited_run_embeds_complete_lexical_winner_with_fake(
         "articles": 1,
         "attempted": 2,
         "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
+        "elapsed_seconds": 0.0,
         "embeddings": 3,
         "header_absent": 0,
         "header_failed": 0,
+        "hosted_requests": 0,
         "interrupted": 0,
+        "retries": 0,
         "retryable": 0,
         "reused": 0,
         "succeeded": 3,
         "terminal": 0,
+        "throttles": 0,
+        "usage": {},
     }
     assert line == f"{json.dumps(json.loads(line), sort_keys=True)}\n"
     assert adapter.texts == ["# Complete A\n\nFirst paragraph.\n"]
@@ -284,14 +342,19 @@ def test_authorized_reprocess_flag_regenerates_only_the_limited_cli_scope(
         "articles": 1,
         "attempted": 1,
         "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
+        "elapsed_seconds": 0.0,
         "embeddings": 2,
         "header_absent": 0,
         "header_failed": 0,
+        "hosted_requests": 0,
         "interrupted": 0,
+        "retries": 0,
         "retryable": 0,
         "reused": 1,
         "succeeded": 2,
         "terminal": 0,
+        "throttles": 0,
+        "usage": {},
     }
     assert adapter.texts == ["# Complete A\n\nFirst paragraph.\n"]
     with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
@@ -355,14 +418,19 @@ def test_run_summary_distinguishes_absent_from_failed_header(
         "articles": 1,
         "attempted": 1,
         "configuration_id": configuration_id(FakeEmbeddingAdapter.profile),
+        "elapsed_seconds": 0.0,
         "embeddings": 1,
         "header_absent": expected_absent,
         "header_failed": expected_failed,
+        "hosted_requests": 0,
         "interrupted": 0,
+        "retries": 0,
         "retryable": expected_retryable,
         "reused": 0,
         "succeeded": 1,
         "terminal": 0,
+        "throttles": 0,
+        "usage": {},
     }
 
 

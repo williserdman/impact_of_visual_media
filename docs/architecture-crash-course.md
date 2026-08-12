@@ -126,12 +126,12 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
 | `wsj_embeddings/image_rendition.py` | bounded image decode, exact-byte eligibility, deterministic Pillow rendition, and atomic derived-file installation | source-image mutation or hosted requests |
 | `wsj_embeddings/batching.py` | mixed-input payload packing, bounded concurrency, rate-aware retry waves, and safe observations | HTTP serialization or catalog publication |
-| `wsj_embeddings/catalog.py` | separate schema version 12, exact read-only inspection, bounded lifecycle/generation/part/provenance transactions | preprocessing catalog mutation |
-| `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection, text/image encoding, composite derivation, hashes, and publication | hosted credential loading |
+| `wsj_embeddings/catalog.py` | separate schema version 13, exact read-only inspection, bounded lifecycle/generation/part/provenance/full-run transactions | preprocessing catalog mutation |
+| `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection/full traversal, text/image encoding, composite derivation, publication, and reconciliation | hosted credential loading |
 | `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
 | `wsj_embeddings/pilot.py` | fixed generated hosted text/image/boundary probes and content-free observations | corpus or filesystem input/output |
-| `wsj_embeddings/cli.py` | `smoke`, `pilot`, credential-free `inventory`, and authorized limit-only production `run` with bounded reprocess | preprocessing mutation or full embedding reconciliation |
+| `wsj_embeddings/cli.py` | `smoke`, `pilot`, credential-free `inventory`, and authorized exactly-one-of limit/full production `run` with bounded reprocess | preprocessing mutation |
 
 The installed `wsj-embeddings` command accepts `smoke`, `pilot`, `inventory`,
 and `run`. `smoke`
@@ -141,12 +141,14 @@ creates three disjoint temporary roots, publishes one fake 2,048-dimensional
 temporary fixture. `pilot` has no selectors and, only with `JINA_API_KEY`, uses
 the hosted adapter for its fixed generated probes without creating a catalog or
 output root. `inventory` performs a read-only aggregate over canonical winners
-without constructing an adapter or requiring `JINA_API_KEY`. `run` requires a
-positive `--limit`, three explicit disjoint roots, and
-`--authorize-hosted-processing`; it selects by `ORDER BY article_id LIMIT ?`,
-uses the production Jina adapter with truncation disabled, and never reconciles
-unselected rows. Optional `--reprocess` regenerates article text only in that
-selected limit while reusing unchanged independent header-image work,
+without constructing an adapter or requiring `JINA_API_KEY`. `run` requires
+exactly one of positive `--limit` or explicit `--full`, three explicit disjoint
+roots, and `--authorize-hosted-processing`. Limited mode selects by
+`ORDER BY article_id LIMIT ?` and never reconciles unselected rows. Full mode
+uses bounded lexical keyset pages, durable content-free discovery, bounded
+processing and reconciliation pages, and reconciles only after successful
+traversal. Optional `--reprocess` regenerates selected article text while
+reusing unchanged independent header-image work,
 and success JSON includes its deterministic `configuration_id`. The existing
 `wsj-pipeline` command surface is unchanged.
 
@@ -256,15 +258,17 @@ ORDER BY published_at_utc, article_id;
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 12 has exactly eleven base tables, no views,
-and no indexes. Versions 1 through 11 and malformed output are refused without
-migration.
+catalog. Embedding schema version 13 has exactly twelve base tables, no views,
+and no indexes. Versions 1 through 12 and malformed output are refused without
+migration. `full_run_articles` stores only run/article identity and the optional
+source-relative header association, never Markdown or image bytes.
 
 | Table | Ordered columns and DuckDB types | Primary key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
 | `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `observed_api_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
-| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `hosted_requests INTEGER`, `hosted_retries INTEGER`, `usage_json VARCHAR`, `throttles INTEGER`, `elapsed_seconds DOUBLE`, `started_at TIMESTAMPTZ` | `run_id` |
+| `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `scope VARCHAR`, `status VARCHAR`, `discovery_complete BOOLEAN`, `reconciliation_complete BOOLEAN`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `hosted_requests INTEGER`, `hosted_retries INTEGER`, `usage_json VARCHAR`, `throttles INTEGER`, `elapsed_seconds DOUBLE`, `started_at TIMESTAMPTZ`, `finished_at TIMESTAMPTZ` | `run_id` |
+| `full_run_articles` | `run_id VARCHAR`, `article_id VARCHAR`, `header_image_path VARCHAR` | `(run_id, article_id)` |
 | `embedding_work_items` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `updated_at TIMESTAMPTZ` | `(article_id, modality, configuration_id)` |
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
@@ -572,6 +576,20 @@ that pending relation. A later full run therefore resumes after an interruption
 between source pages, between phases, or between identity pages without holding
 a corpus-sized Python work list.
 
+Embedding full runs use a separate downstream boundary. They first keyset-page
+one read-only snapshot of the canonical `articles` relation in lexical
+`article_id` order and commit only article identity plus the optional header
+association to the run inventory. No disappearance inference occurs unless
+that traversal exhausts.
+The coordinator then reopens and processes each inventory page through the
+existing bounded modality pipeline. Only after all pages return does it
+reconcile disappeared articles and headers across every stored configuration in
+bounded transactions. A failed page rolls back only that page and leaves the
+run non-complete; a later full run re-evaluates remaining stale work. Obsolete
+derived renditions are descriptor-checked and unlinked only after the catalog
+transaction commits. Interrupted cleanup leaves a validator-visible harmless
+orphan for a later full run to remove.
+
 An unchanged rerun does not sweep a post-commit orphan. To remove one safely:
 
 1. Verify no pipeline process is active and run `validate` to obtain the exact
@@ -612,11 +630,12 @@ reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
-and local header-image embeddings. It checks the exact eleven-table embedding
+and local header-image embeddings. It checks the exact twelve-table embedding
 schema first, opens the
 preprocessing catalog through its public exact-schema contract, and reports
 stable sorted issues for configuration identity/reference failures, malformed
-work lifecycle/failure checkpoints, malformed generation provenance, missing
+run scope/terminal/full-inventory state, malformed work lifecycle/failure
+checkpoints, malformed generation provenance, missing
 vectors claimed by successful work,
 unsupported modality/dimension, orphaned canonical identities, publication
 mismatch, unsafe or missing canonical Markdown/header images, rendition and
@@ -708,14 +727,15 @@ orphan cleanup, and full-only missing-source reconciliation.
   anchor even if the pathname changes, and lock cleanup removes only the inode
   created by the current coordinator.
 - The explicit `wsj-embeddings pilot` sends generated probes only. The separate
-  `wsj-embeddings run` is the licensed-content Jina call surface and remains
-  limited-only: affirmative hosted-processing authorization and a positive
-  lexical article limit are mandatory. Unchanged successful article text is
-  reused; retryable/interrupted work resumes and terminal work is not retried
+  `wsj-embeddings run` is the licensed-content Jina call surface: affirmative
+  hosted-processing authorization and exactly one positive lexical article
+  limit or explicit full scope are mandatory. Unchanged successful article
+  text is reused; retryable/interrupted work resumes and terminal work is not retried
   implicitly. Missing declared images are counted separately from true
-  no-header articles without failing successful text. `--reprocess` regenerates only that selected limit and retains
-  superseded-generation provenance. Full reconciliation remains a later
-  boundary.
+  no-header articles without failing successful text. `--reprocess` regenerates
+  only the selected scope and retains superseded-generation provenance.
+  Completed explicit full runs reconcile disappeared articles and header
+  associations across configurations.
 - Hosted v4 work is greedily packed across text, image, and long-part items
   under independent item, estimated-token, and total encoded-byte ceilings.
   At most the profile's configured request concurrency is active. Indexed
