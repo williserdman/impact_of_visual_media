@@ -408,8 +408,8 @@ references only; the pipeline never downloads them.
 `article_text` is a hosted Jina v4 embedding of canonical Markdown.
 `header_image` is a hosted Jina v4 embedding of the optional local canonical
 header image. `multimodal_article` is the locally computed normalized midpoint
-of matching text and image generations, not a joint hosted API response. All
-vectors are 2,048-dimensional normalized float32 research observations.
+of matching text and image generations; no additional hosted request produces
+it. All vectors are 2,048-dimensional normalized float32 research observations.
 
 ### First-time embedding workflow
 
