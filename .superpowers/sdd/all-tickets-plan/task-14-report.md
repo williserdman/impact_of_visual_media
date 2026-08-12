@@ -262,3 +262,40 @@ beyond the first 32-vector page, fresh and long-text validation, visible
 reconciliation, multimodal/history provenance, concurrent artifact changes,
 and coverage. `validate.py` contains no `fetchall()` call. No real archive,
 live API, credential, real full run, or full suite was used.
+
+### Final integration review corrections
+
+The fatal-telemetry production correction was already present: malformed item
+counts and local indexes are accumulated into `BatchExecutionFatal`, and both
+limited and full coordinators persist its completed request, retry, usage, and
+throttle observations before failing the run. The public catalog fixture now
+exercises both malformed shapes after one retry and a durable sibling success.
+It observes three requests, one retry, eight prompt tokens, one total token,
+one throttle, and four seconds of whole-run elapsed time in the failed `runs`
+row. A separate generated packing failure proves that a plain hosted error
+before any exchange stores zero requests, retries, usage, and throttles while
+retaining the three-second whole-run elapsed time. The two scheduler shape
+fixtures and three public coordinator fixtures passed.
+
+The README quick command synopsis now states the same exactly-one-positive-
+limit-or-explicit-full contract as the live embedding parser. Recovery now
+distinguishes the preprocessing lock from
+`<embedding-output-root>/pipeline.lock`: the operator must first verify that no
+embedding pipeline process is active, remove only that exact stale lock, and
+rerun the same idempotent embedding command.
+
+An isolated `duckdb==1.5.5` environment fetched a generated `TIMESTAMPTZ`
+successfully with `pytz==2024.1`. After changing the declared dependency to the
+bounded verified range `pytz>=2024.1,<2027`, a clean editable development
+install explicitly pinned to the floor passed the three public telemetry
+fixtures and `wsj-embeddings smoke`. No shared environment, lock file, machine
+configuration, service, or daemon was changed.
+
+The final focused gate used that isolated floor environment. Scheduler tests
+reported `2 passed`; public coordinator tests reported `3 passed`; changed-file
+Ruff passed; preprocessing and embedding smokes returned successful generated
+summaries. Installed preprocessing, embedding, and embedding-run help exposed
+the documented command sets, exactly-one scope, and hosted authorization.
+Current-document relative links resolved, whitespace and tracked-artifact
+hygiene checks passed, and no full suite was rerun. The earlier first and final
+full-suite results above remain the complete full-suite chronology.

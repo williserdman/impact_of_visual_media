@@ -83,7 +83,8 @@ smoke      publish and validate one generated article text embedding
 pilot      send fixed generated text/image probes to hosted Jina v4
 inventory  count canonical/text/header eligibility without credentials
 validate   check integrity and content-free coverage without credentials
-run        embed or reprocess a positive lexical article-id limit after authorization
+run        embed or reprocess exactly one positive limit or explicit full scope
+           after hosted-processing authorization
 ```
 
 It prints this deterministic, content-free result on success:
@@ -641,12 +642,12 @@ new path before switching the catalog and removes the old generated file only
 after commit; an interrupted cleanup can leave a harmless orphan that
 `validate` reports.
 
-Mutating runs own `data/processed/wsj/pipeline.lock`. If a process dies before
-cleanup, first verify that no pipeline process is active, remove only that
-stale lock, then rerun. Never delete the source archive to recover. If legacy
-or unsupported derived output is detected, move that generated directory
-aside or choose a fresh output root; the pipeline will not migrate or delete
-it automatically.
+Mutating preprocessing runs own `data/processed/wsj/pipeline.lock`. If a process
+dies before cleanup, first verify that no preprocessing pipeline process is
+active, remove only that stale lock, then rerun. Never delete the source archive
+to recover. If legacy or unsupported derived output is detected, move that
+generated directory aside or choose a fresh output root; the pipeline will not
+migrate or delete it automatically.
 
 The catalog leaf must be a single-link regular file; symlinks, directories, and
 hard links are refused before DuckDB mutation. A validated run remains
@@ -667,6 +668,13 @@ coordinator opens every output-root component without following links, then
 creates its catalog and exclusive `pipeline.lock` relative to that anchored
 directory. Lock cleanup compares file identity and will not remove a pathname
 replaced by another process.
+
+Embedding runs separately own `<embedding-output-root>/pipeline.lock`. After an
+embedding process dies, first verify that no embedding pipeline process is
+active. Remove only that exact stale embedding lock, then rerun the same
+idempotent `wsj-embeddings run` command. Do not remove the preprocessing lock as
+part of embedding recovery, and do not remove any other file below either
+output root.
 
 ## Development checks
 

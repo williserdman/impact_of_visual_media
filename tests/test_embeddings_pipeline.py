@@ -1429,7 +1429,10 @@ def test_concurrent_wave_commits_second_success_before_raising_first_fatal(
     assert [[item.value for item in call] for call in replay.calls] == [["#\n"]]
 
 
-def test_malformed_later_batch_persists_prior_usage_and_throttle(tmp_path):
+@pytest.mark.parametrize("malformed_kind", ("count", "index"))
+def test_malformed_later_batch_persists_all_completed_hosted_telemetry(
+    tmp_path, malformed_kind
+):
     """Break caught: fatal shape errors erase completed hosted telemetry."""
 
     config = write_generated_preprocessing_fixture(tmp_path)
@@ -1439,55 +1442,82 @@ def test_malformed_later_batch_persists_prior_usage_and_throttle(tmp_path):
         markdown="# Second generated article\n",
     )
 
-    class MalformedSecondBatchAdapter(RecordingBatchAdapter):
+    class MalformedAfterRetryAdapter(RecordingBatchAdapter):
         profile = replace(
             RecordingBatchAdapter.profile,
             batch_max_items=1,
-            client_configuration_version="synthetic-malformed-second-batch-v1",
+            batch_max_attempts=2,
+            client_configuration_version="synthetic-malformed-after-retry-v1",
         )
 
         def embed_batch(self, inputs, *, limits):
-            if self.calls:
+            call_number = len(self.calls)
+            if call_number == 0:
                 self.calls.append(tuple(inputs))
                 return JinaEmbeddingBatchResponse(
-                    (),
-                    {"prompt_tokens": 3},
+                    (
+                        JinaBatchItemOutcome(
+                            0,
+                            None,
+                            "missing_response_item",
+                            retryable=True,
+                            status_code=200,
+                        ),
+                    ),
+                    {"prompt_tokens": 2},
+                    JinaResponseMetadata(
+                        200,
+                        self.profile.model,
+                        {"x-ratelimit-remaining-requests": 0.0},
+                    ),
+                )
+            if call_number == 2:
+                self.calls.append(tuple(inputs))
+                malformed_items = (
+                    ()
+                    if malformed_kind == "count"
+                    else (
+                        JinaBatchItemOutcome(
+                            1,
+                            None,
+                            "invalid_response",
+                            retryable=False,
+                        ),
+                    )
+                )
+                return JinaEmbeddingBatchResponse(
+                    malformed_items,
+                    {"prompt_tokens": 5},
                     JinaResponseMetadata(200, self.profile.model, {}),
                 )
-            response = super().embed_batch(inputs, limits=limits)
-            return replace(
-                response,
-                usage={"prompt_tokens": 7},
-                response_metadata=JinaResponseMetadata(
-                    200,
-                    self.profile.model,
-                    {"x-ratelimit-remaining-requests": 0.0},
-                ),
-            )
+            return super().embed_batch(inputs, limits=limits)
 
-    adapter = MalformedSecondBatchAdapter()
+    adapter = MalformedAfterRetryAdapter()
     with pytest.raises(JinaHostedAdapterError) as caught:
         run_embedding_pipeline(
             config,
             adapter,
             limit=2,
             batch_sleep=lambda _seconds: None,
+            batch_jitter=lambda _attempt: 0.0,
+            monotonic=iter((10.0, 14.0)).__next__,
         )
 
     assert caught.value.code == "invalid_response"
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
             """
-            SELECT status, hosted_requests, usage_json, throttles,
-                   elapsed_seconds >= 0, finished_at IS NOT NULL
+            SELECT status, hosted_requests, hosted_retries, usage_json, throttles,
+                   elapsed_seconds, finished_at IS NOT NULL
             FROM runs
             """
         ).fetchone() == (
             "failed",
-            2,
-            '{"prompt_tokens":10}',
+            3,
             1,
-            True,
+            '{"prompt_tokens":8,"total_tokens":1}',
+            1,
+            4.0,
             True,
         )
         assert db.execute(
@@ -1499,6 +1529,39 @@ def test_malformed_later_batch_persists_prior_usage_and_throttle(tmp_path):
             ("wsj:SYNTHETIC-EMBEDDING", "succeeded"),
             ("wsj:ZZZ-SYNTHETIC-EMBEDDING", "in_progress"),
         ]
+
+
+def test_pre_exchange_hosted_error_records_zero_hosted_telemetry(tmp_path):
+    """Break caught: a no-request packing failure invents hosted observations."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class LocallyOversizedBatchAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_encoded_bytes=1,
+            client_configuration_version="synthetic-local-oversize-v1",
+        )
+
+    adapter = LocallyOversizedBatchAdapter()
+    with pytest.raises(JinaHostedAdapterError) as caught:
+        run_embedding_pipeline(
+            config,
+            adapter,
+            limit=1,
+            monotonic=iter((20.0, 23.0)).__next__,
+        )
+
+    assert caught.value.code == "deterministic_request"
+    assert adapter.calls == []
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT status, hosted_requests, hosted_retries, usage_json, throttles,
+                   elapsed_seconds, finished_at IS NOT NULL
+            FROM runs
+            """
+        ).fetchone() == ("failed", 0, 0, "{}", 0, 3.0, True)
 
 
 def test_batched_replay_enters_attempt_two_and_terminalizes_at_durable_ceiling(

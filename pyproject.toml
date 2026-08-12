@@ -14,7 +14,7 @@ dependencies = [
   "huggingface-hub>=0.34,<1",
   "lxml>=5,<7",
   "pillow==11.3.0",
-  "pytz>=2026.3.post1",
+  "pytz>=2024.1,<2027",
   "tokenizers==0.21.4",
 ]
 
