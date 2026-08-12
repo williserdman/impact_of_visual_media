@@ -667,6 +667,13 @@ generations, reports malformed dimensions without aborting, rejects globally
 unknown provenance configuration references, and descriptor-scans the
 rendition namespace without following symlinks, reporting unsafe entries and
 unreferenced final or temporary files without deleting them.
+It opens the embedding catalog first, then preprocessing, begins a read
+transaction before either catalog's first schema query, and holds both through
+all checks. The resulting pair existed when preprocessing was acquired, but is
+not an atomic cross-database or filesystem snapshot. Content-free start/end
+tokens cover every referenced canonical Markdown/current header/rendition and
+the entire no-follow rendition namespace; an observed change produces
+`concurrent_validation_state_change` and a failed result.
 It also checks bounded long-text lifecycle/vector state and resolves complete
 active and archived aggregate provenance to immutable part generations. It
 recomputes every aggregate hash, compares active vectors, and reopens current
@@ -676,7 +683,8 @@ never contain Markdown, vector values, or credentials. When configurations
 coexist, validation requires one explicit configuration identity and never
 mixes generations. Its public corpus result accounts for canonical articles;
 text success/failure; header present/absent/success/failure; multimodal
-success/unavailable/failure; stale and unresolved retryable work; and orphan
+success/unavailable/failure as one mutually exclusive partition; stale and
+unresolved retryable work; and orphan
 rendition files. Validation detects but does not repair state, use a hosted
 credential, or make a network request.
 

@@ -18,6 +18,7 @@ from wsj_embeddings.smoke import EmbeddingSmokeResult, run_embedding_smoke
 from wsj_embeddings.validate import (
     EmbeddingCorpusValidationResult,
     EmbeddingCoverage,
+    EmbeddingValidationFailpoints,
     EmbeddingValidationIssue,
     EmbeddingValidationResult,
     validate_embedding_corpus,
@@ -35,6 +36,7 @@ __all__ = [
     "EmbeddingProfile",
     "EmbeddingRunResult",
     "EmbeddingSmokeResult",
+    "EmbeddingValidationFailpoints",
     "EmbeddingValidationIssue",
     "EmbeddingValidationResult",
     "FakeEmbeddingAdapter",

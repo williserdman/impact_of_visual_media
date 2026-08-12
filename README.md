@@ -236,11 +236,22 @@ Validate the completed corpus without a Jina credential or hosted request:
 `--configuration-id` may be omitted only while the catalog contains zero or
 one configuration. The result reports stable integrity issues and content-free
 counts for canonical articles; text success/failure; header present/absent,
-success/failure; multimodal success/unavailable/failure; stale work;
+success/failure; a mutually exclusive multimodal success/unavailable/failure
+partition; stale work;
 unresolved retryable work; and orphan rendition artifacts. A nonempty issue
 list returns a nonzero status. Validation opens both catalogs read-only, does
 not construct an embedding adapter, and never repairs, migrates, deletes, or
 downloads anything.
+
+Validation opens the embedding catalog first and then the preprocessing
+catalog, begins a read transaction before each catalog's first schema query,
+and holds both through the complete pass. This provides one stable catalog
+pair that existed when the second handle was acquired; it is not described as
+an atomic cross-database or filesystem snapshot. Generated files cannot be
+locked by those transactions, so validation records content-free start/end
+tokens for every canonical Markdown/current header, every referenced
+rendition, and the complete no-follow rendition namespace. A detected change
+reports `concurrent_validation_state_change` and makes validation unsuccessful.
 
 Then inventory the configured archive without changing either source or
 generated state:
@@ -521,6 +532,9 @@ selected by article-text work and reconciles the latest run's `header_absent`
 and `header_failed` claims against durable header work. When more than one
 configuration exists, callers must select an explicit `configuration_id`;
 validation never silently mixes generations.
+Every vector exposed by the canonical `embeddings` view must also join the
+same public article/modality/configuration work key in `succeeded` state with
+matching source path, input hash, and a same-configuration generating run.
 
 ## Incremental runs and reprocessing
 

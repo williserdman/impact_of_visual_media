@@ -8,7 +8,9 @@ import math
 import os
 import stat
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 import duckdb
 
@@ -57,6 +59,10 @@ from wsj_embeddings.source_image import (
 from wsj_pipeline.catalog import Catalog, CatalogError
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+
+
+class _Digest(Protocol):
+    def update(self, value: bytes) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,11 +116,19 @@ class EmbeddingCorpusValidationResult:
         return not self.issues
 
 
+@dataclass(frozen=True, slots=True)
+class EmbeddingValidationFailpoints:
+    """Generated-fixture seams around the stable validation snapshot."""
+
+    after_state_snapshot: Callable[[], None] | None = None
+
+
 def validate_embedding_corpus(
     config: EmbeddingPipelineConfig,
     *,
     configuration_id: str | None = None,
     image_codec: ImageCodec | None = None,
+    failpoints: EmbeddingValidationFailpoints | None = None,
 ) -> EmbeddingCorpusValidationResult:
     """Return read-only integrity and content-free coverage for one config."""
 
@@ -123,6 +137,7 @@ def validate_embedding_corpus(
         configuration_id=configuration_id,
         image_codec=image_codec,
         include_coverage=True,
+        failpoints=failpoints or EmbeddingValidationFailpoints(),
     )
     return EmbeddingCorpusValidationResult(
         configuration_id=selected_configuration_id,
@@ -144,6 +159,7 @@ def validate_embedding_outputs(
         configuration_id=configuration_id,
         image_codec=image_codec,
         include_coverage=False,
+        failpoints=EmbeddingValidationFailpoints(),
     )
     return EmbeddingValidationResult(issues)
 
@@ -154,6 +170,7 @@ def _validate_embedding_state(
     configuration_id: str | None,
     image_codec: ImageCodec | None,
     include_coverage: bool,
+    failpoints: EmbeddingValidationFailpoints,
 ) -> tuple[
     tuple[EmbeddingValidationIssue, ...],
     str | None,
@@ -167,99 +184,56 @@ def _validate_embedding_state(
     coverage: EmbeddingCoverage | None = None
     try:
         with EmbeddingCatalog.read_only(config.embedding_catalog) as catalog:
-            articles = _canonical_articles(config, issues)
-            if articles is not None:
-                _validate_configurations(catalog.connection, issues)
-                _validate_run_metrics(catalog.connection, issues)
-                _validate_run_lifecycle(catalog.connection, issues)
-                _validate_reconciliation_actions(catalog.connection, issues)
-                _validate_global_generation_history_references(
-                    catalog.connection,
-                    issues,
-                )
-                _validate_global_image_provenance_references(
-                    catalog.connection,
-                    issues,
-                )
-                orphan_artifacts = _validate_rendition_artifacts(
-                    catalog.connection,
-                    config,
-                    issues,
-                )
-                selected_configuration_id = _select_configuration_id(
-                    catalog.connection,
-                    configuration_id,
-                    issues,
-                )
-                if selected_configuration_id is not None:
-                    resolved_image_codec = _resolve_validation_image_codec(
-                        catalog.connection,
-                        selected_configuration_id,
-                        image_codec,
-                        issues,
-                    )
-                    _validate_run_coverage(
-                        catalog.connection, selected_configuration_id, issues
-                    )
-                    _validate_work_items(
-                        catalog.connection,
-                        articles,
-                        selected_configuration_id,
-                        issues,
-                    )
-                    _validate_header_disposition_coverage(
-                        catalog.connection,
-                        articles,
-                        selected_configuration_id,
-                        issues,
-                    )
-                    _validate_embeddings(
-                        catalog.connection,
-                        config,
-                        articles,
-                        selected_configuration_id,
-                        issues,
-                    )
-                    _validate_long_text_parts(
-                        catalog.connection,
-                        config,
-                        articles,
-                        selected_configuration_id,
-                        issues,
-                    )
-                    _validate_image_input_provenance(
-                        catalog.connection,
-                        config,
-                        articles,
-                        selected_configuration_id,
-                        issues,
-                        resolved_image_codec,
-                    )
-                    _validate_multimodal_provenance(
-                        catalog.connection,
-                        selected_configuration_id,
-                        issues,
-                    )
-                    _validate_generation_history(
-                        catalog.connection, selected_configuration_id, issues
-                    )
-                    if include_coverage:
-                        coverage = _coverage_for_configuration(
+            preprocessing_phase = True
+            try:
+                with Catalog.read_only(config.preprocessing_catalog) as preprocessing:
+                    preprocessing.execute("BEGIN TRANSACTION")
+                    try:
+                        Catalog.validate_schema(preprocessing)
+                        articles = _canonical_articles(preprocessing)
+                        preprocessing_phase = False
+                        initial_artifact_state = _artifact_state_token(
+                            config,
                             catalog.connection,
                             articles,
-                            selected_configuration_id,
-                            orphan_artifacts=orphan_artifacts,
                         )
-                elif (
-                    include_coverage
-                    and articles
-                    and not _connection_has_configurations(catalog.connection)
-                ):
-                    _append(
-                        issues,
-                        "missing_embedding_configuration",
-                        "canonical articles lack an embedding configuration",
-                    )
+                        if failpoints.after_state_snapshot is not None:
+                            failpoints.after_state_snapshot()
+                        selected_configuration_id, coverage = _validate_stable_state(
+                            embedding=catalog.connection,
+                            config=config,
+                            articles=articles,
+                            requested_configuration_id=configuration_id,
+                            image_codec=image_codec,
+                            include_coverage=include_coverage,
+                            issues=issues,
+                        )
+                        if _artifact_state_token(
+                            config,
+                            catalog.connection,
+                            articles,
+                        ) != initial_artifact_state:
+                            _append(
+                                issues,
+                                "concurrent_validation_state_change",
+                                "generated artifact state changed during validation",
+                            )
+                    finally:
+                        preprocessing.execute("ROLLBACK")
+            except (CatalogError, OSError):
+                _append(
+                    issues,
+                    "invalid_preprocessing_catalog",
+                    "canonical preprocessing catalog could not be queried",
+                )
+            except duckdb.Error:
+                if not preprocessing_phase:
+                    raise
+                _append(
+                    issues,
+                    "invalid_preprocessing_catalog",
+                    "canonical preprocessing catalog could not be queried",
+                )
     except EmbeddingCatalogError:
         issues.append(
             EmbeddingValidationIssue(
@@ -281,6 +255,100 @@ def _validate_embedding_state(
     )
 
 
+def _validate_stable_state(
+    *,
+    embedding: duckdb.DuckDBPyConnection,
+    config: EmbeddingPipelineConfig,
+    articles: dict[str, CanonicalArticle],
+    requested_configuration_id: str | None,
+    image_codec: ImageCodec | None,
+    include_coverage: bool,
+    issues: list[EmbeddingValidationIssue],
+) -> tuple[str | None, EmbeddingCoverage | None]:
+    """Validate one stable catalog pair and its observed generated artifacts."""
+
+    _validate_configurations(embedding, issues)
+    _validate_run_metrics(embedding, issues)
+    _validate_run_lifecycle(embedding, issues)
+    _validate_reconciliation_actions(embedding, issues)
+    _validate_global_public_embedding_checkpoints(embedding, issues)
+    _validate_global_generation_history_references(embedding, issues)
+    _validate_global_image_provenance_references(embedding, issues)
+    orphan_artifacts = _scan_rendition_artifacts(embedding, config, issues)
+    selected_configuration_id = _select_configuration_id(
+        embedding,
+        requested_configuration_id,
+        issues,
+    )
+    coverage: EmbeddingCoverage | None = None
+    if selected_configuration_id is not None:
+        resolved_image_codec = _resolve_validation_image_codec(
+            embedding,
+            selected_configuration_id,
+            image_codec,
+            issues,
+        )
+        _validate_run_coverage(embedding, selected_configuration_id, issues)
+        _validate_work_items(
+            embedding,
+            articles,
+            selected_configuration_id,
+            issues,
+        )
+        _validate_header_disposition_coverage(
+            embedding,
+            articles,
+            selected_configuration_id,
+            issues,
+        )
+        _validate_embeddings(
+            embedding,
+            config,
+            articles,
+            selected_configuration_id,
+            issues,
+        )
+        _validate_long_text_parts(
+            embedding,
+            config,
+            articles,
+            selected_configuration_id,
+            issues,
+        )
+        _validate_image_input_provenance(
+            embedding,
+            config,
+            articles,
+            selected_configuration_id,
+            issues,
+            resolved_image_codec,
+        )
+        _validate_multimodal_provenance(
+            embedding,
+            selected_configuration_id,
+            issues,
+        )
+        _validate_generation_history(embedding, selected_configuration_id, issues)
+        if include_coverage:
+            coverage = _coverage_for_configuration(
+                embedding,
+                articles,
+                selected_configuration_id,
+                orphan_artifacts=orphan_artifacts,
+            )
+    elif (
+        include_coverage
+        and articles
+        and not _connection_has_configurations(embedding)
+    ):
+        _append(
+            issues,
+            "missing_embedding_configuration",
+            "canonical articles lack an embedding configuration",
+        )
+    return selected_configuration_id, coverage
+
+
 def _connection_has_configurations(connection: duckdb.DuckDBPyConnection) -> bool:
     """Return whether an exact catalog contains an embedding configuration."""
 
@@ -292,29 +360,269 @@ def _connection_has_configurations(connection: duckdb.DuckDBPyConnection) -> boo
 
 
 def _canonical_articles(
-    config: EmbeddingPipelineConfig,
-    issues: list[EmbeddingValidationIssue],
-) -> dict[str, CanonicalArticle] | None:
-    try:
-        with Catalog.read_only(config.preprocessing_catalog) as db:
-            Catalog.validate_schema(db)
-            rows = db.execute(
-                """
-                SELECT article_id, cleaned_markdown_path, published_at_utc,
-                       publication_date_new_york, cleaned_markdown_sha256,
-                       header_image_path
-                FROM articles
-                """
-            ).fetchall()
-    except (CatalogError, duckdb.Error, OSError):
-        issues.append(
-            EmbeddingValidationIssue(
-                "invalid_preprocessing_catalog",
-                "canonical preprocessing catalog could not be queried",
-            )
-        )
-        return None
+    connection: duckdb.DuckDBPyConnection,
+) -> dict[str, CanonicalArticle]:
+    rows = connection.execute(
+        """
+        SELECT article_id, cleaned_markdown_path, published_at_utc,
+               publication_date_new_york, cleaned_markdown_sha256,
+               header_image_path
+        FROM articles
+        """
+    ).fetchall()
     return {row[0]: CanonicalArticle(*row) for row in rows}
+
+
+def _artifact_state_token(
+    config: EmbeddingPipelineConfig,
+    embedding: duckdb.DuckDBPyConnection,
+    articles: dict[str, CanonicalArticle],
+) -> str:
+    """Fingerprint referenced inputs and the complete no-follow rendition tree."""
+
+    digest = hashlib.sha256()
+    for article_id, article in sorted(articles.items()):
+        try:
+            markdown = read_canonical_markdown(
+                config.preprocessing_output_root,
+                article.cleaned_markdown_path,
+            )
+        except CanonicalMarkdownError as error:
+            _update_artifact_token(
+                digest,
+                "markdown",
+                article_id,
+                article.cleaned_markdown_path,
+                error.status,
+            )
+        else:
+            _update_artifact_token(
+                digest,
+                "markdown",
+                article_id,
+                article.cleaned_markdown_path,
+                hashlib.sha256(markdown).hexdigest(),
+            )
+        if article.header_image_path is not None:
+            try:
+                header = read_source_image(
+                    config.source_root,
+                    article.header_image_path,
+                )
+            except SourceImageError as error:
+                _update_artifact_token(
+                    digest,
+                    "header",
+                    article_id,
+                    article.header_image_path,
+                    error.status,
+                )
+            else:
+                _update_artifact_token(
+                    digest,
+                    "header",
+                    article_id,
+                    article.header_image_path,
+                    hashlib.sha256(header).hexdigest(),
+                )
+    rendition_paths = tuple(
+        str(row[0])
+        for row in embedding.execute(
+            """
+            SELECT rendition_relative_path FROM image_input_provenance
+            WHERE rendition_relative_path IS NOT NULL
+            ORDER BY rendition_relative_path
+            """
+        ).fetchall()
+    )
+    for relative_path in rendition_paths:
+        try:
+            rendition = read_source_image(
+                config.embedding_output_root,
+                relative_path,
+            )
+        except SourceImageError as error:
+            _update_artifact_token(digest, "rendition", relative_path, error.status)
+        else:
+            _update_artifact_token(
+                digest,
+                "rendition",
+                relative_path,
+                hashlib.sha256(rendition).hexdigest(),
+            )
+    try:
+        _update_rendition_tree_token(digest, config.embedding_output_root)
+    except OSError:
+        _update_artifact_token(digest, "rendition-tree", "unstable")
+    return digest.hexdigest()
+
+
+def _update_artifact_token(digest: _Digest, *values: object) -> None:
+    encoded = json.dumps(values, separators=(",", ":"), ensure_ascii=True).encode()
+    digest.update(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
+
+
+def _update_rendition_tree_token(
+    digest: _Digest,
+    output_root: os.PathLike[str] | str,
+) -> None:
+    """Hash entry identities/bytes below renditions without following links."""
+
+    try:
+        output_descriptor = os.open(output_root, _DIRECTORY_FLAGS)
+    except OSError:
+        _update_artifact_token(digest, "rendition-tree", "output-unavailable")
+        return
+    try:
+        try:
+            rendition_descriptor = os.open(
+                "renditions",
+                _DIRECTORY_FLAGS,
+                dir_fd=output_descriptor,
+            )
+        except FileNotFoundError:
+            _update_artifact_token(digest, "rendition-tree", "absent")
+            return
+        except OSError:
+            _update_artifact_token(digest, "rendition-tree", "unsafe")
+            return
+        try:
+            for namespace in sorted(
+                os.scandir(rendition_descriptor),
+                key=lambda entry: entry.name,
+            ):
+                try:
+                    namespace_stat = namespace.stat(follow_symlinks=False)
+                except OSError:
+                    _update_artifact_token(
+                        digest,
+                        "rendition-namespace",
+                        namespace.name,
+                        "unreadable",
+                    )
+                    continue
+                _update_artifact_token(
+                    digest,
+                    "rendition-namespace",
+                    namespace.name,
+                    _stat_identity(namespace_stat),
+                )
+                if not stat.S_ISDIR(namespace_stat.st_mode):
+                    continue
+                try:
+                    namespace_descriptor = os.open(
+                        namespace.name,
+                        _DIRECTORY_FLAGS,
+                        dir_fd=rendition_descriptor,
+                    )
+                except OSError:
+                    _update_artifact_token(
+                        digest,
+                        "rendition-namespace",
+                        namespace.name,
+                        "replaced",
+                    )
+                    continue
+                try:
+                    opened_stat = os.fstat(namespace_descriptor)
+                    if _stat_identity(opened_stat) != _stat_identity(namespace_stat):
+                        _update_artifact_token(
+                            digest,
+                            "rendition-namespace",
+                            namespace.name,
+                            "replaced",
+                        )
+                        continue
+                    for entry in sorted(
+                        os.scandir(namespace_descriptor),
+                        key=lambda item: item.name,
+                    ):
+                        _update_rendition_leaf_token(
+                            digest,
+                            namespace.name,
+                            namespace_descriptor,
+                            entry,
+                        )
+                finally:
+                    os.close(namespace_descriptor)
+        finally:
+            os.close(rendition_descriptor)
+    finally:
+        os.close(output_descriptor)
+
+
+def _update_rendition_leaf_token(
+    digest: _Digest,
+    namespace: str,
+    directory_descriptor: int,
+    entry: os.DirEntry[str],
+) -> None:
+    try:
+        entry_stat = entry.stat(follow_symlinks=False)
+    except OSError:
+        _update_artifact_token(
+            digest,
+            "rendition-leaf",
+            namespace,
+            entry.name,
+            "unreadable",
+        )
+        return
+    identity = _stat_identity(entry_stat)
+    if not stat.S_ISREG(entry_stat.st_mode):
+        _update_artifact_token(
+            digest,
+            "rendition-leaf",
+            namespace,
+            entry.name,
+            identity,
+        )
+        return
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            entry.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+        opened_stat = os.fstat(descriptor)
+        if _stat_identity(opened_stat) != identity:
+            raise OSError("rendition leaf replaced")
+        leaf_digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            leaf_digest.update(chunk)
+    except OSError:
+        _update_artifact_token(
+            digest,
+            "rendition-leaf",
+            namespace,
+            entry.name,
+            "replaced",
+        )
+    else:
+        _update_artifact_token(
+            digest,
+            "rendition-leaf",
+            namespace,
+            entry.name,
+            identity,
+            leaf_digest.hexdigest(),
+        )
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_mode,
+        value.st_dev,
+        value.st_ino,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+    )
 
 
 def _validate_configurations(
@@ -601,7 +909,7 @@ def _coverage_for_configuration(
     multimodal_success = sum(
         work.get((article_id, EmbeddingModality.MULTIMODAL_ARTICLE.value))
         == WorkState.SUCCEEDED.value
-        for article_id in articles
+        for article_id in header_present_ids
     )
     return EmbeddingCoverage(
         canonical_articles=len(articles),
@@ -714,6 +1022,37 @@ def _validate_global_generation_history_references(
             issues,
             "invalid_generation_identity_reference",
             "embedding generation history lacks its work or configuration identity",
+        )
+
+
+def _validate_global_public_embedding_checkpoints(
+    connection: duckdb.DuckDBPyConnection,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Require every public vector to have exact reusable-success work."""
+
+    invalid = connection.execute(
+        """
+        SELECT count(*)
+        FROM embeddings AS vector
+        LEFT JOIN embedding_work_items AS work
+          USING (article_id, modality, configuration_id)
+        LEFT JOIN runs AS generation_run
+          ON generation_run.run_id = work.generation_run_id
+         AND generation_run.configuration_id = work.configuration_id
+        WHERE work.article_id IS NULL
+           OR work.state <> 'succeeded'
+           OR work.source_relative_path IS DISTINCT FROM vector.source_relative_path
+           OR work.input_sha256 IS DISTINCT FROM vector.input_sha256
+           OR work.generation_run_id IS NULL
+           OR generation_run.run_id IS NULL
+        """
+    ).fetchone()[0]
+    if invalid:
+        _append(
+            issues,
+            "invalid_public_embedding_checkpoint",
+            "public embeddings lack exact reusable-success work provenance",
         )
 
 
@@ -1559,15 +1898,6 @@ def _validate_global_image_provenance_references(
             "unknown_image_provenance_configuration",
             "image input provenance references an unknown configuration",
         )
-
-
-def _validate_rendition_artifacts(
-    connection: duckdb.DuckDBPyConnection,
-    config: EmbeddingPipelineConfig,
-    issues: list[EmbeddingValidationIssue],
-) -> int:
-    """Scan the descriptor-anchored rendition namespace without following links."""
-    return _scan_rendition_artifacts(connection, config, issues)
 
 
 def _scan_rendition_artifacts(

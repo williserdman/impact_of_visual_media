@@ -98,3 +98,60 @@ and production Pillow verification. No full suite was run.
 - No real archive traversal, live hosted call, real full run, generated-data
   commit, machine configuration change, or shared-environment mutation was
   performed.
+
+## Review correction round 1
+
+Review found that a no-header canonical article could still count an old
+visible composite as multimodal success, producing success plus unavailable
+and a negative failure count. A generated header-removal fixture reproduced
+that exact result (`1 failed in 8.46s`). Coverage now counts multimodal
+success/failure only among currently header-eligible canonical identities; the
+remaining no-header identities are unavailable. The partition, incomplete
+coverage, and fresh CLI cases pass `3 passed in 12.10s` with explicit total and
+nonnegative assertions.
+
+Every vector exposed by the canonical `embeddings` view now has a global
+invariant requiring an exact public work key in `succeeded` state, matching
+source path/input hash, a non-null generation run, and a same-configuration run
+reference. Orphan-key and null-hash stale-work fixtures first failed to produce
+the stable issue (`2 failed in 5.62s`), then passed together with visible
+reconciliation compatibility (`3 passed in 8.63s`).
+
+Catalog validation now opens embedding first, begins its read transaction
+before exact schema validation, opens preprocessing second, begins its read
+transaction before exact schema validation or article queries, and retains
+both until the complete validation and coverage pass ends. This is a stable
+catalog pair that existed at second-handle acquisition, not an atomic
+cross-database snapshot. Filesystem state is not claimed atomic: content-free
+start/end tokens cover all canonical Markdown/current headers, all referenced
+renditions, and every no-follow rendition namespace/leaf identity and regular
+file hash. Changes produce `concurrent_validation_state_change`.
+
+The public failpoint fixture first failed because the snapshot callback was not
+invoked (`1 failed in 8.68s`), then passed (`1 passed in 2.76s`) while proving a
+concurrent Markdown replacement, failed validation, and unchanged catalog
+bytes. Concurrent Markdown and whole-namespace orphan addition pass together
+(`2 passed in 5.46s`). The complete correction selection passed `10 passed in
+27.53s`; exact schema/prior-schema refusal passed `5 passed in 4.40s`. The
+single-use rendition forwarding helper was removed. All correction fixtures
+remain generated, credential-free, offline, and read-only except for their
+explicit temporary artifact mutation.
+
+Final correction verification covered all new findings plus malformed
+preprocessing and the public CLI (`8 passed in 21.90s`), representative fresh,
+multimodal, long-text, vector/publication, and reconciliation validation (`6
+passed in 23.64s`), image/history/orphan validation (`4 passed in 14.90s`), and
+all run-metric/lifecycle parameter cases (`13 passed in 28.96s`).
+
+The final read-only compatibility and correction selection passed `14 passed
+in 31.99s`. It included the exact version-14 schema, version-13 refusal,
+malformed canonical-view and preprocessing-catalog refusal, immutable malformed
+catalog bytes, the public validation CLI, reconciliation-visible pending work,
+both concurrent-artifact fixtures, the coverage partition, and both global
+public-vector checkpoint corruptions. Ruff and `git diff --check` passed, live
+embedding help still exposes `{smoke,pilot,inventory,validate,run}` and the
+validate roots/configuration selector, and both generated smokes returned
+`validation_ok: true`. The three previously observed environment-dependent CLI
+failures are unchanged and were not broadly rerun: this correction does not
+touch the hosted image-codec path, and ticket 15 still owns verification in its
+clean temporary environment. No whole module or full suite is claimed green.

@@ -677,9 +677,12 @@ class EmbeddingCatalog:
         assert connection is not None
         catalog = cls(connection, leaf_descriptor=leaf_descriptor)
         try:
+            catalog.connection.execute("BEGIN TRANSACTION")
             catalog.validate_schema()
             yield catalog
         finally:
+            with suppress(duckdb.Error):
+                catalog.connection.execute("ROLLBACK")
             catalog.close()
 
     @classmethod

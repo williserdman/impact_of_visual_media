@@ -29,6 +29,7 @@ from wsj_embeddings import (
     EmbeddingPipelineFailpoints,
     EmbeddingProfile,
     EmbeddingRunResult,
+    EmbeddingValidationFailpoints,
     EmbeddingValidationIssue,
     EmbeddingValidationResult,
     FakeEmbeddingAdapter,
@@ -5239,6 +5240,150 @@ def test_public_validator_accounts_for_incomplete_stale_retryable_and_orphaned_o
     }
     assert not result.ok
     assert "orphan_image_rendition" in {issue.code for issue in result.issues}
+
+
+def test_public_coverage_partitions_header_removed_stale_visible_composite(tmp_path):
+    """Break caught: no-header articles also count as multimodal success/failure."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated stale visible header")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute(
+            """
+            UPDATE articles SET header_image_path = NULL
+            WHERE article_id = 'wsj:SYNTHETIC-EMBEDDING'
+            """
+        )
+
+    result = validate_embedding_corpus(config)
+
+    assert result.coverage is not None
+    coverage = result.coverage
+    assert coverage.header_present + coverage.header_absent == 1
+    assert coverage.text_success + coverage.text_failure == 1
+    assert (
+        coverage.multimodal_success
+        + coverage.multimodal_unavailable
+        + coverage.multimodal_failure
+        == 1
+    )
+    assert coverage.multimodal_success == 0
+    assert coverage.multimodal_unavailable == 1
+    assert coverage.multimodal_failure == 0
+    assert all(value >= 0 for value in asdict(coverage).values())
+
+
+@pytest.mark.parametrize(
+    "damage",
+    (
+        """
+        UPDATE embedding_storage
+        SET article_id = 'wsj:ORPHANED-PUBLIC-VECTOR'
+        """,
+        """
+        UPDATE embedding_work_storage
+        SET state = 'stale_input', input_sha256 = NULL,
+            generation_run_id = NULL
+        WHERE modality = 'article_text'
+        """,
+    ),
+    ids=("orphan-key", "null-hash-stale-work"),
+)
+def test_validator_rejects_public_vector_without_exact_reusable_work(tmp_path, damage):
+    """Break caught: a public vector survives without exact successful work."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(damage)
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_public_embedding_checkpoint" in codes
+
+
+def test_public_validator_reports_concurrent_artifact_change_without_catalog_write(
+    tmp_path,
+):
+    """Break caught: validation accepts a hybrid of two artifact generations."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    markdown_path = (
+        config.preprocessing_output_root
+        / "text"
+        / "2024"
+        / "01"
+        / "02"
+        / "article.md"
+    )
+    embedding_catalog_before = hashlib.sha256(
+        config.embedding_catalog.read_bytes()
+    ).hexdigest()
+    preprocessing_catalog_before = hashlib.sha256(
+        config.preprocessing_catalog.read_bytes()
+    ).hexdigest()
+    replacement = b"# Generated concurrent replacement\n"
+    calls = 0
+
+    def replace_after_snapshot() -> None:
+        nonlocal calls
+        calls += 1
+        markdown_path.write_bytes(replacement)
+
+    result = validate_embedding_corpus(
+        config,
+        failpoints=EmbeddingValidationFailpoints(
+            after_state_snapshot=replace_after_snapshot,
+        ),
+    )
+
+    assert calls == 1
+    assert not result.ok
+    assert "concurrent_validation_state_change" in {
+        issue.code for issue in result.issues
+    }
+    assert markdown_path.read_bytes() == replacement
+    assert (
+        hashlib.sha256(config.embedding_catalog.read_bytes()).hexdigest()
+        == embedding_catalog_before
+    )
+    assert (
+        hashlib.sha256(config.preprocessing_catalog.read_bytes()).hexdigest()
+        == preprocessing_catalog_before
+    )
+
+
+def test_public_validator_detects_concurrent_orphan_rendition_addition(tmp_path):
+    """Break caught: the concurrency token covers referenced files only."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    orphan = (
+        config.embedding_output_root
+        / "renditions"
+        / ("a" * 64)
+        / f"{'b' * 64}.jpg"
+    )
+
+    def add_orphan_after_snapshot() -> None:
+        orphan.parent.mkdir(parents=True)
+        orphan.write_bytes(b"generated concurrent orphan")
+
+    result = validate_embedding_corpus(
+        config,
+        failpoints=EmbeddingValidationFailpoints(
+            after_state_snapshot=add_orphan_after_snapshot,
+        ),
+    )
+
+    assert not result.ok
+    assert {"concurrent_validation_state_change", "orphan_image_rendition"} <= {
+        issue.code for issue in result.issues
+    }
+    assert result.coverage is not None
+    assert result.coverage.orphan_artifacts == 1
 
 
 def test_public_validator_reports_tampered_vector(tmp_path):
