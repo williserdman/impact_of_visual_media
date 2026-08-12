@@ -12,7 +12,7 @@ import warnings
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -88,6 +88,9 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("batch_max_attempts", "INTEGER", True, None, False),
         ("batch_initial_backoff_seconds", "DOUBLE", True, None, False),
         ("batch_max_backoff_seconds", "DOUBLE", True, None, False),
+        ("quota_max_requests", "INTEGER", True, None, False),
+        ("quota_max_estimated_tokens", "INTEGER", True, None, False),
+        ("quota_window_seconds", "INTEGER", True, None, False),
         ("image_input_rules", "VARCHAR", True, None, False),
         ("image_transform", "VARCHAR", True, None, False),
         ("multimodal_formula", "VARCHAR", True, None, False),
@@ -117,6 +120,14 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("elapsed_seconds", "DOUBLE", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
         ("finished_at", "TIMESTAMP WITH TIME ZONE", False, None, False),
+    ),
+    "hosted_request_reservations": (
+        ("reservation_id", "VARCHAR", True, None, True),
+        ("run_id", "VARCHAR", True, None, False),
+        ("configuration_id", "VARCHAR", True, None, False),
+        ("reserved_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+        ("estimated_tokens", "INTEGER", True, None, False),
+        ("observed_input_tokens", "INTEGER", False, None, False),
     ),
     "full_run_articles": (
         ("run_id", "VARCHAR", True, None, True),
@@ -283,6 +294,7 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     ("metadata", ("key",)),
     ("embedding_configurations", ("configuration_id",)),
     ("runs", ("run_id",)),
+    ("hosted_request_reservations", ("reservation_id",)),
     ("full_run_articles", ("run_id", "article_id")),
     (
         "embedding_work_storage",
@@ -824,6 +836,9 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
         "batch_max_attempts": 4,
         "batch_initial_backoff_seconds": 2.0,
         "batch_max_backoff_seconds": 60.0,
+        "quota_max_requests": 89,
+        "quota_max_estimated_tokens": 89_000,
+        "quota_window_seconds": 61,
         "image_input_rules": "changed-image-rules",
         "image_transform": "changed-image-transform",
         "multimodal_formula": "changed-multimodal-formula",
@@ -7626,7 +7641,7 @@ def test_rendition_cleanup_checks_one_candidate_and_preserves_history(tmp_path):
     assert not (namespace / orphan_name).exists()
 
 
-def test_embedding_catalog_has_exact_version_sixteen_observed_model_schema(
+def test_embedding_catalog_has_exact_version_seventeen_quota_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -7708,6 +7723,7 @@ def test_embedding_catalog_has_exact_version_sixteen_observed_model_schema(
         "embedding_configurations": "BASE TABLE",
         "embedding_generation_history": "BASE TABLE",
         "full_run_articles": "BASE TABLE",
+        "hosted_request_reservations": "BASE TABLE",
         "image_input_provenance": "BASE TABLE",
         "embedding_work_items": "VIEW",
         "embedding_work_storage": "BASE TABLE",
@@ -7724,7 +7740,91 @@ def test_embedding_catalog_has_exact_version_sixteen_observed_model_schema(
     assert view_columns == EXPECTED_EMBEDDING_VIEW_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "16")]
+    assert metadata == [("schema_version", "17")]
+
+
+def test_catalog_reserves_dual_rolling_quota_and_expires_old_capacity(tmp_path):
+    database_path = tmp_path / "catalog.duckdb"
+    profile = FakeEmbeddingAdapter.profile
+    configuration_identifier = configuration_id(profile)
+    started = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+
+    with EmbeddingCatalog.open(database_path) as catalog:
+        with catalog.transaction():
+            catalog.begin_run("run-quota", configuration_identifier, profile, 1)
+        reservation_ids: list[str] = []
+        for _ in range(45):
+            with catalog.transaction():
+                decision = catalog.reserve_hosted_requests(
+                    run_id="run-quota",
+                    configuration_identifier=configuration_identifier,
+                    estimated_tokens=(1_000, 1_000),
+                    reserved_at=started,
+                    profile=profile,
+                )
+            assert decision.retry_after_seconds == 0.0
+            reservation_ids.extend(decision.reservation_ids)
+
+        with catalog.transaction():
+            blocked = catalog.reserve_hosted_requests(
+                run_id="run-quota",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(1,),
+                reserved_at=started,
+                profile=profile,
+            )
+        assert blocked.reservation_ids == ()
+        assert blocked.retry_after_seconds == 60.0
+
+        with catalog.transaction():
+            admitted = catalog.reserve_hosted_requests(
+                run_id="run-quota",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(45_000,),
+                reserved_at=started + timedelta(seconds=60),
+                profile=profile,
+            )
+        assert len(admitted.reservation_ids) == 1
+        assert admitted.retry_after_seconds == 0.0
+
+        with catalog.transaction():
+            catalog.reconcile_hosted_request_usage(
+                reservation_ids=admitted.reservation_ids,
+                observed_input_tokens=45_001,
+            )
+        assert catalog.connection.execute(
+            """
+            SELECT estimated_tokens, observed_input_tokens
+            FROM hosted_request_reservations
+            WHERE reservation_id = ?
+            """,
+            [admitted.reservation_ids[0]],
+        ).fetchone() == (45_000, 45_001)
+        assert len(reservation_ids) == 90
+
+
+def test_pipeline_refuses_exact_version_sixteen_catalog_without_migration(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP TABLE hosted_request_reservations")
+        for column in (
+            "quota_max_requests",
+            "quota_max_estimated_tokens",
+            "quota_window_seconds",
+        ):
+            db.execute(
+                f"ALTER TABLE embedding_configurations DROP COLUMN {column}"
+            )
+        db.execute("UPDATE metadata SET value = '16' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
 
 
 def test_pipeline_refuses_exact_version_fifteen_catalog_without_migration(

@@ -10,7 +10,8 @@ import stat
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -27,7 +28,7 @@ from wsj_embeddings.models import (
 )
 from wsj_embeddings.run_metrics import normalize_safe_usage
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "16"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "17"
 
 _EMBEDDING_CATALOG_TYPES = {
     "article_text_aggregation_provenance",
@@ -36,6 +37,7 @@ _EMBEDDING_CATALOG_TYPES = {
     "embedding_work_storage",
     "embedding_storage",
     "full_run_articles",
+    "hosted_request_reservations",
     "image_input_provenance",
     "long_text_parts",
     "long_text_part_generations",
@@ -78,6 +80,9 @@ _TABLE_COLUMNS = {
         ("batch_max_attempts", "INTEGER", True, None, False),
         ("batch_initial_backoff_seconds", "DOUBLE", True, None, False),
         ("batch_max_backoff_seconds", "DOUBLE", True, None, False),
+        ("quota_max_requests", "INTEGER", True, None, False),
+        ("quota_max_estimated_tokens", "INTEGER", True, None, False),
+        ("quota_window_seconds", "INTEGER", True, None, False),
         ("image_input_rules", "VARCHAR", True, None, False),
         ("image_transform", "VARCHAR", True, None, False),
         ("multimodal_formula", "VARCHAR", True, None, False),
@@ -112,6 +117,14 @@ _TABLE_COLUMNS = {
         ("run_id", "VARCHAR", True, None, True),
         ("article_id", "VARCHAR", True, None, True),
         ("header_image_path", "VARCHAR", False, None, False),
+    ),
+    "hosted_request_reservations": (
+        ("reservation_id", "VARCHAR", True, None, True),
+        ("run_id", "VARCHAR", True, None, False),
+        ("configuration_id", "VARCHAR", True, None, False),
+        ("reserved_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+        ("estimated_tokens", "INTEGER", True, None, False),
+        ("observed_input_tokens", "INTEGER", False, None, False),
     ),
     "embedding_work_storage": (
         ("article_id", "VARCHAR", True, None, True),
@@ -297,6 +310,11 @@ _KEY_CONSTRAINTS = {
     ("runs", "PRIMARY KEY", ("run_id",)),
     ("full_run_articles", "PRIMARY KEY", ("run_id", "article_id")),
     (
+        "hosted_request_reservations",
+        "PRIMARY KEY",
+        ("reservation_id",),
+    ),
+    (
         "embedding_work_storage",
         "PRIMARY KEY",
         ("article_id", "modality", "configuration_id"),
@@ -391,6 +409,14 @@ _RUN_COUNT_COLUMNS = frozenset(
 
 class EmbeddingCatalogError(RuntimeError):
     """Raised when the embedding catalog cannot be safely published."""
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaReservationDecision:
+    """One atomic hosted-wave admission decision."""
+
+    reservation_ids: tuple[str, ...]
+    retry_after_seconds: float
 
 
 def _normalize_view_sql(sql: str) -> str:
@@ -768,6 +794,9 @@ class EmbeddingCatalog:
                     batch_max_attempts INTEGER NOT NULL,
                     batch_initial_backoff_seconds DOUBLE NOT NULL,
                     batch_max_backoff_seconds DOUBLE NOT NULL,
+                    quota_max_requests INTEGER NOT NULL,
+                    quota_max_estimated_tokens INTEGER NOT NULL,
+                    quota_window_seconds INTEGER NOT NULL,
                     image_input_rules VARCHAR NOT NULL,
                     image_transform VARCHAR NOT NULL,
                     multimodal_formula VARCHAR NOT NULL,
@@ -811,6 +840,18 @@ class EmbeddingCatalog:
                     article_id VARCHAR NOT NULL,
                     header_image_path VARCHAR,
                     PRIMARY KEY (run_id, article_id)
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hosted_request_reservations (
+                    reservation_id VARCHAR PRIMARY KEY,
+                    run_id VARCHAR NOT NULL,
+                    configuration_id VARCHAR NOT NULL,
+                    reserved_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    estimated_tokens INTEGER NOT NULL,
+                    observed_input_tokens INTEGER
                 )
                 """
             )
@@ -1206,11 +1247,13 @@ class EmbeddingCatalog:
                 batch_max_response_bytes,
                 batch_max_concurrency, batch_max_attempts,
                 batch_initial_backoff_seconds, batch_max_backoff_seconds,
+                quota_max_requests, quota_max_estimated_tokens,
+                quota_window_seconds,
                 image_input_rules, image_transform,
                 multimodal_formula, client_configuration_version
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (configuration_id) DO NOTHING
             """,
             [
@@ -1236,6 +1279,9 @@ class EmbeddingCatalog:
                 profile.batch_max_attempts,
                 profile.batch_initial_backoff_seconds,
                 profile.batch_max_backoff_seconds,
+                profile.quota_max_requests,
+                profile.quota_max_estimated_tokens,
+                profile.quota_window_seconds,
                 profile.image_input_rules,
                 profile.image_transform,
                 profile.multimodal_formula,
@@ -1256,6 +1302,172 @@ class EmbeddingCatalog:
             """,
             [run_id, configuration_identifier, scope, article_count],
         )
+
+    def reserve_hosted_requests(
+        self,
+        *,
+        run_id: str,
+        configuration_identifier: str,
+        estimated_tokens: Sequence[int],
+        reserved_at: datetime,
+        profile: EmbeddingProfile,
+    ) -> QuotaReservationDecision:
+        """Atomically reserve one bounded hosted wave or return its safe delay."""
+
+        costs = tuple(estimated_tokens)
+        if (
+            not costs
+            or len(costs) > profile.batch_max_concurrency
+            or any(
+                isinstance(cost, bool)
+                or not isinstance(cost, int)
+                or cost < 0
+                or cost > profile.batch_max_estimated_tokens
+                for cost in costs
+            )
+            or profile.quota_max_requests < 1
+            or profile.quota_max_estimated_tokens < 1
+            or profile.quota_window_seconds < 1
+            or profile.batch_max_concurrency < 1
+            or profile.batch_max_estimated_tokens < 1
+        ):
+            raise ValueError("hosted quota reservation is invalid")
+        if configuration_identifier != configuration_id(profile):
+            raise ValueError("hosted quota configuration does not match profile")
+        if reserved_at.tzinfo is None or reserved_at.utcoffset() is None:
+            raise ValueError("hosted quota timestamp must be timezone-aware")
+        run = self.connection.execute(
+            "SELECT configuration_id FROM runs WHERE run_id = ?",
+            [run_id],
+        ).fetchone()
+        if run != (configuration_identifier,):
+            raise ValueError("hosted quota run does not match configuration")
+
+        window_start = reserved_at - timedelta(
+            seconds=profile.quota_window_seconds
+        )
+        rows = self.connection.execute(
+            """
+            SELECT reservation_id, reserved_at,
+                   greatest(estimated_tokens,
+                            coalesce(observed_input_tokens, estimated_tokens))
+            FROM hosted_request_reservations
+            WHERE reserved_at > ? AND reserved_at <= ?
+            ORDER BY reserved_at, reservation_id
+            LIMIT ?
+            """,
+            [window_start, reserved_at, profile.quota_max_requests + 1],
+        ).fetchall()
+        if len(rows) > profile.quota_max_requests or any(
+            int(row[2]) < 0 for row in rows
+        ):
+            raise EmbeddingCatalogError("invalid hosted quota reservation state")
+
+        proposed_requests = len(costs)
+        proposed_tokens = sum(costs)
+        active_requests = len(rows)
+        active_tokens = sum(int(row[2]) for row in rows)
+        if (
+            proposed_requests > profile.quota_max_requests
+            or proposed_tokens > profile.quota_max_estimated_tokens
+        ):
+            raise ValueError("hosted wave exceeds quota policy")
+        if (
+            active_requests + proposed_requests <= profile.quota_max_requests
+            and active_tokens + proposed_tokens
+            <= profile.quota_max_estimated_tokens
+        ):
+            reservation_ids = tuple(uuid4().hex for _ in costs)
+            self.connection.executemany(
+                """
+                INSERT INTO hosted_request_reservations (
+                    reservation_id, run_id, configuration_id, reserved_at,
+                    estimated_tokens, observed_input_tokens
+                ) VALUES (?, ?, ?, ?, ?, NULL)
+                """,
+                [
+                    (
+                        reservation_id,
+                        run_id,
+                        configuration_identifier,
+                        reserved_at,
+                        cost,
+                    )
+                    for reservation_id, cost in zip(
+                        reservation_ids, costs, strict=True
+                    )
+                ],
+            )
+            return QuotaReservationDecision(reservation_ids, 0.0)
+
+        remaining_requests = active_requests
+        remaining_tokens = active_tokens
+        for _reservation_id, row_reserved_at, effective_tokens in rows:
+            remaining_requests -= 1
+            remaining_tokens -= int(effective_tokens)
+            if (
+                remaining_requests + proposed_requests
+                <= profile.quota_max_requests
+                and remaining_tokens + proposed_tokens
+                <= profile.quota_max_estimated_tokens
+            ):
+                retry_at = row_reserved_at + timedelta(
+                    seconds=profile.quota_window_seconds
+                )
+                return QuotaReservationDecision(
+                    (), max(0.0, (retry_at - reserved_at).total_seconds())
+                )
+        raise EmbeddingCatalogError("invalid hosted quota reservation state")
+
+    def reconcile_hosted_request_usage(
+        self,
+        *,
+        reservation_ids: Sequence[str],
+        observed_input_tokens: int,
+    ) -> None:
+        """Increase one wave's durable token debt from safe provider usage."""
+
+        identifiers = tuple(reservation_ids)
+        if (
+            not identifiers
+            or len(set(identifiers)) != len(identifiers)
+            or isinstance(observed_input_tokens, bool)
+            or not isinstance(observed_input_tokens, int)
+            or observed_input_tokens < 0
+            or observed_input_tokens > 1_000_000_000
+        ):
+            raise ValueError("hosted quota usage observation is invalid")
+        rows = self.connection.execute(
+            """
+            SELECT reservation_id, estimated_tokens, observed_input_tokens
+            FROM hosted_request_reservations
+            WHERE reservation_id IN (SELECT unnest(?))
+            ORDER BY reservation_id
+            """,
+            [list(identifiers)],
+        ).fetchall()
+        if len(rows) != len(identifiers):
+            raise ValueError("hosted quota reservation is missing")
+        # Provider usage is batch-wide. Assign any excess to the first stable
+        # reservation while retaining every request's original estimate.
+        estimated_total = sum(int(row[1]) for row in rows)
+        effective_total = max(estimated_total, observed_input_tokens)
+        excess = effective_total - estimated_total
+        first_identifier = min(identifiers)
+        for reservation_id, estimated, prior_observed in rows:
+            observed = int(estimated) + (
+                excess if reservation_id == first_identifier else 0
+            )
+            if prior_observed is not None:
+                observed = max(observed, int(prior_observed))
+            self.connection.execute(
+                """
+                UPDATE hosted_request_reservations
+                SET observed_input_tokens = ?
+                WHERE reservation_id = ?
+                """,
+                [observed, reservation_id],
+            )
 
     def register_work(
         self,
