@@ -29,6 +29,7 @@ from wsj_embeddings.image_rendition import (
     ImageCodec,
     ImageCodecError,
     PillowImageCodec,
+    scaled_image_dimensions,
 )
 from wsj_embeddings.models import (
     CanonicalArticle,
@@ -806,9 +807,9 @@ def _validate_image_input_provenance(
     rows = connection.execute(
         """
         SELECT article_id, generation_run_id, source_sha256, source_format,
-               source_bytes, source_width, source_height,
+               source_bytes, source_width, source_height, source_frames,
                embedded_input_sha256, embedded_format, embedded_bytes,
-               embedded_width, embedded_height, transform_id,
+               embedded_width, embedded_height, embedded_frames, transform_id,
                rendition_relative_path
         FROM image_input_provenance
         WHERE configuration_id = ?
@@ -825,11 +826,13 @@ def _validate_image_input_provenance(
             source_bytes,
             source_width,
             source_height,
+            source_frames,
             embedded_sha256,
             embedded_format,
             embedded_bytes,
             embedded_width,
             embedded_height,
+            embedded_frames,
             transform_id,
             rendition_relative_path,
         ) = row
@@ -854,8 +857,10 @@ def _validate_image_input_provenance(
             or embedded_bytes < 1
             or source_width < 1
             or source_height < 1
+            or source_frames != 1
             or embedded_width < 1
             or embedded_height < 1
+            or embedded_frames != 1
             or embedded_bytes > 5_000_000
             or embedded_width * embedded_height > 20_000_000
         ):
@@ -895,6 +900,7 @@ def _validate_image_input_provenance(
                     or decoded_source.format != source_format
                     or decoded_source.width != source_width
                     or decoded_source.height != source_height
+                    or decoded_source.frames != source_frames
                 ):
                     _append(
                         issues,
@@ -930,6 +936,25 @@ def _validate_image_input_provenance(
                 issues,
                 "invalid_image_input_provenance",
                 "derived image input does not declare the JPEG contract",
+            )
+        if (
+            source_bytes <= MAX_HOSTED_IMAGE_BYTES
+            and source_width * source_height <= MAX_HOSTED_IMAGE_PIXELS
+        ):
+            _append(
+                issues,
+                "invalid_image_input_provenance",
+                "within-limit supported source image was not passed through",
+            )
+        expected_width, expected_height = scaled_image_dimensions(
+            source_width,
+            source_height,
+        )
+        if (embedded_width, embedded_height) != (expected_width, expected_height):
+            _append(
+                issues,
+                "invalid_image_input_provenance",
+                "derived image dimensions differ from deterministic aspect scale",
             )
         transform_namespace = hashlib.sha256(str(transform_id).encode()).hexdigest()
         if transform_id != configured_transform:
@@ -995,6 +1020,7 @@ def _validate_image_input_provenance(
                     or decoded_embedded.format != "JPEG"
                     or decoded_embedded.width != embedded_width
                     or decoded_embedded.height != embedded_height
+                    or decoded_embedded.frames != embedded_frames
                     or decoded_embedded.pixels > MAX_HOSTED_IMAGE_PIXELS
                     or len(rendition) > MAX_HOSTED_IMAGE_BYTES
                 ):

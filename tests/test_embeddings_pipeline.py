@@ -150,11 +150,13 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("source_bytes", "BIGINT", True, None, False),
         ("source_width", "INTEGER", True, None, False),
         ("source_height", "INTEGER", True, None, False),
+        ("source_frames", "INTEGER", True, None, False),
         ("embedded_input_sha256", "VARCHAR", True, None, False),
         ("embedded_format", "VARCHAR", True, None, False),
         ("embedded_bytes", "BIGINT", True, None, False),
         ("embedded_width", "INTEGER", True, None, False),
         ("embedded_height", "INTEGER", True, None, False),
+        ("embedded_frames", "INTEGER", True, None, False),
         ("transform_id", "VARCHAR", True, None, False),
         ("rendition_relative_path", "VARCHAR", False, None, False),
         ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
@@ -1906,9 +1908,11 @@ def test_pipeline_publishes_all_three_modalities_with_source_provenance(tmp_path
         image_provenance = db.execute(
             """
             SELECT source_sha256, source_format, source_bytes,
-                   source_width, source_height, embedded_input_sha256,
+                   source_width, source_height, source_frames,
+                   embedded_input_sha256,
                    embedded_format, embedded_bytes, embedded_width,
-                   embedded_height, transform_id, rendition_relative_path
+                   embedded_height, embedded_frames, transform_id,
+                   rendition_relative_path
             FROM image_input_provenance
             """
         ).fetchone()
@@ -1933,11 +1937,13 @@ def test_pipeline_publishes_all_three_modalities_with_source_provenance(tmp_path
         len(image_bytes),
         640,
         360,
+        1,
         image_sha256,
         "PNG",
         len(image_bytes),
         640,
         360,
+        1,
         "exact-source-bytes-v1",
         None,
     )
@@ -2524,9 +2530,11 @@ def test_oversized_header_image_publishes_verified_versioned_rendition(tmp_path)
         assert db.execute(
             """
             SELECT source_sha256, source_format, source_bytes,
-                   source_width, source_height, embedded_input_sha256,
+                   source_width, source_height, source_frames,
+                   embedded_input_sha256,
                    embedded_format, embedded_bytes, embedded_width,
-                   embedded_height, transform_id, rendition_relative_path
+                   embedded_height, embedded_frames, transform_id,
+                   rendition_relative_path
             FROM image_input_provenance
             """
         ).fetchone() == (
@@ -2535,11 +2543,13 @@ def test_oversized_header_image_publishes_verified_versioned_rendition(tmp_path)
             len(source_bytes),
             6000,
             4000,
+            1,
             derived_sha256,
             "JPEG",
             len(derived_bytes),
             5477,
             3651,
+            1,
             codec.transform_id,
             expected_relative_path,
         )
@@ -2771,6 +2781,72 @@ def test_rendition_directory_entries_are_fsynced_before_nested_publication(
     ]
 
 
+def test_rendition_directory_reuse_fsyncs_verified_parents_before_state(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: replay trusts a prior mkdir whose parent was never durable."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated replay-fsync oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            ScenarioImageAdapter(),
+            limit=1,
+            image_codec=codec,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_image_rendition_install=lambda path: (_ for _ in ()).throw(
+                    SyntheticInterruption
+                )
+            ),
+        )
+    events: list[tuple[str, int]] = []
+    real_fsync = os.fsync
+    real_open = os.open
+
+    def observed_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            events.append(("fsync", os.fstat(descriptor).st_ino))
+        return real_fsync(descriptor)
+
+    def observed_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and path not in {"catalog.duckdb", "pipeline.lock"}:
+            events.append((f"open:{path}", os.fstat(dir_fd).st_ino))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(image_rendition_module.os, "fsync", observed_fsync)
+    monkeypatch.setattr(image_rendition_module.os, "open", observed_open)
+
+    result = run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+
+    output_inode = config.embedding_output_root.stat().st_ino
+    rendition_inode = (config.embedding_output_root / "renditions").stat().st_ino
+    transform_namespace = hashlib.sha256(codec.transform_id.encode()).hexdigest()
+    assert events.index(("fsync", output_inode)) < events.index(
+        (f"open:{transform_namespace}", rendition_inode)
+    )
+    assert events.index(("fsync", rendition_inode)) < next(
+        index
+        for index, event in enumerate(events)
+        if event[0].startswith("open:.")
+    )
+    assert result.embeddings == 3
+
+
 @pytest.mark.parametrize("replacement_kind", ("replacement", "hardlink", "symlink"))
 def test_rendition_final_leaf_replacement_is_refused_before_state_commit(
     tmp_path,
@@ -2834,6 +2910,58 @@ def test_rendition_final_leaf_replacement_is_refused_before_state_commit(
         assert db.execute("SELECT count(*) FROM embedding_work_items").fetchone() == (
             0,
         )
+
+
+@pytest.mark.parametrize("ancestor", ("renditions", "transform"))
+def test_rendition_ancestor_replacement_is_refused_before_state_commit(
+    tmp_path,
+    ancestor,
+):
+    """Break caught: held leaf succeeds after its namespace path was replaced."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated ancestor-race oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    namespace = hashlib.sha256(ScenarioImageCodec.transform_id.encode()).hexdigest()
+    rendition_path = config.embedding_output_root / "renditions"
+    transform_path = rendition_path / namespace
+
+    class AncestorReplacingCodec(ScenarioImageCodec):
+        def __init__(self):
+            super().__init__(
+                {
+                    source_bytes: ImageInfo("PNG", 6000, 4000),
+                    derived_bytes: ImageInfo("JPEG", 5477, 3651),
+                }
+            )
+            self.derived_inspections = 0
+
+        def inspect(self, data: bytes, *, max_decode_pixels: int) -> ImageInfo:
+            result = super().inspect(data, max_decode_pixels=max_decode_pixels)
+            if data == derived_bytes:
+                self.derived_inspections += 1
+                if self.derived_inspections == 3:
+                    target = (
+                        rendition_path
+                        if ancestor == "renditions"
+                        else transform_path
+                    )
+                    target.replace(target.with_name(f"{target.name}.replaced"))
+                    target.mkdir(parents=True)
+            return result
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(
+            config,
+            ScenarioImageAdapter(),
+            limit=1,
+            image_codec=AncestorReplacingCodec(),
+        )
+
+    assert raised.value.code == "unsafe_rendition_output"
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone() == (0,)
 
 
 def test_validator_requires_exact_image_provenance_and_rendition_bytes(tmp_path):
@@ -2964,6 +3092,117 @@ def test_validator_rejects_malformed_derived_image_contract(tmp_path, mutation):
     assert "invalid_image_input_provenance" in codes
 
 
+@pytest.mark.parametrize("frame_column", ("source_frames", "embedded_frames"))
+def test_validator_rejects_animated_image_provenance(tmp_path, frame_column):
+    """Break caught: an animated source or embedded input is declared static."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated animated-policy oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(f"UPDATE image_input_provenance SET {frame_column} = 2")
+
+    codes = {
+        issue.code
+        for issue in validate_embedding_outputs(config, image_codec=codec).issues
+    }
+
+    assert "invalid_image_input_provenance" in codes
+
+
+def test_validator_rejects_arbitrary_within_limit_rendition_dimensions(tmp_path):
+    """Break caught: a derived JPEG ignores the deterministic aspect scale."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated arbitrary-dimension oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5000, 4000),
+        }
+    )
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+
+    codes = {
+        issue.code
+        for issue in validate_embedding_outputs(config, image_codec=codec).issues
+    }
+
+    assert "invalid_image_input_provenance" in codes
+
+
+def test_validator_rejects_archived_within_limit_source_with_rendition(tmp_path):
+    """Break caught: archived derived provenance escapes pass-through policy."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    first_source = b"generated archived oversized png one"
+    second_source = b"generated archived oversized png two"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    relative_path = attach_generated_header_image(config, first_source)
+    codec = ScenarioImageCodec(
+        {
+            first_source: ImageInfo("PNG", 6000, 4000),
+            second_source: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    (config.source_root / relative_path).write_bytes(second_source)
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        archived_generation = db.execute(
+            """
+            SELECT generation_run_id FROM embedding_generation_history
+            WHERE modality = 'header_image'
+            """
+        ).fetchone()[0]
+        db.execute(
+            """
+            UPDATE image_input_provenance
+            SET source_bytes = 1000, source_width = 640, source_height = 360
+            WHERE generation_run_id = ?
+            """,
+            [archived_generation],
+        )
+
+    codes = {
+        issue.code
+        for issue in validate_embedding_outputs(config, image_codec=codec).issues
+    }
+
+    assert "invalid_image_input_provenance" in codes
+
+
 def test_validator_reports_image_provenance_with_unknown_configuration(tmp_path):
     """Break caught: unselected provenance can reference no known configuration."""
 
@@ -2976,9 +3215,11 @@ def test_validator_reports_image_provenance_with_unknown_configuration(tmp_path)
             INSERT INTO image_input_provenance
             SELECT article_id, repeat('f', 64), generation_run_id,
                    source_sha256, source_format, source_bytes,
-                   source_width, source_height, embedded_input_sha256,
+                   source_width, source_height, source_frames,
+                   embedded_input_sha256,
                    embedded_format, embedded_bytes, embedded_width,
-                   embedded_height, transform_id, rendition_relative_path,
+                   embedded_height, embedded_frames, transform_id,
+                   rendition_relative_path,
                    created_at
             FROM image_input_provenance
             """
@@ -4553,7 +4794,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_ten_image_rendition_schema(
+def test_embedding_catalog_has_exact_version_eleven_image_frame_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -4637,7 +4878,7 @@ def test_embedding_catalog_has_exact_version_ten_image_rendition_schema(
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "10")]
+    assert metadata == [("schema_version", "11")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -5008,6 +5249,35 @@ def test_pipeline_refuses_exact_version_nine_catalog_without_migration(tmp_path)
         assert "image_input_provenance" not in {
             row[0] for row in db.execute("SHOW TABLES").fetchall()
         }
+
+
+def test_pipeline_refuses_exact_version_ten_catalog_without_migration(tmp_path):
+    """Break caught: frame provenance is silently added to prior output."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("ALTER TABLE image_input_provenance DROP source_frames")
+        db.execute("ALTER TABLE image_input_provenance DROP embedded_frames")
+        db.execute("UPDATE metadata SET value = '10' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("10",)
+        assert {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info('image_input_provenance')"
+            ).fetchall()
+        }.isdisjoint({"source_frames", "embedded_frames"})
 
 
 def test_pipeline_refuses_malformed_current_schema_with_version_eight_label(

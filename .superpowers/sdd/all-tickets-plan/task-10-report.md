@@ -233,3 +233,57 @@ duplicate, zero failures, and validation true; `run --help` retained its three
 explicit roots, positive limit, bounded reprocess, and hosted authorization;
 diff whitespace, tracked generated artifacts, stale current schema claims, and
 relative operator-document links had no findings.
+
+## Review-fix round 2
+
+Directory-entry durability is now proven on every invocation, including replay
+after a crash that occurred between `mkdir` and the first parent fsync. Each
+descriptor-relative child is opened and identity-checked, then its parent is
+fsynced whether the child was created now or already existed. Replay cannot
+begin deeper publication or commit state before both namespace parents have
+crossed that durability boundary.
+
+Final publication now reanchors the complete namespace chain from the held
+embedding-output-root descriptor. It reopens `renditions`, compares its held and
+reopened directory device/inode, reopens the transform namespace and compares
+again, then performs the full regular/single-link/stable-read/path-inode leaf
+verification through that reanchored chain. Rename-and-replace races at either
+ancestor level fail `unsafe_rendition_output` before run or work state.
+
+Image provenance now records source and embedded frame counts, so the complete
+policy remains independently checkable for archived generations whose source
+bytes are intentionally not retained. Validation requires static source and
+embedded inputs; supported within-limit sources must be exact pass-through;
+derived input is permitted only when source bytes or pixels exceed the hosted
+threshold; derived format is JPEG; and derived dimensions must exactly equal
+the deterministic aspect scale. Coordinator and validator use the same pure
+`scaled_image_dimensions` helper. Hash, byte, limit, transform, and path checks
+remain mandatory. This physical shape change bumps schema 10 to 11 and adds an
+exact prior-v10 refusal fixture without migration.
+
+Review-fix round-2 RED/GREEN evidence:
+
+- replay parent-fsync and `renditions`/transform ancestor replacement races:
+  `3 failed, 151 deselected in 14.67s`, then
+  `3 passed, 151 deselected in 7.87s`;
+- exact schema v11 frame provenance first failed on the absent columns, then
+  passed `1 passed, 153 deselected in 0.87s`;
+- animated source/embedded, arbitrary rendition dimensions, and archived
+  within-limit-derived policy: `4 failed, 154 deselected in 19.75s`, then
+  `4 passed, 154 deselected in 18.49s`;
+- schema v11/prior-v10 plus established pass-through/rendition/global-reference
+  wiring: `5 passed, 154 deselected in 13.60s`.
+
+Round-2 self-review verified fsync happens after safe child identity resolution,
+the complete reanchor runs before descriptors close and before `begin_run`, and
+ancestor races cannot be hidden by a still-valid held descriptor. Frame counts
+are content-free and necessary for archived policy audit. The threshold and
+dimension decision uses stored source facts for every generation, while current
+generations additionally decode source and embedded bytes with the exact codec.
+
+Final round-2 affected verification passed
+`22 passed, 137 deselected in 68.88s`. Changed-file Ruff, embedding smoke,
+preprocessing smoke, live `run --help`, diff whitespace, tracked generated
+artifacts, stale current-schema claims, and both operator-document relative-link
+sets were clean. No full suite, shared dependency change, network, credential,
+licensed archive, or corpus operation was used.

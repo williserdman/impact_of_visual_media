@@ -493,6 +493,7 @@ def run_embedding_pipeline(
                             source_bytes=len(prepared_image.data),
                             source_width=image_input.source_info.width,
                             source_height=image_input.source_info.height,
+                            source_frames=image_input.source_info.frames,
                             embedded_input_sha256=(
                                 image_input.embedded_input_sha256
                             ),
@@ -500,6 +501,7 @@ def run_embedding_pipeline(
                             embedded_bytes=len(image_input.data),
                             embedded_width=image_input.embedded_info.width,
                             embedded_height=image_input.embedded_info.height,
+                            embedded_frames=image_input.embedded_info.frames,
                             transform_id=image_input.transform_id,
                             rendition_relative_path=(
                                 image_input.rendition_relative_path

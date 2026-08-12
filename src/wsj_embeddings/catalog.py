@@ -24,7 +24,7 @@ from wsj_embeddings.models import (
     WorkState,
 )
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "10"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "11"
 
 _EMBEDDING_CATALOG_TABLES = {
     "article_text_aggregation_provenance",
@@ -138,11 +138,13 @@ _TABLE_COLUMNS = {
         ("source_bytes", "BIGINT", True, None, False),
         ("source_width", "INTEGER", True, None, False),
         ("source_height", "INTEGER", True, None, False),
+        ("source_frames", "INTEGER", True, None, False),
         ("embedded_input_sha256", "VARCHAR", True, None, False),
         ("embedded_format", "VARCHAR", True, None, False),
         ("embedded_bytes", "BIGINT", True, None, False),
         ("embedded_width", "INTEGER", True, None, False),
         ("embedded_height", "INTEGER", True, None, False),
+        ("embedded_frames", "INTEGER", True, None, False),
         ("transform_id", "VARCHAR", True, None, False),
         ("rendition_relative_path", "VARCHAR", False, None, False),
         ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
@@ -767,11 +769,13 @@ class EmbeddingCatalog:
                     source_bytes BIGINT NOT NULL,
                     source_width INTEGER NOT NULL,
                     source_height INTEGER NOT NULL,
+                    source_frames INTEGER NOT NULL,
                     embedded_input_sha256 VARCHAR NOT NULL,
                     embedded_format VARCHAR NOT NULL,
                     embedded_bytes BIGINT NOT NULL,
                     embedded_width INTEGER NOT NULL,
                     embedded_height INTEGER NOT NULL,
+                    embedded_frames INTEGER NOT NULL,
                     transform_id VARCHAR NOT NULL,
                     rendition_relative_path VARCHAR,
                     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -2151,11 +2155,13 @@ class EmbeddingCatalog:
         source_bytes: int,
         source_width: int,
         source_height: int,
+        source_frames: int,
         embedded_input_sha256: str,
         embedded_format: str,
         embedded_bytes: int,
         embedded_width: int,
         embedded_height: int,
+        embedded_frames: int,
         transform_id: str,
         rendition_relative_path: str | None,
         stored_vector_sha256: str,
@@ -2179,7 +2185,7 @@ class EmbeddingCatalog:
         self.connection.execute(
             """
             INSERT INTO image_input_provenance
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     current_timestamp)
             """,
             [
@@ -2191,11 +2197,13 @@ class EmbeddingCatalog:
                 source_bytes,
                 source_width,
                 source_height,
+                source_frames,
                 embedded_input_sha256,
                 embedded_format,
                 embedded_bytes,
                 embedded_width,
                 embedded_height,
+                embedded_frames,
                 transform_id,
                 rendition_relative_path,
             ],

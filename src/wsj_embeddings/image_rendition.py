@@ -265,7 +265,7 @@ def prepare_image_input(
             embedded_info=source_info,
             transform_id=SOURCE_BYTES_TRANSFORM_ID,
         )
-    width, height = _scaled_dimensions(source_info)
+    width, height = scaled_image_dimensions(source_info.width, source_info.height)
     derived = codec.render_jpeg(source_data, width=width, height=height)
     derived_info = _validated_info(
         codec.inspect(derived, max_decode_pixels=MAX_SAFE_DECODE_PIXELS)
@@ -304,12 +304,16 @@ def _validated_info(info: ImageInfo) -> ImageInfo:
     return ImageInfo(image_format, info.width, info.height, info.frames)
 
 
-def _scaled_dimensions(info: ImageInfo) -> tuple[int, int]:
-    if info.pixels <= MAX_HOSTED_IMAGE_PIXELS:
-        return info.width, info.height
-    scale = math.sqrt(MAX_HOSTED_IMAGE_PIXELS / info.pixels)
-    width = max(1, int(info.width * scale))
-    height = max(1, int(info.height * scale))
+def scaled_image_dimensions(width: int, height: int) -> tuple[int, int]:
+    """Return the exact deterministic aspect scale for the hosted pixel ceiling."""
+
+    if width < 1 or height < 1:
+        raise ImageCodecError("corrupt_image")
+    if width * height <= MAX_HOSTED_IMAGE_PIXELS:
+        return width, height
+    scale = math.sqrt(MAX_HOSTED_IMAGE_PIXELS / (width * height))
+    width = max(1, int(width * scale))
+    height = max(1, int(height * scale))
     while width * height > MAX_HOSTED_IMAGE_PIXELS:
         if width >= height:
             width -= 1
@@ -405,6 +409,16 @@ def install_image_rendition(
             info,
             codec,
         )
+        _verify_rendition_chain(
+            output_descriptor,
+            rendition_descriptor,
+            transform_descriptor,
+            transform_namespace,
+            final_name,
+            data,
+            info,
+            codec,
+        )
     finally:
         if transform_descriptor is not None:
             with suppress(FileNotFoundError):
@@ -418,18 +432,13 @@ def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
     if not name or name in {".", ".."} or os.path.basename(name) != name:
         raise ImageCodecError("unsafe_rendition_output")
     descriptor: int | None = None
-    created = False
     try:
-        try:
+        with suppress(FileExistsError):
             os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
-            created = True
-        except FileExistsError:
-            pass
         descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_descriptor)
         descriptor_stat = os.fstat(descriptor)
         path_stat = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if created:
-            os.fsync(parent_descriptor)
+        os.fsync(parent_descriptor)
     except OSError as error:
         if descriptor is not None:
             os.close(descriptor)
@@ -443,6 +452,66 @@ def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
         os.close(descriptor)
         raise ImageCodecError("unsafe_rendition_output")
     return descriptor
+
+
+def _verify_rendition_chain(
+    output_descriptor: int,
+    held_rendition_descriptor: int,
+    held_transform_descriptor: int,
+    transform_namespace: str,
+    final_name: str,
+    expected_data: bytes,
+    expected_info: ImageInfo,
+    codec: ImageCodec,
+) -> None:
+    """Re-anchor both namespace directories and final leaf from output root."""
+
+    rendition_descriptor: int | None = None
+    transform_descriptor: int | None = None
+    try:
+        rendition_descriptor = os.open(
+            "renditions",
+            _DIRECTORY_FLAGS,
+            dir_fd=output_descriptor,
+        )
+        _require_same_directory(
+            held_rendition_descriptor,
+            rendition_descriptor,
+        )
+        transform_descriptor = os.open(
+            transform_namespace,
+            _DIRECTORY_FLAGS,
+            dir_fd=rendition_descriptor,
+        )
+        _require_same_directory(
+            held_transform_descriptor,
+            transform_descriptor,
+        )
+        _verify_rendition_leaf(
+            transform_descriptor,
+            final_name,
+            expected_data,
+            expected_info,
+            codec,
+        )
+    except OSError as error:
+        raise ImageCodecError("unsafe_rendition_output") from error
+    finally:
+        if transform_descriptor is not None:
+            os.close(transform_descriptor)
+        if rendition_descriptor is not None:
+            os.close(rendition_descriptor)
+
+
+def _require_same_directory(left_descriptor: int, right_descriptor: int) -> None:
+    left = os.fstat(left_descriptor)
+    right = os.fstat(right_descriptor)
+    if (
+        not stat.S_ISDIR(left.st_mode)
+        or not stat.S_ISDIR(right.st_mode)
+        or (left.st_dev, left.st_ino) != (right.st_dev, right.st_ino)
+    ):
+        raise ImageCodecError("unsafe_rendition_output")
 
 
 def _verify_rendition_leaf(
