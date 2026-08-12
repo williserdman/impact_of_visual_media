@@ -669,10 +669,13 @@ rendition namespace without following symlinks, reporting unsafe entries and
 unreferenced final or temporary files without deleting them.
 It opens the embedding catalog first, then preprocessing, begins a read
 transaction before either catalog's first schema query, and holds both through
-all checks. The resulting pair existed when preprocessing was acquired, but is
-not an atomic cross-database or filesystem snapshot. Content-free start/end
-tokens cover every referenced canonical Markdown/current header/rendition and
-the entire no-follow rendition namespace; an observed change produces
+all checks. These are independently stable read snapshots acquired in that
+order; because the catalogs have separate writers, the pinned versions need not
+ever have been simultaneously current. Validation reports
+cross-catalog relational inconsistencies, but it is not an atomic cross-catalog
+or filesystem snapshot. Content-free start/end tokens cover every referenced
+canonical Markdown/current header/rendition and the entire no-follow rendition
+namespace; an observed in-pass filesystem change produces
 `concurrent_validation_state_change` and a failed result.
 It also checks bounded long-text lifecycle/vector state and resolves complete
 active and archived aggregate provenance to immutable part generations. It

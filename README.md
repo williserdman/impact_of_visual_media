@@ -245,12 +245,14 @@ downloads anything.
 
 Validation opens the embedding catalog first and then the preprocessing
 catalog, begins a read transaction before each catalog's first schema query,
-and holds both through the complete pass. This provides one stable catalog
-pair that existed when the second handle was acquired; it is not described as
-an atomic cross-database or filesystem snapshot. Generated files cannot be
-locked by those transactions, so validation records content-free start/end
-tokens for every canonical Markdown/current header, every referenced
-rendition, and the complete no-follow rendition namespace. A detected change
+and holds both through the complete pass. These are independently stable read
+snapshots acquired in that order. Because the catalogs have separate writers,
+their pinned versions need not ever have been simultaneously current.
+Validation reports cross-catalog relational inconsistencies, but it is not an
+atomic cross-catalog or filesystem snapshot. Generated files cannot be locked
+by those transactions, so validation records content-free start/end tokens for
+every canonical Markdown/current header, every referenced rendition, and the
+complete no-follow rendition namespace. A detected in-pass filesystem change
 reports `concurrent_validation_state_change` and makes validation unsuccessful.
 
 Then inventory the configured archive without changing either source or

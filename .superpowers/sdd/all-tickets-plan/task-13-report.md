@@ -120,12 +120,15 @@ reconciliation compatibility (`3 passed in 8.63s`).
 Catalog validation now opens embedding first, begins its read transaction
 before exact schema validation, opens preprocessing second, begins its read
 transaction before exact schema validation or article queries, and retains
-both until the complete validation and coverage pass ends. This is a stable
-catalog pair that existed at second-handle acquisition, not an atomic
-cross-database snapshot. Filesystem state is not claimed atomic: content-free
-start/end tokens cover all canonical Markdown/current headers, all referenced
-renditions, and every no-follow rendition namespace/leaf identity and regular
-file hash. Changes produce `concurrent_validation_state_change`.
+both until the complete validation and coverage pass ends. These are
+independently stable snapshots acquired in that order. Separate writers mean
+their pinned versions need not ever have been simultaneously current;
+cross-catalog relational inconsistencies are reported, but validation is not
+an atomic cross-catalog snapshot. Filesystem state is also not claimed atomic:
+content-free start/end tokens cover all canonical Markdown/current headers, all
+referenced renditions, and every no-follow rendition namespace/leaf identity
+and regular file hash. In-pass changes produce
+`concurrent_validation_state_change`.
 
 The public failpoint fixture first failed because the snapshot callback was not
 invoked (`1 failed in 8.68s`), then passed (`1 passed in 2.76s`) while proving a
@@ -155,3 +158,21 @@ validate roots/configuration selector, and both generated smokes returned
 failures are unchanged and were not broadly rerun: this correction does not
 touch the hosted image-codec path, and ticket 15 still owns verification in its
 clean temporary environment. No whole module or full suite is claimed green.
+
+## Review correction round 2
+
+Documentation and current validator docstrings no longer describe the two
+independently pinned catalog states as a pair that necessarily existed at one
+instant. The embedding snapshot is acquired first and preprocessing second;
+because the catalogs have separate writers, the pinned versions need not ever
+have been simultaneously current. Validation reports relational inconsistencies
+across the pinned states but does not provide an atomic cross-catalog snapshot.
+The filesystem guarantee remains start/end detection of in-pass changes across
+referenced artifacts and the complete no-follow rendition namespace.
+
+The tracked-Markdown/current-docstring stale-language search found no remaining
+claim of jointly current catalog state at acquisition or one shared read-only
+catalog snapshot. README and crash-course relative links resolved, Ruff passed
+for the docstring-only Python edit, and `git diff --check` was clean. No
+behavioral test was run because this round changes wording only and the
+repository has no focused documentation wording assertion.

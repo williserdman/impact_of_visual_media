@@ -118,7 +118,7 @@ class EmbeddingCorpusValidationResult:
 
 @dataclass(frozen=True, slots=True)
 class EmbeddingValidationFailpoints:
-    """Generated-fixture seams around the stable validation snapshot."""
+    """Generated-fixture seam while independent catalog snapshots are held."""
 
     after_state_snapshot: Callable[[], None] | None = None
 
@@ -176,7 +176,7 @@ def _validate_embedding_state(
     str | None,
     EmbeddingCoverage | None,
 ]:
-    """Validate and optionally account within one read-only catalog snapshot."""
+    """Validate against independently stable read-only catalog snapshots."""
 
     config.validate()
     issues: list[EmbeddingValidationIssue] = []
@@ -265,7 +265,7 @@ def _validate_stable_state(
     include_coverage: bool,
     issues: list[EmbeddingValidationIssue],
 ) -> tuple[str | None, EmbeddingCoverage | None]:
-    """Validate one stable catalog pair and its observed generated artifacts."""
+    """Validate pinned catalog states and their observed generated artifacts."""
 
     _validate_configurations(embedding, issues)
     _validate_run_metrics(embedding, issues)
