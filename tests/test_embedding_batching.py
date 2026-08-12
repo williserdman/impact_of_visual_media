@@ -7,6 +7,7 @@ from collections import deque
 
 import pytest
 
+import wsj_embeddings.batching as batching_module
 from wsj_embeddings.adapters import (
     JinaBatchItemOutcome,
     JinaEmbeddedVector,
@@ -37,6 +38,8 @@ def _response(
                 None if index in retryable_indexes else _vector(index),
                 "missing_response_item" if index in retryable_indexes else None,
                 retryable=index in retryable_indexes,
+                status_code=200 if index in retryable_indexes else None,
+                retry_after_seconds=(headers or {}).get("retry-after"),
             )
             for index in range(count)
         ),
@@ -233,6 +236,144 @@ def test_scheduler_waits_for_rate_reset_before_deferred_work():
     assert sleeps == [3.0]
     assert result.throttles == 1
     assert result.retries == 0
+
+
+def test_scheduler_emits_each_wave_outcome_before_later_fatal_request():
+    """Break caught: an earlier success remains volatile until all waves finish."""
+
+    adapter = ScenarioBatchAdapter(
+        [
+            _response(1),
+            JinaHostedAdapterError(
+                "authentication", retryable=False, status_code=401
+            ),
+        ]
+    )
+    committed: list[tuple[int, int, bool]] = []
+
+    with pytest.raises(JinaHostedAdapterError, match="authentication"):
+        execute_rate_aware_batches(
+            adapter,
+            (JinaEmbeddingInput.text("first"), JinaEmbeddingInput.text("second")),
+            policy=BatchPolicy(1, 10, 10, 1, 2, 1.0, 8.0),
+            on_outcome=lambda index, attempt, outcome, final: committed.append(
+                (index, attempt, outcome.vector is not None and final)
+            ),
+            jitter=lambda _attempt: 0.0,
+        )
+
+    assert committed == [(0, 1, True)]
+
+
+def test_scheduler_uses_durable_prior_attempt_count_as_total_budget():
+    """Break caught: replay starts at attempt one and purchases past the durable cap."""
+
+    adapter = ScenarioBatchAdapter(
+        [JinaHostedAdapterError("timeout", retryable=True, status_code=504)]
+    )
+    observed: list[tuple[int, int, str | None, bool]] = []
+
+    result = execute_rate_aware_batches(
+        adapter,
+        (JinaEmbeddingInput.text("entering attempt two"),),
+        policy=BatchPolicy(1, 100, 100, 1, 2, 1.0, 8.0),
+        prior_attempt_counts=(1,),
+        on_outcome=lambda index, attempt, outcome, final: observed.append(
+            (index, attempt, outcome.error_code, final)
+        ),
+        sleep=lambda _seconds: None,
+        jitter=lambda _attempt: 0.0,
+    )
+
+    assert len(adapter.calls) == 1
+    assert result.retries == 0
+    assert observed == [(0, 2, "timeout", True)]
+
+
+def test_scheduler_caps_jittered_retry_and_rate_reset_delays():
+    """Break caught: jitter or a usable rate header pushes sleep past policy max."""
+
+    sleeps: list[float] = []
+    adapter = ScenarioBatchAdapter(
+        [
+            JinaHostedAdapterError(
+                "rate_limit",
+                retryable=True,
+                status_code=429,
+                retry_after_seconds=100.0,
+            ),
+            _response(
+                1,
+                headers={
+                    "x-ratelimit-remaining-requests": 0.0,
+                    "x-ratelimit-reset-requests": 200.0,
+                },
+            ),
+            _response(1),
+        ]
+    )
+
+    execute_rate_aware_batches(
+        adapter,
+        (JinaEmbeddingInput.text("retry"), JinaEmbeddingInput.text("deferred")),
+        policy=BatchPolicy(1, 100, 100, 1, 2, 1.0, 3.0),
+        sleep=sleeps.append,
+        jitter=lambda _attempt: 50.0,
+    )
+
+    assert sleeps == [3.0, 3.0]
+
+
+def test_scheduler_default_retry_jitter_is_real_and_bounded(monkeypatch):
+    """Break caught: production retries synchronize because default jitter is zero."""
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        batching_module._SYSTEM_RANDOM, "uniform", lambda _low, _high: 0.4
+    )
+    adapter = ScenarioBatchAdapter(
+        [JinaHostedAdapterError("timeout", retryable=True), _response(1)]
+    )
+
+    execute_rate_aware_batches(
+        adapter,
+        (JinaEmbeddingInput.text("default jitter"),),
+        policy=BatchPolicy(1, 100, 100, 1, 2, 1.0, 3.0),
+        sleep=sleeps.append,
+    )
+
+    assert sleeps == [1.4]
+
+
+def test_scheduler_honors_item_retry_after_metadata_without_numeric_header():
+    """Break caught: parsed HTTP-date delay is lost between adapter and scheduler."""
+
+    sleeps: list[float] = []
+    retryable = JinaEmbeddingBatchResponse(
+        items=(
+            JinaBatchItemOutcome(
+                0,
+                None,
+                "missing_response_item",
+                retryable=True,
+                status_code=200,
+                retry_after_seconds=5.0,
+            ),
+        ),
+        usage={},
+        response_metadata=JinaResponseMetadata(200, "jina-embeddings-v4", {}),
+    )
+    adapter = ScenarioBatchAdapter([retryable, _response(1)])
+
+    execute_rate_aware_batches(
+        adapter,
+        (JinaEmbeddingInput.text("item retry"),),
+        policy=BatchPolicy(1, 100, 100, 1, 2, 1.0, 8.0),
+        sleep=sleeps.append,
+        jitter=lambda _attempt: 0.0,
+    )
+
+    assert sleeps == [5.0]
 
 
 @pytest.mark.parametrize("code", ("authentication", "authorization"))

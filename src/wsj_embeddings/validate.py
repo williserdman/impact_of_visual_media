@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import stat
@@ -47,6 +48,7 @@ from wsj_embeddings.pipeline import (
     _vector_hash,
     _verified_source_vector,
 )
+from wsj_embeddings.run_metrics import safe_usage_is_valid
 from wsj_embeddings.source_image import (
     SourceImageError,
     is_safe_source_relative_path,
@@ -91,6 +93,7 @@ def validate_embedding_outputs(
             articles = _canonical_articles(config, issues)
             if articles is not None:
                 _validate_configurations(catalog.connection, issues)
+                _validate_run_metrics(catalog.connection, issues)
                 _validate_global_image_provenance_references(
                     catalog.connection,
                     issues,
@@ -272,6 +275,36 @@ def _validate_configurations(
         )
 
 
+def _validate_run_metrics(
+    connection: duckdb.DuckDBPyConnection,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    invalid = False
+    rows = connection.execute(
+        """
+        SELECT hosted_requests, hosted_retries, usage_json, throttles,
+               elapsed_seconds
+        FROM runs
+        """
+    ).fetchall()
+    for hosted_requests, hosted_retries, usage_json, throttles, elapsed in rows:
+        if any(value < 0 for value in (hosted_requests, hosted_retries, throttles)):
+            invalid = True
+        if not math.isfinite(float(elapsed)) or elapsed < 0:
+            invalid = True
+        try:
+            usage = json.loads(usage_json)
+        except (TypeError, json.JSONDecodeError):
+            invalid = True
+            continue
+        if not safe_usage_is_valid(usage):
+            invalid = True
+    if invalid:
+        _append(
+            issues,
+            "invalid_run_metrics",
+            "embedding run observations are not finite content-free metrics",
+        )
 def _select_configuration_id(
     connection: duckdb.DuckDBPyConnection,
     requested: str | None,

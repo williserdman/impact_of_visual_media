@@ -719,12 +719,16 @@ orphan cleanup, and full-only missing-source reconciliation.
 - Hosted v4 work is greedily packed across text, image, and long-part items
   under independent item, estimated-token, and total encoded-byte ceilings.
   At most the profile's configured request concurrency is active. Indexed
-  results are validated and committed one item at a time. Retryable request or
-  item failures use bounded exponential backoff plus injected jitter; usable
-  `Retry-After` and rate-reset headers can lengthen the delay. A throttle halves
+  results are validated and committed one item at a time on the coordinator as
+  each wave response is processed, before later retry sleeps or waves. Durable
+  prior attempts reduce each item's remaining budget. Retryable request or item
+  failures use bounded exponential backoff plus production jitter (injectable
+  for tests); usable numeric/RFC-date `Retry-After` and rate-reset headers can
+  lengthen the delay only to the configured maximum. A throttle halves
   subsequent concurrency, while authentication, authorization, and invalid
-  request configuration stop the run. Run state stores only aggregate usage,
-  request/retry/throttle counts, and elapsed seconds.
+  request configuration stop the run. Run state stores only allowlisted finite
+  nonnegative numeric usage, request/retry/throttle counts, and elapsed seconds
+  covering preparation through final aggregation and metric publication.
 - Local header images are opened read-only without following symlinks and
   hashed. Eligible images are base64-encoded from those same bytes; oversized
   safe images use the verified deterministic rendition below the embedding

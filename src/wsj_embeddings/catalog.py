@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import stat
 from collections import Counter
@@ -23,6 +24,7 @@ from wsj_embeddings.models import (
     SupersessionReason,
     WorkState,
 )
+from wsj_embeddings.run_metrics import normalize_safe_usage
 
 EMBEDDING_CATALOG_SCHEMA_VERSION = "12"
 
@@ -1997,6 +1999,7 @@ class EmbeddingCatalog:
         error_code: str,
         status_code: int | None,
         retry_after_seconds: float | None,
+        count_run: bool = True,
     ) -> None:
         """Commit one content-free retryable or terminal checkpoint."""
 
@@ -2022,7 +2025,8 @@ class EmbeddingCatalog:
                 configuration_identifier,
             ],
         )
-        self.increment_run(run_id, state.value)
+        if count_run:
+            self.increment_run(run_id, state.value)
 
     def attempt_count(
         self,
@@ -2403,7 +2407,22 @@ class EmbeddingCatalog:
     ) -> None:
         """Persist safe aggregate hosted observations for one returned summary."""
 
-        usage_json = json.dumps(usage, sort_keys=True, separators=(",", ":"))
+        counters = (hosted_requests, hosted_retries, throttles)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in counters
+        ):
+            raise ValueError("hosted run counters must be nonnegative integers")
+        if (
+            isinstance(elapsed_seconds, bool)
+            or not isinstance(elapsed_seconds, (int, float))
+            or not math.isfinite(float(elapsed_seconds))
+            or elapsed_seconds < 0
+        ):
+            raise ValueError("hosted run elapsed time must be finite and nonnegative")
+        usage_json = json.dumps(
+            normalize_safe_usage(usage), sort_keys=True, separators=(",", ":")
+        )
         self.connection.execute(
             """
             UPDATE runs

@@ -892,6 +892,36 @@ def test_rate_aware_coordinator_batches_mixed_items_and_summarizes_hosted_usage(
         ]
 
 
+def test_catalog_boundary_drops_hostile_or_nonnumeric_usage(tmp_path):
+    """Break caught: a fake adapter can persist response content through usage JSON."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class HostileUsageAdapter(RecordingBatchAdapter):
+        def embed_batch(self, inputs, *, limits):
+            response = super().embed_batch(inputs, limits=limits)
+            return JinaEmbeddingBatchResponse(
+                response.items,
+                {
+                    "prompt_tokens": "private article text",
+                    "total_tokens": 2.5,
+                    "input_tokens": -1,
+                    "output_tokens": float("inf"),
+                    "private_content": {"body": "secret"},
+                },
+                response.response_metadata,
+            )
+
+    result = run_embedding_pipeline(config, HostileUsageAdapter(), limit=1)
+
+    assert result.usage == {"total_tokens": 2.5}
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        stored = db.execute("SELECT usage_json FROM runs").fetchone()[0]
+    assert stored == '{"total_tokens":2.5}'
+    assert "private" not in stored
+    assert "secret" not in stored
+
+
 def test_partial_batch_success_commits_independently_and_resumes_only_failure(
     tmp_path,
 ):
@@ -903,22 +933,35 @@ def test_partial_batch_success_commits_independently_and_resumes_only_failure(
         article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
         markdown="# Second generated article\n",
     )
-    first_adapter = RecordingBatchAdapter([{1: "missing_response_item"}])
+    class ResumableBatchAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_attempts=2,
+            client_configuration_version="synthetic-partial-resume-v2",
+        )
 
-    first = run_embedding_pipeline(
-        config,
-        first_adapter,
-        limit=2,
-        batch_sleep=lambda _seconds: None,
-        batch_jitter=lambda _attempt: 0.0,
-        monotonic=iter((1.0, 2.0)).__next__,
-    )
+    first_adapter = ResumableBatchAdapter([{1: "missing_response_item"}])
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            first_adapter,
+            limit=2,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_batched_item_outcome_commit=(
+                    lambda index, final: (
+                        (_ for _ in ()).throw(SyntheticInterruption())
+                        if index == 1 and not final
+                        else None
+                    )
+                )
+            ),
+            batch_sleep=lambda _seconds: None,
+            batch_jitter=lambda _attempt: 0.0,
+            monotonic=iter((1.0, 2.0)).__next__,
+        )
 
     assert [len(call) for call in first_adapter.calls] == [2]
-    assert first.embeddings == 1
-    assert first.succeeded == 1
-    assert first.retryable == 1
-    assert first.retries == 0
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
             """
@@ -930,7 +973,7 @@ def test_partial_batch_success_commits_independently_and_resumes_only_failure(
             ("wsj:ZZZ-SYNTHETIC-EMBEDDING", "retryable"),
         ]
 
-    resumed_adapter = RecordingBatchAdapter()
+    resumed_adapter = ResumableBatchAdapter()
     resumed = run_embedding_pipeline(
         config,
         resumed_adapter,
@@ -950,6 +993,125 @@ def test_partial_batch_success_commits_independently_and_resumes_only_failure(
         assert db.execute(
             "SELECT count(*) FROM embeddings WHERE modality = 'article_text'"
         ).fetchone() == (2,)
+
+
+def test_wave_success_is_durable_before_later_fatal_and_replay_skips_purchase(
+    tmp_path,
+):
+    """Break caught: a later fatal response loses an earlier wave's valid success."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+
+    class OneItemBatchAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_attempts=2,
+            client_configuration_version="synthetic-wave-durability-v1",
+        )
+
+    adapter = OneItemBatchAdapter(
+        [
+            {},
+            JinaHostedAdapterError(
+                "authentication", retryable=False, status_code=401
+            ),
+        ]
+    )
+    checkpoints: list[int] = []
+
+    with pytest.raises(JinaHostedAdapterError, match="authentication"):
+        run_embedding_pipeline(
+            config,
+            adapter,
+            limit=2,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_batched_item_outcome_commit=lambda index, _final: (
+                    checkpoints.append(index)
+                )
+            ),
+        )
+
+    assert checkpoints == [0]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT article_id, state FROM embedding_work_items
+            WHERE modality = 'article_text' ORDER BY article_id
+            """
+        ).fetchall() == [
+            ("wsj:SYNTHETIC-EMBEDDING", "succeeded"),
+            ("wsj:ZZZ-SYNTHETIC-EMBEDDING", "in_progress"),
+        ]
+
+    replay = OneItemBatchAdapter()
+    run_embedding_pipeline(config, replay, limit=2)
+    assert [[item.value for item in call] for call in replay.calls] == [
+        ["# Second generated article\n"]
+    ]
+
+
+def test_batched_replay_enters_attempt_two_and_terminalizes_at_durable_ceiling(
+    tmp_path,
+):
+    """Break caught: replay purchases two new calls after attempt one was committed."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class TwoAttemptAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_attempts=2,
+            client_configuration_version="synthetic-durable-attempts-v1",
+        )
+
+    failure = JinaHostedAdapterError(
+        "rate_limit",
+        retryable=True,
+        status_code=429,
+        retry_after_seconds=2.5,
+    )
+
+    def interrupt_after_failure(_index: int, final: bool) -> None:
+        if not final:
+            raise SyntheticInterruption
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            TwoAttemptAdapter([failure]),
+            limit=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_batched_item_outcome_commit=interrupt_after_failure
+            ),
+            batch_sleep=lambda _seconds: None,
+            batch_jitter=lambda _attempt: 0.0,
+        )
+
+    replay = TwoAttemptAdapter([failure])
+    result = run_embedding_pipeline(
+        config,
+        replay,
+        limit=1,
+        batch_sleep=lambda _seconds: None,
+        batch_jitter=lambda _attempt: 0.0,
+    )
+
+    assert len(replay.calls) == 1
+    assert result.terminal == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code, status_code,
+                   retry_after_seconds
+            FROM embedding_work_items WHERE modality = 'article_text'
+            """
+        ).fetchone() == ("terminal", 2, "rate_limit", 429, 2.5)
 
 
 def test_malformed_mixed_item_does_not_erase_valid_sibling(tmp_path):
@@ -990,23 +1152,36 @@ def test_batched_long_part_resume_keeps_sibling_parts_and_header_success(tmp_pat
         config, "AAAA\n\nBBBB\n\nCCCC"
     )
     attach_generated_header_image(config, b"generated batched long image")
-    first_adapter = LongTextRecordingBatchAdapter(
-        [{1: "missing_response_item"}]
-    )
+    class ResumableLongBatchAdapter(LongTextRecordingBatchAdapter):
+        profile = replace(
+            LongTextRecordingBatchAdapter.profile,
+            batch_max_attempts=2,
+            client_configuration_version="synthetic-long-partial-resume-v2",
+        )
 
-    first = run_embedding_pipeline(
-        config,
-        first_adapter,
-        limit=1,
-        batch_sleep=lambda _seconds: None,
-        monotonic=iter((1.0, 2.0)).__next__,
-    )
+    first_adapter = ResumableLongBatchAdapter([{1: "missing_response_item"}])
+
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            first_adapter,
+            limit=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_batched_item_outcome_commit=(
+                    lambda index, final: (
+                        (_ for _ in ()).throw(SyntheticInterruption())
+                        if index == 1 and not final
+                        else None
+                    )
+                )
+            ),
+            batch_sleep=lambda _seconds: None,
+            monotonic=iter((1.0, 2.0)).__next__,
+        )
 
     assert [[item.kind for item in call] for call in first_adapter.calls] == [
         ["text", "text", "text", "image"]
     ]
-    assert first.embeddings == 1
-    assert first.retryable == 1
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
             """
@@ -1017,13 +1192,13 @@ def test_batched_long_part_resume_keeps_sibling_parts_and_header_success(tmp_pat
         ).fetchall() == [
             (0, "succeeded", 1),
             (1, "retryable", 1),
-            (2, "succeeded", 1),
+            (2, "in_progress", 1),
         ]
         assert db.execute(
             "SELECT modality FROM embeddings"
-        ).fetchall() == [("header_image",)]
+        ).fetchall() == []
 
-    resumed_adapter = LongTextRecordingBatchAdapter()
+    resumed_adapter = ResumableLongBatchAdapter()
     resumed = run_embedding_pipeline(
         config,
         resumed_adapter,
@@ -1032,10 +1207,9 @@ def test_batched_long_part_resume_keeps_sibling_parts_and_header_success(tmp_pat
     )
 
     assert [[item.value for item in call] for call in resumed_adapter.calls] == [
-        ["BBBB\n\n"]
+        ["BBBB\n\n", "CCCC", "Z2VuZXJhdGVkIGJhdGNoZWQgbG9uZyBpbWFnZQ=="]
     ]
-    assert resumed.reused == 1
-    assert resumed.succeeded == 2
+    assert resumed.succeeded == 3
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
             "SELECT modality FROM embeddings ORDER BY modality"
@@ -1053,7 +1227,7 @@ def test_batched_long_part_resume_keeps_sibling_parts_and_header_success(tmp_pat
         ).fetchall() == [
             (0, "succeeded", 1),
             (1, "succeeded", 2),
-            (2, "succeeded", 1),
+            (2, "succeeded", 2),
         ]
 
 
@@ -5918,6 +6092,31 @@ def test_validator_accepts_fresh_synthetic_embedding_output(tmp_path):
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
 
     assert validate_embedding_outputs(config) == EmbeddingValidationResult(issues=())
+
+
+@pytest.mark.parametrize(
+    "run_update",
+    (
+        "usage_json = '{\"private_content\":\"secret\"}'",
+        "usage_json = '{\"prompt_tokens\":-1}'",
+        "hosted_requests = -1",
+        "hosted_retries = -1",
+        "throttles = -1",
+        "elapsed_seconds = -1",
+        "elapsed_seconds = 'NaN'",
+    ),
+)
+def test_validator_rejects_unsafe_usage_or_run_metric_ranges(tmp_path, run_update):
+    """Break caught: malformed content-bearing run observations validate as safe."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(f"UPDATE runs SET {run_update}")
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_run_metrics" in codes
 
 
 @pytest.mark.parametrize("disposition", ("absent", "missing"))

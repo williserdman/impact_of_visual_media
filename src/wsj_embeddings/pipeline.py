@@ -9,6 +9,7 @@ import math
 import os
 import stat
 import struct
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ import duckdb
 
 from wsj_embeddings.adapters import (
     EmbeddingAdapter,
+    JinaBatchItemOutcome,
     JinaEmbeddingInput,
     JinaHostedAdapterError,
 )
@@ -92,6 +94,7 @@ class EmbeddingPipelineFailpoints:
     ) = None
     after_long_text_terminal_transition: Callable[[int], None] | None = None
     after_image_rendition_install: Callable[[str], None] | None = None
+    after_batched_item_outcome_commit: Callable[[int, bool], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +289,8 @@ def run_embedding_pipeline(
 ) -> EmbeddingRunResult:
     """Publish source and derived vectors for a bounded canonical slice."""
 
+    run_clock = time.monotonic if monotonic is None else monotonic
+    run_started_at = run_clock()
     if not config.hosted_processing_authorized:
         raise HostedProcessingAuthorizationError
     if limit < 1:
@@ -423,7 +428,7 @@ def run_embedding_pipeline(
                     hosted_retries=metrics.retries,
                     usage=metrics.usage,
                     throttles=metrics.throttles,
-                    elapsed_seconds=metrics.elapsed_seconds,
+                    elapsed_seconds=max(0.0, run_clock() - run_started_at),
                 )
             return catalog.run_result(run_id)
         for article in articles:
@@ -778,6 +783,32 @@ def _run_rate_aware_work(
                     )
                 )
 
+    prior_attempt_counts: list[int] = []
+    attempt_limits: list[int] = []
+    for work in works:
+        if work.part is None:
+            prior_attempt_counts.append(
+                catalog.attempt_count(
+                    article_id=work.article.article_id,
+                    modality=work.modality,
+                    configuration_identifier=configuration_identifier,
+                )
+            )
+            attempt_limits.append(profile.batch_max_attempts)
+            continue
+        assert work.article_input_sha256 is not None
+        prior_attempt_counts.append(
+            catalog.long_text_part_attempt_count(
+                article_id=work.article.article_id,
+                configuration_identifier=configuration_identifier,
+                article_input_sha256=work.article_input_sha256,
+                part_index=work.part.index,
+            )
+        )
+        attempt_limits.append(
+            min(profile.batch_max_attempts, profile.long_text_part_attempt_limit)
+        )
+
     def checkpoint_attempt(index: int, _attempt: int) -> None:
         work = works[index]
         if work.part is None:
@@ -803,29 +834,15 @@ def _run_rate_aware_work(
                 work.part.index, attempt_count
             )
 
-    execution_kwargs: dict[str, object] = {"before_attempt": checkpoint_attempt}
-    if batch_sleep is not None:
-        execution_kwargs["sleep"] = batch_sleep
-    if batch_jitter is not None:
-        execution_kwargs["jitter"] = batch_jitter
-    if monotonic is not None:
-        execution_kwargs["monotonic"] = monotonic
-    metrics = execute_rate_aware_batches(
-        adapter,
-        tuple(work.embedding_input for work in works),
-        policy=BatchPolicy(
-            profile.batch_max_items,
-            profile.batch_max_estimated_tokens,
-            profile.batch_max_encoded_bytes,
-            profile.batch_max_concurrency,
-            profile.batch_max_attempts,
-            profile.batch_initial_backoff_seconds,
-            profile.batch_max_backoff_seconds,
-        ),
-        **execution_kwargs,
-    )
     failed_long_articles: set[str] = set()
-    for work, outcome in zip(works, metrics.items, strict=True):
+
+    def commit_outcome(
+        index: int,
+        _attempt: int,
+        outcome: JinaBatchItemOutcome,
+        final: bool,
+    ) -> None:
+        work = works[index]
         if outcome.vector is not None:
             vector = _normalized_vector(
                 outcome.vector.stored_vector, work.article.article_id
@@ -842,62 +859,91 @@ def _run_rate_aware_work(
                         stored_vector_sha256=_vector_hash(vector),
                         vector=vector,
                     )
-                continue
-            _publish_batched_source_success(
-                catalog,
-                run_id,
-                configuration_identifier,
-                profile,
-                work,
-                vector,
+            else:
+                _publish_batched_source_success(
+                    catalog,
+                    run_id,
+                    configuration_identifier,
+                    profile,
+                    work,
+                    vector,
+                )
+        else:
+            error_code = outcome.error_code or "invalid_response"
+            failure_state = (
+                WorkState.TERMINAL
+                if final or not outcome.retryable
+                else WorkState.RETRYABLE
             )
-            continue
-        error_code = outcome.error_code or "invalid_response"
-        failure_state = (
-            WorkState.RETRYABLE if outcome.retryable else WorkState.TERMINAL
-        )
-        if work.part is not None:
-            assert work.article_input_sha256 is not None
-            failed_long_articles.add(work.article.article_id)
-            with catalog.transaction():
-                if failure_state is WorkState.TERMINAL:
-                    catalog.record_terminal_long_text_part_failure(
+            if work.part is not None:
+                assert work.article_input_sha256 is not None
+                failed_long_articles.add(work.article.article_id)
+                with catalog.transaction():
+                    if failure_state is WorkState.TERMINAL:
+                        catalog.record_terminal_long_text_part_failure(
+                            run_id=run_id,
+                            article_id=work.article.article_id,
+                            configuration_identifier=configuration_identifier,
+                            article_input_sha256=work.article_input_sha256,
+                            part_index=work.part.index,
+                            error_code=error_code,
+                            status_code=outcome.status_code,
+                            retry_after_seconds=outcome.retry_after_seconds,
+                        )
+                    else:
+                        catalog.record_long_text_part_failure(
+                            run_id=run_id,
+                            article_id=work.article.article_id,
+                            configuration_identifier=configuration_identifier,
+                            article_input_sha256=work.article_input_sha256,
+                            part_index=work.part.index,
+                            state=failure_state,
+                            error_code=error_code,
+                            status_code=outcome.status_code,
+                            retry_after_seconds=outcome.retry_after_seconds,
+                        )
+            else:
+                with catalog.transaction():
+                    catalog.record_failure(
                         run_id=run_id,
                         article_id=work.article.article_id,
+                        modality=work.modality,
                         configuration_identifier=configuration_identifier,
-                        article_input_sha256=work.article_input_sha256,
-                        part_index=work.part.index,
-                        error_code=error_code,
-                        status_code=None,
-                        retry_after_seconds=None,
-                    )
-                else:
-                    catalog.record_long_text_part_failure(
-                        run_id=run_id,
-                        article_id=work.article.article_id,
-                        configuration_identifier=configuration_identifier,
-                        article_input_sha256=work.article_input_sha256,
-                        part_index=work.part.index,
                         state=failure_state,
                         error_code=error_code,
-                        status_code=None,
-                        retry_after_seconds=None,
+                        status_code=outcome.status_code,
+                        retry_after_seconds=outcome.retry_after_seconds,
+                        count_run=final,
                     )
-            continue
-        with catalog.transaction():
-            catalog.record_failure(
-                run_id=run_id,
-                article_id=work.article.article_id,
-                modality=work.modality,
-                configuration_identifier=configuration_identifier,
-                state=failure_state,
-                error_code=error_code,
-                status_code=None,
-                retry_after_seconds=None,
-            )
-            if work.modality == _HEADER_IMAGE_MODALITY:
-                catalog.increment_run(run_id, "header_failed")
+                    if final and work.modality == _HEADER_IMAGE_MODALITY:
+                        catalog.increment_run(run_id, "header_failed")
+        if failpoints.after_batched_item_outcome_commit is not None:
+            failpoints.after_batched_item_outcome_commit(index, final)
 
+    execution_kwargs: dict[str, object] = {
+        "before_attempt": checkpoint_attempt,
+        "on_outcome": commit_outcome,
+        "prior_attempt_counts": tuple(prior_attempt_counts),
+        "attempt_limits": tuple(attempt_limits),
+    }
+    if batch_sleep is not None:
+        execution_kwargs["sleep"] = batch_sleep
+    if batch_jitter is not None:
+        execution_kwargs["jitter"] = batch_jitter
+    metrics = execute_rate_aware_batches(
+        adapter,
+        tuple(work.embedding_input for work in works),
+        policy=BatchPolicy(
+            profile.batch_max_items,
+            profile.batch_max_estimated_tokens,
+            profile.batch_max_encoded_bytes,
+            profile.batch_max_concurrency,
+            profile.batch_max_attempts,
+            profile.batch_initial_backoff_seconds,
+            profile.batch_max_backoff_seconds,
+        ),
+        **execution_kwargs,
+    )
     for article_id in failed_long_articles:
         with catalog.transaction():
             row = catalog.connection.execute(

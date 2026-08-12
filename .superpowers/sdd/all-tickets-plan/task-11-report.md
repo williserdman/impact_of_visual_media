@@ -19,20 +19,26 @@ concurrency. A throttle halves later concurrency, with a floor of one. Eligible
 timeouts, connections, rate limits, server failures, and explicitly retryable
 indexed response gaps use bounded exponential backoff. Injectable jitter,
 sleep, and monotonic clocks make all retry behavior deterministic in fixtures.
-Usable `Retry-After` and zero-remaining request/token reset headers can extend
-the wait. Authentication, authorization, missing credential, deterministic
+Production uses bounded nondeterministic jitter; tests inject deterministic
+jitter. Numeric and RFC 9110 HTTP-date `Retry-After` plus zero-remaining
+request/token reset headers can extend the wait only to the configured cap.
+Authentication, authorization, missing credential, deterministic
 request configuration, and other nonretryable request failures stop the run.
 
 The coordinator stages all hosted work only after safe input preparation and
 durable work registration. Every hosted attempt is checkpointed before the
-call. Every successful or failed source item and long-text part then crosses
-its own catalog transaction. Partial mixed responses therefore preserve valid
+call. The scheduler invokes a serialized coordinator callback as each indexed
+outcome is processed, and every successful or failed source item and long-text
+part then crosses its own catalog transaction before later sleeps or waves.
+Durable prior attempt counts reduce the per-item remaining budget. Partial mixed
+responses therefore preserve valid
 text, image, and part work; replay sends only unproven items. Completed part
 sets aggregate through the established complete long-text formula, and source
 successes still produce the established multimodal derivative.
 
 Run summaries and `runs` now include hosted requests, item retries, safe named
-usage totals, throttle observations, and elapsed seconds. They contain no
+allowlisted finite nonnegative numeric usage totals, throttle observations, and
+whole-run elapsed seconds. They contain no
 Markdown, image bytes, vector values, credentials, response bodies, or
 exception text.
 
@@ -83,6 +89,18 @@ no supplied model-token count (`1 failed, 29 deselected in 0.61s`), then GREEN
 after the coordinator attached tokenizer/tile estimates (`1 passed,
 29 deselected in 0.34s`).
 
+The correction round first observed three scheduler failures: the serialized
+outcome callback and durable prior-attempt seam were absent, and uncapped
+sleeps were `[53.0, 200.0]` instead of `[3.0, 3.0]`. The exact selection then
+passed `3 passed, 7 deselected in 0.37s`. Default jitter passed `1 passed,
+10 deselected`; valid/malformed HTTP-date parsing passed `2 passed, 30
+deselected`. Coordinator crash/replay durability and entering-attempt-two
+fixtures passed `2 passed, 172 deselected in 5.67s`. Hostile usage plus corrupt
+run-metric validation first failed eight cases, then passed `8 passed, 174
+deselected in 13.84s`. Adapter and scheduler files passed `43 passed in 5.25s`;
+the final scheduler file, including preservation of parsed per-item Retry-After
+metadata, passed `12 passed in 0.87s`.
+
 ## Self-review
 
 - Production uses `JinaEmbeddingAdapter.embed_batch`; tests inject only local
@@ -93,9 +111,9 @@ after the coordinator attached tokenizer/tile estimates (`1 passed,
 - Request indexes are the only mapping between an input and its outcome.
   Out-of-range entries cannot be assigned; duplicates invalidate only that
   ambiguous index; a missing index remains independently retryable.
-- Attempt checkpoints happen before executor submission. Catalog, aggregation,
-  and validation remain on the serialized coordinator; worker threads call
-  only the hosted adapter.
+- Attempt checkpoints happen before executor submission. Outcome callbacks,
+  catalog publication, aggregation, and validation remain on the serialized
+  coordinator; worker threads call only the hosted adapter.
 - Existing fake adapters retain their established single-item seam. Only the
   real hosted adapter and explicit batching fakes opt into the new scheduler.
 - Auth/authz errors intentionally leave in-progress checkpoints; replay can
@@ -110,7 +128,6 @@ output, shared environment mutation, or full-corpus operation was used.
 
 The default limits are conservative versioned policy, not a live throughput
 promise. A credentialed generated-fixture pilot still owns measuring current
-v4 throughput and rate headers. `Retry-After` is currently accepted only in
-numeric seconds; an HTTP-date value is safely ignored and exponential backoff
-still applies. Jina's documented remaining/reset headers are not stable across
+v4 throughput and rate headers. Malformed `Retry-After` values are safely
+ignored. Jina's documented remaining/reset headers are not stable across
 public sources, so only numeric named values affect scheduling.

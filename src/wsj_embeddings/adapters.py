@@ -10,8 +10,10 @@ import os
 import struct
 import urllib.error
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Protocol
 
 from wsj_embeddings.image_rendition import (
@@ -238,6 +240,8 @@ class JinaBatchItemOutcome:
     vector: JinaEmbeddedVector | None
     error_code: str | None
     retryable: bool = False
+    status_code: int | None = None
+    retry_after_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +305,7 @@ class JinaEmbeddingAdapter:
         transport: JinaTransport | None = None,
         tokenizer: TextOffsetTokenizer | None = None,
         timeout_seconds: float = 30.0,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -312,6 +317,7 @@ class JinaEmbeddingAdapter:
         self._transport = UrllibJinaTransport() if transport is None else transport
         self._tokenizer = PinnedJinaV4Tokenizer() if tokenizer is None else tokenizer
         self._timeout_seconds = timeout_seconds
+        self._wall_clock = wall_clock
 
     def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
         """Tokenize locally with the immutable checksum-verified v4 artifact."""
@@ -419,13 +425,22 @@ class JinaEmbeddingAdapter:
         model = payload.get("model")
         if model != _JINA_MODEL:
             raise JinaHostedAdapterError("invalid_response", retryable=False)
+        rate_headers = _safe_rate_limit_headers(response.headers)
+        retry_after = _retry_after_seconds(
+            response.headers, now=self._wall_clock()
+        )
         return JinaEmbeddingBatchResponse(
-            items=_validated_batch_items(payload, expected_count=len(request_items)),
+            items=_validated_batch_items(
+                payload,
+                expected_count=len(request_items),
+                status_code=response.status_code,
+                retry_after_seconds=retry_after,
+            ),
             usage=_safe_usage(payload.get("usage")),
             response_metadata=JinaResponseMetadata(
                 status_code=response.status_code,
                 model=model,
-                rate_limit_headers=_safe_rate_limit_headers(response.headers),
+                rate_limit_headers=rate_headers,
             ),
         )
 
@@ -455,8 +470,7 @@ class JinaEmbeddingAdapter:
             raise JinaHostedAdapterError("invalid_response", retryable=False)
         return payload
 
-    @staticmethod
-    def _raise_for_status(response: JinaHttpResponse) -> None:
+    def _raise_for_status(self, response: JinaHttpResponse) -> None:
         status = response.status_code
         if status == 401:
             code, retryable = "authentication", False
@@ -474,7 +488,9 @@ class JinaEmbeddingAdapter:
             code,
             retryable=retryable,
             status_code=status,
-            retry_after_seconds=_retry_after_seconds(response.headers),
+            retry_after_seconds=_retry_after_seconds(
+                response.headers, now=self._wall_clock()
+            ),
             rate_limit_headers=_safe_rate_limit_headers(response.headers),
         )
 
@@ -540,14 +556,24 @@ def _validated_vectors(
 
 
 def _validated_batch_items(
-    payload: Mapping[str, object], *, expected_count: int
+    payload: Mapping[str, object],
+    *,
+    expected_count: int,
+    status_code: int,
+    retry_after_seconds: float | None,
 ) -> tuple[JinaBatchItemOutcome, ...]:
     """Validate each unambiguous response index without discarding siblings."""
 
     data = payload.get("data")
     if not isinstance(data, list):
         return tuple(
-            JinaBatchItemOutcome(index, None, "invalid_response")
+            JinaBatchItemOutcome(
+                index,
+                None,
+                "invalid_response",
+                status_code=status_code,
+                retry_after_seconds=retry_after_seconds,
+            )
             for index in range(expected_count)
         )
     candidates: dict[int, list[Mapping[str, object]]] = {}
@@ -569,12 +595,25 @@ def _validated_batch_items(
         if not indexed:
             outcomes.append(
                 JinaBatchItemOutcome(
-                    index, None, "missing_response_item", retryable=True
+                    index,
+                    None,
+                    "missing_response_item",
+                    retryable=True,
+                    status_code=status_code,
+                    retry_after_seconds=retry_after_seconds,
                 )
             )
             continue
         if len(indexed) != 1:
-            outcomes.append(JinaBatchItemOutcome(index, None, "invalid_response"))
+            outcomes.append(
+                JinaBatchItemOutcome(
+                    index,
+                    None,
+                    "invalid_response",
+                    status_code=status_code,
+                    retry_after_seconds=retry_after_seconds,
+                )
+            )
             continue
         try:
             vector = _validated_vectors(
@@ -582,7 +621,15 @@ def _validated_batch_items(
                 expected_count=1,
             )[0]
         except JinaHostedAdapterError:
-            outcomes.append(JinaBatchItemOutcome(index, None, "invalid_response"))
+            outcomes.append(
+                JinaBatchItemOutcome(
+                    index,
+                    None,
+                    "invalid_response",
+                    status_code=status_code,
+                    retry_after_seconds=retry_after_seconds,
+                )
+            )
             continue
         outcomes.append(
             JinaBatchItemOutcome(
@@ -620,11 +667,23 @@ def _safe_rate_limit_headers(headers: Mapping[str, str]) -> dict[str, float]:
     return safe_headers
 
 
-def _retry_after_seconds(headers: Mapping[str, str]) -> float | None:
+def _retry_after_seconds(
+    headers: Mapping[str, str], *, now: datetime
+) -> float | None:
     for name, value in headers.items():
         if not isinstance(name, str) or name.lower() != "retry-after":
             continue
-        return _safe_numeric_value(value, maximum=_MAX_SAFE_RATE_LIMIT_VALUE)
+        numeric = _safe_numeric_value(value, maximum=_MAX_SAFE_RATE_LIMIT_VALUE)
+        if numeric is not None:
+            return numeric
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed.tzinfo is None or now.tzinfo is None:
+            return None
+        seconds = max(0.0, (parsed - now).total_seconds())
+        return _safe_numeric_value(seconds, maximum=_MAX_SAFE_RATE_LIMIT_VALUE)
     return None
 
 

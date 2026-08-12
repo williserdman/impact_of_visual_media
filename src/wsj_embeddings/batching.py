@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from random import SystemRandom
 
 from wsj_embeddings.adapters import (
     JinaBatchItemOutcome,
@@ -14,6 +15,7 @@ from wsj_embeddings.adapters import (
     JinaEmbeddingInput,
     JinaHostedAdapterError,
 )
+from wsj_embeddings.run_metrics import normalize_safe_usage
 
 _RUN_FATAL_CODES = frozenset(
     {
@@ -24,6 +26,11 @@ _RUN_FATAL_CODES = frozenset(
         "request_failure",
     }
 )
+_SYSTEM_RANDOM = SystemRandom()
+
+
+def _production_jitter(_attempt: int) -> float:
+    return _SYSTEM_RANDOM.uniform(0.0, 1.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +91,7 @@ class _PendingItem:
     index: int
     value: JinaEmbeddingInput
     attempt: int = 1
+    attempt_limit: int = 1
 
 
 def execute_rate_aware_batches(
@@ -92,15 +100,46 @@ def execute_rate_aware_batches(
     *,
     policy: BatchPolicy,
     sleep: Callable[[float], None] = time.sleep,
-    jitter: Callable[[int], float] = lambda _attempt: 0.0,
+    jitter: Callable[[int], float] = _production_jitter,
     monotonic: Callable[[], float] = time.monotonic,
     before_attempt: Callable[[int, int], None] | None = None,
+    on_outcome: Callable[[int, int, JinaBatchItemOutcome, bool], None] | None = None,
+    prior_attempt_counts: Sequence[int] | None = None,
+    attempt_limits: Sequence[int] | None = None,
 ) -> BatchExecutionResult:
     """Run bounded waves, retaining every independently validated success."""
 
     started_at = monotonic()
-    pending = [_PendingItem(index, value) for index, value in enumerate(inputs)]
+    if prior_attempt_counts is None:
+        prior_attempt_counts = (0,) * len(inputs)
+    if attempt_limits is None:
+        attempt_limits = (policy.max_attempts,) * len(inputs)
+    if len(prior_attempt_counts) != len(inputs) or any(
+        isinstance(count, bool) or not isinstance(count, int) or count < 0
+        for count in prior_attempt_counts
+    ):
+        raise ValueError("prior attempt counts must be nonnegative integers per input")
+    if len(attempt_limits) != len(inputs) or any(
+        isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        for limit in attempt_limits
+    ):
+        raise ValueError("attempt limits must be positive integers per input")
+    pending: list[_PendingItem] = []
     final: dict[int, JinaBatchItemOutcome] = {}
+    for index, (value, prior_attempts, attempt_limit) in enumerate(
+        zip(inputs, prior_attempt_counts, attempt_limits, strict=True)
+    ):
+        if prior_attempts >= attempt_limit:
+            outcome = JinaBatchItemOutcome(
+                index, None, "attempt_limit_exhausted", retryable=False
+            )
+            final[index] = outcome
+            if on_outcome is not None:
+                on_outcome(index, prior_attempts, outcome, True)
+        else:
+            pending.append(
+                _PendingItem(index, value, prior_attempts + 1, attempt_limit)
+            )
     usage: dict[str, int | float] = {}
     requests = 0
     retries = 0
@@ -150,14 +189,37 @@ def execute_rate_aware_batches(
                     throttles += 1
                     throttled_wave = True
                 for item in batch:
-                    if item.attempt >= policy.max_attempts:
-                        final[item.index] = JinaBatchItemOutcome(
-                            item.index, None, exchange.code, retryable=True
+                    if item.attempt >= item.attempt_limit:
+                        outcome = JinaBatchItemOutcome(
+                            item.index,
+                            None,
+                            exchange.code,
+                            retryable=False,
+                            status_code=exchange.status_code,
+                            retry_after_seconds=exchange.retry_after_seconds,
                         )
+                        final[item.index] = outcome
+                        if on_outcome is not None:
+                            on_outcome(item.index, item.attempt, outcome, True)
                     else:
+                        outcome = JinaBatchItemOutcome(
+                            item.index,
+                            None,
+                            exchange.code,
+                            retryable=True,
+                            status_code=exchange.status_code,
+                            retry_after_seconds=exchange.retry_after_seconds,
+                        )
+                        if on_outcome is not None:
+                            on_outcome(item.index, item.attempt, outcome, False)
                         retries += 1
                         next_pending.append(
-                            _PendingItem(item.index, item.value, item.attempt + 1)
+                            _PendingItem(
+                                item.index,
+                                item.value,
+                                item.attempt + 1,
+                                item.attempt_limit,
+                            )
                         )
                         retry_delays.append(
                             _retry_delay(
@@ -175,35 +237,57 @@ def execute_rate_aware_batches(
             if throttled:
                 throttles += 1
                 throttled_wave = True
-                retry_delays.append(_rate_header_delay(headers))
+                retry_delays.append(
+                    _rate_header_delay(headers, policy.max_backoff_seconds)
+                )
             if len(exchange.items) != len(batch):
                 raise JinaHostedAdapterError("invalid_response", retryable=False)
             for item, outcome in zip(batch, exchange.items, strict=True):
                 if outcome.index != batch.index(item):
                     raise JinaHostedAdapterError("invalid_response", retryable=False)
                 if outcome.vector is not None or not outcome.retryable:
-                    final[item.index] = JinaBatchItemOutcome(
+                    delivered = JinaBatchItemOutcome(
                         item.index,
                         outcome.vector,
                         outcome.error_code,
                         retryable=False,
+                        status_code=outcome.status_code,
+                        retry_after_seconds=outcome.retry_after_seconds,
                     )
+                    final[item.index] = delivered
+                    if on_outcome is not None:
+                        on_outcome(item.index, item.attempt, delivered, True)
                     continue
-                if item.attempt >= policy.max_attempts:
-                    final[item.index] = JinaBatchItemOutcome(
-                        item.index, None, outcome.error_code, retryable=True
+                if item.attempt >= item.attempt_limit:
+                    delivered = JinaBatchItemOutcome(
+                        item.index,
+                        None,
+                        outcome.error_code,
+                        retryable=False,
+                        status_code=outcome.status_code,
+                        retry_after_seconds=outcome.retry_after_seconds,
                     )
+                    final[item.index] = delivered
+                    if on_outcome is not None:
+                        on_outcome(item.index, item.attempt, delivered, True)
                     continue
+                if on_outcome is not None:
+                    on_outcome(item.index, item.attempt, outcome, False)
                 retries += 1
                 next_pending.append(
-                    _PendingItem(item.index, item.value, item.attempt + 1)
+                    _PendingItem(
+                        item.index,
+                        item.value,
+                        item.attempt + 1,
+                        item.attempt_limit,
+                    )
                 )
                 retry_delays.append(
                     _retry_delay(
                         item.attempt,
                         policy,
                         jitter,
-                        retry_after=headers.get("retry-after"),
+                        retry_after=outcome.retry_after_seconds,
                         headers=headers,
                     )
                 )
@@ -280,7 +364,7 @@ def _retry_delay(
     jitter_seconds = jitter(attempt)
     if jitter_seconds < 0:
         raise ValueError("batch retry jitter must be nonnegative")
-    return min(policy.max_backoff_seconds, max(header_values)) + jitter_seconds
+    return min(policy.max_backoff_seconds, max(header_values) + jitter_seconds)
 
 
 def _is_throttled(headers: object) -> bool:
@@ -290,7 +374,7 @@ def _is_throttled(headers: object) -> bool:
     )
 
 
-def _rate_header_delay(headers: object) -> float:
+def _rate_header_delay(headers: object, maximum: float) -> float:
     if not isinstance(headers, dict):
         return 0.0
     values = [headers.get("retry-after", 0.0)]
@@ -298,11 +382,11 @@ def _rate_header_delay(headers: object) -> float:
         values.append(headers.get("x-ratelimit-reset-requests", 0.0))
     if headers.get("x-ratelimit-remaining-tokens") == 0:
         values.append(headers.get("x-ratelimit-reset-tokens", 0.0))
-    return max(values)
+    return min(maximum, max(values))
 
 
 def _add_usage(
     aggregate: dict[str, int | float], usage: dict[str, int | float]
 ) -> None:
-    for name, value in usage.items():
+    for name, value in normalize_safe_usage(usage).items():
         aggregate[name] = aggregate.get(name, 0) + value

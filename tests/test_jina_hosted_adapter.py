@@ -9,6 +9,7 @@ import math
 import struct
 import traceback
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -246,6 +247,7 @@ def test_hosted_batch_returns_independent_indexed_mixed_item_outcomes():
             headers={
                 "X-RateLimit-Remaining-Requests": "7",
                 "X-RateLimit-Remaining-Tokens": "101",
+                "Retry-After": "4",
             },
         )
     )
@@ -269,14 +271,19 @@ def test_hosted_batch_returns_independent_indexed_mixed_item_outcomes():
     assert result.items[0].vector.stored_vector[:2] == (1.0, 0.0)
     assert result.items[1].vector is None
     assert result.items[1].error_code == "invalid_response"
+    assert result.items[1].status_code == 200
+    assert result.items[1].retry_after_seconds == 4.0
     assert result.items[2].vector is not None
     assert result.items[2].vector.stored_vector[:2] == (0.0, 1.0)
     assert result.items[3].vector is None
     assert result.items[3].error_code == "missing_response_item"
+    assert result.items[3].status_code == 200
+    assert result.items[3].retry_after_seconds == 4.0
     assert result.usage == {"prompt_tokens": 11, "total_tokens": 11}
     assert result.response_metadata.rate_limit_headers == {
         "x-ratelimit-remaining-requests": 7.0,
         "x-ratelimit-remaining-tokens": 101.0,
+        "retry-after": 4.0,
     }
 
 
@@ -430,6 +437,32 @@ def test_hosted_adapter_classifies_safe_transport_failures(
     assert "synthetic-secret" not in str(raised.value)
     assert "private" not in str(raised.value)
     assert "detail" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected"),
+    [
+        ("Wed, 12 Aug 2026 12:00:05 GMT", 5.0),
+        ("not an HTTP date", None),
+    ],
+)
+def test_hosted_adapter_parses_http_date_retry_after_against_injected_clock(
+    retry_after, expected
+):
+    """Break caught: valid RFC 9110 dates are ignored or use an unstable clock."""
+
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=RecordingTransport(
+            JinaHttpResponse(429, {"Retry-After": retry_after}, b"{}")
+        ),
+        wall_clock=lambda: datetime(2026, 8, 12, 12, 0, tzinfo=UTC),
+    )
+
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        adapter.embed((JinaEmbeddingInput.text("private"),))
+
+    assert raised.value.retry_after_seconds == expected
 
 
 def test_hosted_adapter_requires_only_named_environment_credential():

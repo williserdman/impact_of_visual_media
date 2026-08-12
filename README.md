@@ -346,12 +346,15 @@ total encoded input bytes, and configured concurrency. Response indexes are
 validated independently and every item commits in its own transaction, so a
 valid sibling survives a missing or malformed response item. Retryable
 timeouts, connection errors, rate limits, and eligible server failures use
-bounded exponential backoff with injected jitter. Usable `Retry-After` and
-zero-remaining rate-reset headers are honored; throttling halves later
+bounded exponential backoff with real bounded jitter (injectable in tests).
+Numeric or RFC 9110 HTTP-date `Retry-After` and zero-remaining rate-reset
+headers are honored up to the configured maximum wait; throttling halves later
 concurrency without exceeding its configured maximum. Authentication,
 authorization, and invalid request configuration stop the run. Summaries and
-`runs` store only counts, safe named usage, retry/throttle observations, and
-elapsed seconds—never request content.
+`runs` store only nonnegative counts, allowlisted numeric token usage,
+retry/throttle observations, and whole-run elapsed seconds—never request
+content. Each durable prior attempt reduces the remaining request budget, so
+replay cannot purchase beyond the configured ceiling.
 Every successful image generation has content-free `image_input_provenance`:
 source and exact embedded-input hashes, formats, byte counts, dimensions, frame counts,
 transform identity, and an optional output-relative rendition path. It stores
