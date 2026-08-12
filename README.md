@@ -385,6 +385,80 @@ references only; the pipeline never downloads them.
 
 ## Text, header-image, and multimodal embedding catalog contract
 
+`article_text` is a hosted Jina v4 embedding of canonical Markdown.
+`header_image` is a hosted Jina v4 embedding of the optional local canonical
+header image. `multimodal_article` is the locally computed normalized midpoint
+of matching text and image generations, not a joint hosted API response. All
+vectors are 2,048-dimensional normalized float32 research observations.
+
+### First-time embedding workflow
+
+Before processing any licensed material, complete these steps in order:
+
+1. Confirm that you have the right to submit the licensed input to hosted
+   processing.
+2. Install the declared project dependencies.
+3. Set `JINA_API_KEY` in the environment without recording its value in shell
+   history, configuration, output, or committed files.
+4. Run `wsj-embeddings smoke`; it uses generated fixtures and needs neither a
+   key nor network access.
+5. Manually run the generated-only `wsj-embeddings pilot`; unlike smoke, it
+   makes a hosted request but sends only generated probes, never archive data.
+6. Review the returned model and record its exact safe label for
+   `--observed-model`.
+7. Keep the source, preprocessing-output, and embedding-output roots pairwise
+   disjoint.
+
+Start with the generated smoke check:
+
+```bash
+wsj-embeddings smoke
+```
+
+After setting `JINA_API_KEY`, run the pilot manually and review its
+content-free result before authorizing any archive scope:
+
+```bash
+wsj-embeddings pilot
+```
+
+Inventory canonical eligibility without a credential, hosted adapter, or
+embedding-output mutation:
+
+```bash
+wsj-embeddings inventory \
+  --source-root /path/to/wsj_archive \
+  --preprocessing-output-root /path/to/preprocessing-output \
+  --embedding-output-root /path/to/embedding-output
+```
+
+Make the first real mutation deliberately bounded to one article. This command
+sends canonical Markdown and any optional local canonical header image for the
+selected article to Jina; replace the placeholder with the model returned by
+the pilot:
+
+```bash
+wsj-embeddings run \
+  --source-root /path/to/wsj_archive \
+  --preprocessing-output-root /path/to/preprocessing-output \
+  --embedding-output-root /path/to/embedding-output \
+  --limit 1 \
+  --authorize-hosted-processing \
+  --observed-model '<pilot-returned-model>'
+```
+
+Then validate the generated catalog offline. Validation is read-only and makes
+no hosted request. When more than one configuration exists, provide its
+explicit ID rather than allowing configurations to be mixed:
+
+```bash
+wsj-embeddings validate \
+  --source-root /path/to/wsj_archive \
+  --preprocessing-output-root /path/to/preprocessing-output \
+  --embedding-output-root /path/to/embedding-output \
+  --configuration-id '<configuration-id>'
+```
+
 The downstream catalog is a separate schema-version-16 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
