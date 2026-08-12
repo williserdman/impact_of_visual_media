@@ -340,6 +340,26 @@ command, or `--full --reprocess`, without the user's authorization in the
 current task. A completed full run is the only operation that reconciles
 previously known source files that have disappeared.
 
+### Preprocessing reruns and reprocessing
+
+Normal reruns reuse matching source and header-image fingerprints; when file
+stats change, the pipeline hashes HTML before deciding whether extraction is
+needed. An extractor-version change marks existing sources stale but does not
+start corpus-wide work. Reprocess an explicit scope:
+
+```bash
+.venv/bin/wsj-pipeline run --limit 20 --reprocess
+.venv/bin/wsj-pipeline run --full --reprocess
+```
+
+`--reprocess` is not schema migration, and `--full --reprocess` needs the same
+current-task authorization as any other real full run. Review JSON counters
+after every run. Extraction failures are isolated without article text, and a
+valid duplicate may be promoted in place of a failed winner. `validate` is
+read-only: it checks the supported schema, constraints, and publication-date
+index before relational data and generated files; unsupported catalogs are
+reported, never repaired in place.
+
 ## Generated layout
 
 All generated paths are below the configured output root and ignored by Git:
@@ -584,37 +604,6 @@ WHERE configuration_id = '<configuration_id>'
 GROUP BY modality, state
 ORDER BY modality, state;
 ```
-
-## Incremental runs and reprocessing
-
-Normal reruns skip matching source/image fingerprints. If file stats change,
-the pipeline hashes HTML before deciding whether extraction is necessary.
-New content, changed HTML, and changed selected header images are processed in
-bounded transactions; unchanged content is not republished. Source preparation
-may complete in worker order, while canonical ranking and the completed
-research output remain deterministic.
-
-Discovery and later source reads reject symlinked HTML or local header-image
-leaves and reopen accepted paths through no-follow source-relative descriptors.
-Malformed optional update timestamps become a stable warning and rank as
-missing update metadata; publication timestamps remain strict.
-
-An extractor-version change marks existing sources stale but does not silently
-start corpus-wide work. Reprocess an explicit scope:
-
-```bash
-.venv/bin/wsj-pipeline run --limit 20 --reprocess
-.venv/bin/wsj-pipeline run --full --reprocess
-```
-
-Review the JSON counters after every run. Extraction failures are isolated and
-recorded without article text; a valid duplicate may be promoted in place of a
-failed winner.
-
-`validate` opens the catalog read-only and checks the exact supported tables,
-columns, primary/unique constraints, and publication-date index before it
-checks relational data or generated files. Malformed and unsupported catalogs
-produce stable, content-free issues and are never repaired in place.
 
 ## Recovery
 
