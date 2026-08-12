@@ -661,7 +661,7 @@ reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
-and local header-image embeddings. It checks the exact version-14 embedding
+and local header-image embeddings. It checks the exact version-15 embedding
 schema first, opens the
 preprocessing catalog through its public exact-schema contract, and reports
 stable sorted issues for configuration identity/reference failures, malformed
@@ -704,6 +704,16 @@ success/unavailable/failure as one mutually exclusive partition; stale and
 unresolved retryable work; and orphan
 rendition files. Validation detects but does not repair state, use a hosted
 credential, or make a network request.
+
+Embedding validation holds bounded cursor pages: at most 256 metadata rows, 32
+single-vector rows, or eight three-vector recomputation rows. Long-text
+validation retains one 2,048-value accumulator and one current Markdown body;
+historical part counts do not enlarge its Python working set. Relational checks
+run in DuckDB rather than Python corpus dictionaries. Rendition references are
+streamed into a content-free temporary SQLite primary-key index outside
+configured roots, then the no-follow walk probes it one leaf at a time. The
+index is removed when validation returns. A duplicate-sensitive,
+order-independent rendition-tree digest avoids a corpus-sized directory sort.
 
 ## 11. Test map
 

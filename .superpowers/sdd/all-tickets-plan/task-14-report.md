@@ -176,3 +176,49 @@ and long-part provenance, validator acceptance, abandoned-run recovery,
 concurrent fatal sibling telemetry, authentication telemetry, indexed image
 rejection/replay, and bounded success/error reads. No live Jina call, secret,
 licensed archive, or real full run was used.
+
+### Core review correction round 1
+
+The schema remained at version 15. Validation now treats derivation labels as
+semantic claims: only source text/images may identify a hosted response,
+multimodal rows must identify their local midpoint, long-text aggregate rows
+must have matching aggregation provenance, and synthetic source vectors are
+accepted only under the generated-fixture API/tokenizer profile marker.
+Mutable successful long-text parts must match their immutable generation in
+derivation kind, raw-response hash, and response model as well as vector facts.
+
+Visible but uncompacted reconciliation actions no longer hide physical vector
+corruption. The validator checks the hidden storage vector's dimension,
+finiteness, norm, stored hash, and semantic provenance even when the expected
+action fields were changed to match the corrupt storage. Malformed hosted batch
+item counts or local indexes now enter the fatal wrapper after all completed
+exchange usage and throttle observations are accumulated, allowing the
+coordinator to persist those metrics before failing the run.
+
+The correction used generated fixtures only. Focused selections covered nine
+validator cases and three scheduler/coordinator cases; changed-file Ruff passed.
+Per review instruction, the full test suite was not run. No live API call, key,
+real archive, or real full run was used.
+
+### Corpus-scale validation correction
+
+The scale review found corpus-sized Python materializations of canonical
+articles, active vectors, current and historical long-text parts, and
+provenance. Validation now uses one bounded-row interface: metadata pages are
+capped at 256 rows, single-vector pages at 32, and three-vector multimodal pages
+at eight. Relational reference/equality checks run as SQL anti-joins or counts.
+
+Long-text vectors are completely streamed. Aggregate descriptors advance by
+keyset and each provenance group feeds one 2,048-value token-weighted
+accumulator plus scalar span cursors; only its current Markdown bytes remain in
+memory. Artifact tokens stream articles and references. Their complete
+no-follow rendition-tree digest is order-independent and duplicate-sensitive.
+Orphan checks stream references into a content-free temporary SQLite
+primary-key index outside configured roots, probe it one verified leaf at a
+time, and remove it on return.
+
+Focused evidence covers the bounded cursor and digest contracts, corruption
+beyond the first 32-vector page, fresh and long-text validation, visible
+reconciliation, multimodal/history provenance, concurrent artifact changes,
+and coverage. `validate.py` contains no `fetchall()` call. No real archive,
+live API, credential, real full run, or full suite was used.

@@ -27,7 +27,6 @@ from wsj_embeddings import (
     EmbeddingCatalogError,
     EmbeddingPipelineConfig,
     EmbeddingPipelineFailpoints,
-    EmbeddingProfile,
     EmbeddingRunResult,
     EmbeddingValidationFailpoints,
     EmbeddingValidationIssue,
@@ -752,11 +751,7 @@ class InterruptingImageAdapter(RecordingMultimodalAdapter):
 
 
 class PriorConfigurationAdapter(FakeEmbeddingAdapter):
-    profile = EmbeddingProfile(
-        model="synthetic-prior-model",
-        task="retrieval.passage",
-        dimensions=2048,
-    )
+    profile = replace(FakeEmbeddingAdapter.profile, model="synthetic-prior-model")
 
 
 def test_configuration_identity_covers_every_meaning_bearing_profile_field():
@@ -1084,6 +1079,33 @@ def test_hosted_long_parts_retain_raw_hash_while_aggregate_is_derived(tmp_path):
 @pytest.mark.parametrize(
     ("column", "value"),
     (
+        ("derivation_kind", "synthetic_fixture"),
+        ("raw_response_sha256", "b" * 64),
+        ("response_model", "different-safe-observed-model"),
+    ),
+)
+def test_validator_requires_mutable_part_provenance_to_equal_generation(
+    tmp_path, column, value
+):
+    """Break caught: mutable part audit identity drifts from immutable history."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+    run_embedding_pipeline(config, HostedProvenanceLongTextAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            f"UPDATE long_text_parts SET {column} = ? WHERE part_index = 0",
+            [value],
+        )
+
+    assert "invalid_long_text_part" in {
+        issue.code for issue in validate_embedding_outputs(config).issues
+    }
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (
         ("raw_response_sha256", None),
         ("raw_response_sha256", "not-a-sha256"),
         ("response_model", None),
@@ -1104,6 +1126,69 @@ def test_validator_rejects_malformed_hosted_vector_provenance(
             f"UPDATE embedding_storage SET {column} = ? "
             "WHERE modality = 'article_text'",
             [value],
+        )
+
+    assert "invalid_vector_provenance" in {
+        issue.code for issue in validate_embedding_outputs(config).issues
+    }
+
+
+def test_validator_rejects_synthetic_derivation_under_real_jina_profile(tmp_path):
+    """Break caught: real hosted generations can masquerade as test fixtures."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    class RealProfileHostedFixtureAdapter(HostedProvenanceBatchAdapter):
+        profile = JinaEmbeddingAdapter.profile
+
+    run_embedding_pipeline(config, RealProfileHostedFixtureAdapter(), limit=1)
+    real_id = configuration_id(RealProfileHostedFixtureAdapter.profile)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "UPDATE embedding_storage SET derivation_kind = 'synthetic_fixture', "
+            "raw_response_sha256 = NULL, response_model = NULL "
+            "WHERE modality = 'article_text'"
+        )
+
+    codes = {
+        issue.code
+        for issue in validate_embedding_outputs(config, configuration_id=real_id).issues
+    }
+    assert "invalid_vector_provenance" in codes
+
+
+def test_validator_rejects_hosted_derivation_for_multimodal_midpoint(tmp_path):
+    """Break caught: a local midpoint can claim a nonexistent hosted response."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated semantic midpoint image")
+    run_embedding_pipeline(config, HostedProvenanceBatchAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "UPDATE embedding_storage SET derivation_kind = 'hosted_response', "
+            "raw_response_sha256 = ?, response_model = ? "
+            "WHERE modality = 'multimodal_article'",
+            ["a" * 64, "jina-v4-observed-deployment-a"],
+        )
+
+    assert "invalid_vector_provenance" in {
+        issue.code for issue in validate_embedding_outputs(config).issues
+    }
+
+
+@pytest.mark.parametrize("modality", ("article_text", "header_image"))
+def test_validator_rejects_aggregate_derivation_without_text_parts(
+    tmp_path, modality
+):
+    """Break caught: a direct source vector claims a nonexistent aggregation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated direct provenance image")
+    run_embedding_pipeline(config, HostedProvenanceBatchAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            "UPDATE embedding_storage SET derivation_kind = 'long_text_aggregate', "
+            "raw_response_sha256 = NULL, response_model = NULL WHERE modality = ?",
+            [modality],
         )
 
     assert "invalid_vector_provenance" in {
@@ -1342,6 +1427,78 @@ def test_concurrent_wave_commits_second_success_before_raising_first_fatal(
     replay = FatalFirstWaveAdapter(fatal_first=False)
     run_embedding_pipeline(config, replay, limit=2)
     assert [[item.value for item in call] for call in replay.calls] == [["#\n"]]
+
+
+def test_malformed_later_batch_persists_prior_usage_and_throttle(tmp_path):
+    """Break caught: fatal shape errors erase completed hosted telemetry."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-SYNTHETIC-EMBEDDING",
+        markdown="# Second generated article\n",
+    )
+
+    class MalformedSecondBatchAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            client_configuration_version="synthetic-malformed-second-batch-v1",
+        )
+
+        def embed_batch(self, inputs, *, limits):
+            if self.calls:
+                self.calls.append(tuple(inputs))
+                return JinaEmbeddingBatchResponse(
+                    (),
+                    {"prompt_tokens": 3},
+                    JinaResponseMetadata(200, self.profile.model, {}),
+                )
+            response = super().embed_batch(inputs, limits=limits)
+            return replace(
+                response,
+                usage={"prompt_tokens": 7},
+                response_metadata=JinaResponseMetadata(
+                    200,
+                    self.profile.model,
+                    {"x-ratelimit-remaining-requests": 0.0},
+                ),
+            )
+
+    adapter = MalformedSecondBatchAdapter()
+    with pytest.raises(JinaHostedAdapterError) as caught:
+        run_embedding_pipeline(
+            config,
+            adapter,
+            limit=2,
+            batch_sleep=lambda _seconds: None,
+        )
+
+    assert caught.value.code == "invalid_response"
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT status, hosted_requests, usage_json, throttles,
+                   elapsed_seconds >= 0, finished_at IS NOT NULL
+            FROM runs
+            """
+        ).fetchone() == (
+            "failed",
+            2,
+            '{"prompt_tokens":10}',
+            1,
+            True,
+            True,
+        )
+        assert db.execute(
+            """
+            SELECT article_id, state FROM embedding_work_items
+            WHERE modality = 'article_text' ORDER BY article_id
+            """
+        ).fetchall() == [
+            ("wsj:SYNTHETIC-EMBEDDING", "succeeded"),
+            ("wsj:ZZZ-SYNTHETIC-EMBEDDING", "in_progress"),
+        ]
 
 
 def test_batched_replay_enters_attempt_two_and_terminalizes_at_durable_ceiling(
@@ -5649,6 +5806,37 @@ def test_public_validator_reports_tampered_vector(tmp_path):
     }
 
 
+def test_public_validator_streams_to_a_corrupt_vector_after_the_first_page(tmp_path):
+    """Break caught: bounded validation silently stops after its first vector page."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    suffixes = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for index, suffix in enumerate(suffixes[:33], start=1):
+        add_generated_embedding_article(
+            config,
+            article_id=f"wsj:STREAM-{index:03d}-{suffix}",
+            markdown=f"# Generated stream article {index}\n",
+        )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=34)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(
+            """
+            UPDATE embedding_storage SET vector = ?
+            WHERE article_id = (SELECT max(article_id) FROM embedding_storage)
+            """,
+            [[0.0] * 2048],
+        )
+
+    result = validate_embedding_corpus(config)
+
+    assert result.coverage is not None
+    assert result.coverage.canonical_articles == 34
+    assert {"zero_vector", "vector_hash_mismatch"} <= {
+        issue.code for issue in result.issues
+    }
+    assert sum(issue.code == "zero_vector" for issue in result.issues) == 1
+
+
 def test_public_validator_rejects_canonical_corpus_without_configuration(tmp_path):
     """Break caught: an exact empty embedding catalog reports complete coverage."""
 
@@ -7972,6 +8160,85 @@ def test_validator_rejects_visible_reconciliation_base_identity_mismatch(tmp_pat
     codes = {issue.code for issue in validate_embedding_outputs(config).issues}
 
     assert "invalid_reconciliation_action" in codes
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("raw", "model", "derivation", "vector"),
+)
+def test_validator_checks_hidden_reconciliation_vector_even_when_action_matches(
+    tmp_path, mutation
+):
+    """Break caught: action equality masks corrupt hidden physical vectors."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            FakeEmbeddingAdapter(),
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_full_reconciliation_visibility=lambda: (_ for _ in ()).throw(
+                    SyntheticInterruption()
+                ),
+            ),
+        )
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        if mutation == "raw":
+            db.execute(
+                "UPDATE embedding_storage SET raw_response_sha256 = ?",
+                ["a" * 64],
+            )
+            db.execute(
+                "UPDATE reconciliation_actions "
+                "SET expected_raw_response_sha256 = ?",
+                ["a" * 64],
+            )
+        elif mutation == "model":
+            db.execute("UPDATE embedding_storage SET response_model = 'safe-model'")
+            db.execute(
+                "UPDATE reconciliation_actions "
+                "SET expected_response_model = 'safe-model'"
+            )
+        elif mutation == "derivation":
+            db.execute(
+                "UPDATE embedding_storage SET derivation_kind = 'long_text_aggregate'"
+            )
+            db.execute(
+                "UPDATE reconciliation_actions "
+                "SET expected_derivation_kind = 'long_text_aggregate'"
+            )
+        else:
+            vector = list(
+                db.execute(
+                    "SELECT vector FROM embedding_storage "
+                    "WHERE modality = 'article_text'"
+                ).fetchone()[0]
+            )
+            vector[0] = 0.5
+            vector_sha256 = hashlib.sha256(
+                b"".join(struct.pack("<f", value) for value in vector)
+            ).hexdigest()
+            db.execute(
+                "UPDATE embedding_storage "
+                "SET vector = ?, stored_vector_sha256 = ? "
+                "WHERE modality = 'article_text'",
+                [vector, vector_sha256],
+            )
+            db.execute(
+                "UPDATE reconciliation_actions "
+                "SET expected_stored_vector_sha256 = ? "
+                "WHERE modality = 'article_text'",
+                [vector_sha256],
+            )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert codes & {"invalid_reconciliation_vector", "invalid_vector_hash"}
 
 
 def test_validator_accepts_pending_visible_multimodal_reconciliation(tmp_path):

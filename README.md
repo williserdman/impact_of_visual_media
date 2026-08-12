@@ -567,6 +567,12 @@ immutable generator. It requires provenance for every active and superseded
 composite, re-derives its content-free input identity, resolves both source
 links, and recomputes each active equal-weight normalized midpoint. An
 impossible midpoint is reported rather than skipped.
+Corpus scans use bounded cursor pages rather than loading article, work,
+provenance, or vector relations into Python. The largest vector page contains
+32 vectors, or eight rows for three-vector multimodal recomputation. Long-text
+aggregation retains one fixed 2,048-value accumulator and one current Markdown
+artifact. Rendition orphan checks use a content-free temporary SQLite reference
+index outside configured roots and remove it on return.
 It also validates part identities, limits, bounded attempts,
 lifecycle/vector checkpoints, and aggregate linkage. Every active and archived
 long-text aggregate must resolve all of its immutable part generations and
