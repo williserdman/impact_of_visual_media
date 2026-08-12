@@ -287,3 +287,48 @@ preprocessing smoke, live `run --help`, diff whitespace, tracked generated
 artifacts, stale current-schema claims, and both operator-document relative-link
 sets were clean. No full suite, shared dependency change, network, credential,
 licensed archive, or corpus operation was used.
+
+## Review-fix round 3
+
+Rendition publication now carries the exact held device/inode identities for
+the `renditions` and transform directories. Leaf verification reanchors those
+namespace identities from the output-root descriptor after codec decode, so a
+rename-and-replace during decode cannot be hidden by a still-open descriptor.
+The coordinator repeats the complete chain and leaf verification immediately
+after preparation failpoints and before `begin_run`; a replacement in the
+preparation-to-state boundary therefore fails `unsafe_rendition_output` with no
+run or work state.
+
+Read-only validation now rejects active or archived source provenance above the
+safe decode pixel ceiling even when the rendition facts are otherwise exact.
+It also catches invalid dimensions from the shared deterministic scale helper,
+emitting stable `invalid_image_input_provenance` issues instead of aborting the
+validation command. No catalog shape changed, so schema version 11 remains
+correct.
+
+Round-3 RED/GREEN evidence:
+
+- decode-time namespace replacement and preparation/publication-boundary
+  replacement: `2 failed, 159 deselected`, then
+  `2 passed, 159 deselected in 2.66s`;
+- after tightening the archived fixture to require the new ceiling diagnostic,
+  unsafe archived pixels and nonpositive dimensions:
+  `2 failed, 161 deselected`, then
+  `2 passed, 161 deselected in 10.18s`.
+
+Round-3 self-review confirmed that the post-decode reanchor resolves from the
+held output-root descriptor, the publication-boundary check repeats byte/hash/
+decode and regular/single-link/path-inode verification before catalog mutation,
+and archived policy does not depend on retained source bytes. Malformed source
+dimensions cannot reach an uncaught scaling failure.
+
+Final round-3 affected verification passed
+`18 passed, 145 deselected in 55.20s`. Changed-file Ruff passed. Embedding smoke
+returned `{"articles": 1, "embeddings": 1, "validation_ok": true}`;
+preprocessing smoke returned two articles, three successful inputs, one
+duplicate, zero failures, and validation true. Live `run --help` retained the
+three explicit roots, positive limit, bounded reprocess flag, and hosted
+authorization. Diff whitespace, tracked generated artifacts, stale current
+schema claims, and both operator-document relative links were clean. No full
+suite, shared dependency change, network, credential, licensed archive, or
+corpus operation was used.

@@ -169,7 +169,9 @@ bytes. An oversized but safely decodable image is EXIF-oriented, converted to
 RGB, aspect-scaled only when it exceeds the pixel ceiling, and encoded with the
 versioned Pillow 11.3.0 JPEG-85/4:2:0/Lanczos policy. The metadata-free
 rendition is staged, reopened, decoded, hashed, and atomically installed below
-the embedding output root before image work state can commit. This conservative
+the embedding output root. The full output-root/rendition/transform/leaf chain
+is reanchored after decode and reverified again immediately before run state can
+begin. This conservative
 transform is implementation policy pending confirmation by a credentialed
 synthetic pilot; changing it creates a new configuration identity. Unsupported,
 animated, corrupt, unsafe, or still-oversized input is terminal and publishes
@@ -344,8 +346,10 @@ no image bytes. Pass-through uses `exact-source-bytes-v1`; derived rows name
 the pinned transform and exact JPEG rendition supplied to the adapter.
 Read-only validation decodes current source and embedded bytes with the matching
 profile codec, proves their recorded hashes/formats/byte counts/dimensions/frame
-counts and
-the pass-through-versus-JPEG decision, rejects unknown provenance configuration
+counts, enforces the safe source-decode ceiling for current and archived
+generations, and proves the pass-through-versus-JPEG decision. Malformed
+dimensions become stable validation issues rather than aborting validation.
+Validation rejects unknown provenance configuration
 references, and descriptor-scans the rendition namespace without following
 symlinks. Unreferenced final and interrupted temporary renditions are reported
 as harmless orphans rather than deleted.

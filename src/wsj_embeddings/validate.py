@@ -858,6 +858,7 @@ def _validate_image_input_provenance(
             or source_width < 1
             or source_height < 1
             or source_frames != 1
+            or source_width * source_height > MAX_SAFE_DECODE_PIXELS
             or embedded_width < 1
             or embedded_height < 1
             or embedded_frames != 1
@@ -868,6 +869,12 @@ def _validate_image_input_provenance(
                 issues,
                 "invalid_image_input_provenance",
                 "image input provenance contains invalid content-free facts",
+            )
+        if source_width * source_height > MAX_SAFE_DECODE_PIXELS:
+            _append(
+                issues,
+                "invalid_image_input_provenance",
+                "source image exceeds the safe decode pixel ceiling",
             )
         source_data: bytes | None = None
         decoded_source = None
@@ -946,11 +953,22 @@ def _validate_image_input_provenance(
                 "invalid_image_input_provenance",
                 "within-limit supported source image was not passed through",
             )
-        expected_width, expected_height = scaled_image_dimensions(
-            source_width,
-            source_height,
-        )
-        if (embedded_width, embedded_height) != (expected_width, expected_height):
+        expected_dimensions: tuple[int, int] | None = None
+        try:
+            expected_dimensions = scaled_image_dimensions(
+                source_width,
+                source_height,
+            )
+        except ImageCodecError:
+            _append(
+                issues,
+                "invalid_image_input_provenance",
+                "derived image dimensions cannot be scaled from malformed source facts",
+            )
+        if expected_dimensions is not None and (
+            embedded_width,
+            embedded_height,
+        ) != expected_dimensions:
             _append(
                 issues,
                 "invalid_image_input_provenance",

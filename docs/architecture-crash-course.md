@@ -343,8 +343,10 @@ path remains unexecuted in the shared environment and requires Task 14/ticket
 15's clean-install synthetic verification.
 
 The rendition is staged below `renditions/<transform-hash>/`, fsynced, reopened,
-decoded, byte-compared, hashed, and atomically installed before the run or work
-state can commit. `image_input_provenance` stores source and exact embedded
+decoded, byte-compared, hashed, and atomically installed. After decode the full
+output-root/rendition/transform/leaf chain is reanchored, and an immutable
+identity token makes the coordinator repeat that verification immediately
+before run-state mutation. `image_input_provenance` stores source and exact embedded
 input hashes, formats, byte counts, dimensions, frame counts, transform identity, and the
 optional output-relative rendition path; it never stores bytes. Pass-through
 rows use `exact-source-bytes-v1` and no rendition path. Unsupported, animated,
@@ -622,7 +624,9 @@ For current image generations it uses the exact matching profile codec to decode
 source and embedded bytes and prove the declared hashes, formats, byte counts,
 dimensions, static-frame contract, pass-through decision, and exact
 aspect-scaled derived-JPEG contract. It also rejects
-globally unknown provenance configuration references and descriptor-scans the
+source dimensions above the safe decode ceiling for active and archived
+generations, reports malformed dimensions without aborting, rejects globally
+unknown provenance configuration references, and descriptor-scans the
 rendition namespace without following symlinks, reporting unsafe entries and
 unreferenced final or temporary files without deleting them.
 It also checks bounded long-text lifecycle/vector state and resolves complete

@@ -31,6 +31,7 @@ from wsj_embeddings.image_rendition import (
     PreparedImageInput,
     install_image_rendition,
     prepare_image_input,
+    verify_image_rendition,
 )
 from wsj_embeddings.long_text import (
     LongTextPart,
@@ -318,6 +319,24 @@ def run_embedding_pipeline(
                 )
                 for article_id, prepared_image in prepared_images.items()
             }
+            try:
+                for prepared_image in prepared_images.values():
+                    if (
+                        isinstance(prepared_image, _PreparedHeaderImage)
+                        and prepared_image.image_input is not None
+                        and prepared_image.image_input.rendition_identity is not None
+                    ):
+                        verify_image_rendition(
+                            output_descriptor,
+                            prepared_image.image_input.rendition_identity,
+                            prepared_image.image_input.data,
+                            prepared_image.image_input.embedded_info,
+                            active_image_codec,
+                        )
+            except ImageCodecError as error:
+                raise EmbeddingPipelineError(
+                    error.code, "image_preparation"
+                ) from error
         with catalog.transaction():
             catalog.begin_run(
                 run_id, configuration_identifier, profile, len(articles)

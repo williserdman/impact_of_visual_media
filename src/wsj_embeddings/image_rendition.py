@@ -232,6 +232,16 @@ class PreparedImageInput:
     embedded_info: ImageInfo
     transform_id: str
     rendition_relative_path: str | None = None
+    rendition_identity: RenditionIdentity | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RenditionIdentity:
+    """Held namespace identities for revalidation at publication boundary."""
+
+    relative_path: str
+    rendition_directory: tuple[int, int]
+    transform_directory: tuple[int, int]
 
 
 def prepare_image_input(
@@ -240,7 +250,8 @@ def prepare_image_input(
     codec: ImageCodec,
     expected_input_rules: str,
     expected_transform_id: str,
-    install_rendition: Callable[[bytes, ImageInfo, str], str] | None = None,
+    install_rendition: Callable[[bytes, ImageInfo, str], RenditionIdentity]
+    | None = None,
 ) -> PreparedImageInput:
     """Choose exact source bytes or one verified deterministic rendition."""
 
@@ -279,7 +290,7 @@ def prepare_image_input(
     derived_sha256 = hashlib.sha256(derived).hexdigest()
     if install_rendition is None:
         raise ImageCodecError("rendition_installation_unavailable")
-    relative_path = install_rendition(derived, derived_info, derived_sha256)
+    installation = install_rendition(derived, derived_info, derived_sha256)
     return PreparedImageInput(
         data=derived,
         source_sha256=source_sha256,
@@ -287,7 +298,8 @@ def prepare_image_input(
         embedded_input_sha256=derived_sha256,
         embedded_info=derived_info,
         transform_id=codec.transform_id,
-        rendition_relative_path=relative_path,
+        rendition_relative_path=installation.relative_path,
+        rendition_identity=installation,
     )
 
 
@@ -330,7 +342,7 @@ def install_image_rendition(
     *,
     transform_id: str,
     codec: ImageCodec,
-) -> str:
+) -> RenditionIdentity:
     """Stage, reopen, verify, and atomically install one immutable rendition."""
 
     transform_namespace = hashlib.sha256(transform_id.encode()).hexdigest()
@@ -409,11 +421,14 @@ def install_image_rendition(
             info,
             codec,
         )
+        installation = RenditionIdentity(
+            relative_path=f"renditions/{transform_namespace}/{final_name}",
+            rendition_directory=_directory_identity(rendition_descriptor),
+            transform_directory=_directory_identity(transform_descriptor),
+        )
         _verify_rendition_chain(
             output_descriptor,
-            rendition_descriptor,
-            transform_descriptor,
-            transform_namespace,
+            installation,
             final_name,
             data,
             info,
@@ -425,7 +440,27 @@ def install_image_rendition(
                 os.unlink(temporary_name, dir_fd=transform_descriptor)
             os.close(transform_descriptor)
         os.close(rendition_descriptor)
-    return f"renditions/{transform_namespace}/{final_name}"
+    return installation
+
+
+def verify_image_rendition(
+    output_descriptor: int,
+    installation: RenditionIdentity,
+    data: bytes,
+    info: ImageInfo,
+    codec: ImageCodec,
+) -> None:
+    """Revalidate an installed rendition immediately before catalog mutation."""
+
+    final_name = installation.relative_path.rsplit("/", 1)[-1]
+    _verify_rendition_chain(
+        output_descriptor,
+        installation,
+        final_name,
+        data,
+        info,
+        codec,
+    )
 
 
 def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
@@ -456,9 +491,7 @@ def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
 
 def _verify_rendition_chain(
     output_descriptor: int,
-    held_rendition_descriptor: int,
-    held_transform_descriptor: int,
-    transform_namespace: str,
+    installation: RenditionIdentity,
     final_name: str,
     expected_data: bytes,
     expected_info: ImageInfo,
@@ -474,18 +507,17 @@ def _verify_rendition_chain(
             _DIRECTORY_FLAGS,
             dir_fd=output_descriptor,
         )
-        _require_same_directory(
-            held_rendition_descriptor,
-            rendition_descriptor,
+        _require_directory_identity(
+            rendition_descriptor, installation.rendition_directory
         )
+        transform_namespace = installation.relative_path.split("/", 2)[1]
         transform_descriptor = os.open(
             transform_namespace,
             _DIRECTORY_FLAGS,
             dir_fd=rendition_descriptor,
         )
-        _require_same_directory(
-            held_transform_descriptor,
-            transform_descriptor,
+        _require_directory_identity(
+            transform_descriptor, installation.transform_directory
         )
         _verify_rendition_leaf(
             transform_descriptor,
@@ -494,6 +526,7 @@ def _verify_rendition_chain(
             expected_info,
             codec,
         )
+        _reanchor_namespace_identities(output_descriptor, installation)
     except OSError as error:
         raise ImageCodecError("unsafe_rendition_output") from error
     finally:
@@ -503,15 +536,53 @@ def _verify_rendition_chain(
             os.close(rendition_descriptor)
 
 
-def _require_same_directory(left_descriptor: int, right_descriptor: int) -> None:
-    left = os.fstat(left_descriptor)
-    right = os.fstat(right_descriptor)
+def _directory_identity(descriptor: int) -> tuple[int, int]:
+    observed = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode):
+        raise ImageCodecError("unsafe_rendition_output")
+    return observed.st_dev, observed.st_ino
+
+
+def _require_directory_identity(
+    descriptor: int,
+    expected: tuple[int, int],
+) -> None:
+    observed = os.fstat(descriptor)
     if (
-        not stat.S_ISDIR(left.st_mode)
-        or not stat.S_ISDIR(right.st_mode)
-        or (left.st_dev, left.st_ino) != (right.st_dev, right.st_ino)
+        not stat.S_ISDIR(observed.st_mode)
+        or (observed.st_dev, observed.st_ino) != expected
     ):
         raise ImageCodecError("unsafe_rendition_output")
+
+
+def _reanchor_namespace_identities(
+    output_descriptor: int,
+    installation: RenditionIdentity,
+) -> None:
+    rendition_descriptor: int | None = None
+    transform_descriptor: int | None = None
+    try:
+        rendition_descriptor = os.open(
+            "renditions", _DIRECTORY_FLAGS, dir_fd=output_descriptor
+        )
+        _require_directory_identity(
+            rendition_descriptor, installation.rendition_directory
+        )
+        transform_descriptor = os.open(
+            installation.relative_path.split("/", 2)[1],
+            _DIRECTORY_FLAGS,
+            dir_fd=rendition_descriptor,
+        )
+        _require_directory_identity(
+            transform_descriptor, installation.transform_directory
+        )
+    except OSError as error:
+        raise ImageCodecError("unsafe_rendition_output") from error
+    finally:
+        if transform_descriptor is not None:
+            os.close(transform_descriptor)
+        if rendition_descriptor is not None:
+            os.close(rendition_descriptor)
 
 
 def _verify_rendition_leaf(

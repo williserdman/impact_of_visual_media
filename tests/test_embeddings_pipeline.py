@@ -2964,6 +2964,89 @@ def test_rendition_ancestor_replacement_is_refused_before_state_commit(
         assert db.execute("SELECT count(*) FROM runs").fetchone() == (0,)
 
 
+def test_rendition_ancestor_replacement_during_reanchored_decode_is_refused(
+    tmp_path,
+):
+    """Break caught: namespace replacement during final decode escapes reanchor."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated decode-race oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    relative_path = attach_generated_header_image(config, source_bytes)
+    namespace = hashlib.sha256(ScenarioImageCodec.transform_id.encode()).hexdigest()
+    transform_path = config.embedding_output_root / "renditions" / namespace
+
+    class DecodeReplacingCodec(ScenarioImageCodec):
+        def __init__(self):
+            super().__init__(
+                {
+                    source_bytes: ImageInfo("PNG", 6000, 4000),
+                    derived_bytes: ImageInfo("JPEG", 5477, 3651),
+                }
+            )
+            self.derived_inspections = 0
+
+        def inspect(self, data: bytes, *, max_decode_pixels: int) -> ImageInfo:
+            result = super().inspect(data, max_decode_pixels=max_decode_pixels)
+            if data == derived_bytes:
+                self.derived_inspections += 1
+                if self.derived_inspections == 4:
+                    transform_path.replace(transform_path.with_suffix(".replaced"))
+                    transform_path.mkdir()
+            return result
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(
+            config,
+            ScenarioImageAdapter(),
+            limit=1,
+            image_codec=DecodeReplacingCodec(),
+        )
+
+    assert raised.value.code == "unsafe_rendition_output"
+    assert (config.source_root / relative_path).read_bytes() == source_bytes
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone() == (0,)
+
+
+def test_rendition_chain_is_reverified_at_publication_boundary(tmp_path):
+    """Break caught: namespace changes after preparation but before begin_run."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated boundary-race oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+
+    def replace_transform(relative_path: str) -> None:
+        transform_path = (config.embedding_output_root / relative_path).parent
+        transform_path.replace(transform_path.with_suffix(".replaced"))
+        transform_path.mkdir()
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(
+            config,
+            ScenarioImageAdapter(),
+            limit=1,
+            image_codec=codec,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_image_rendition_install=replace_transform,
+            ),
+        )
+
+    assert raised.value.code == "unsafe_rendition_output"
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone() == (0,)
+        assert db.execute("SELECT count(*) FROM embedding_work_items").fetchone() == (
+            0,
+        )
+
+
 def test_validator_requires_exact_image_provenance_and_rendition_bytes(tmp_path):
     """Break caught: image generations survive missing or changed embedded input."""
 
@@ -3201,6 +3284,90 @@ def test_validator_rejects_archived_within_limit_source_with_rendition(tmp_path)
     }
 
     assert "invalid_image_input_provenance" in codes
+
+
+def test_validator_rejects_archived_source_above_safe_decode_ceiling(tmp_path):
+    """Break caught: archived unsafe source dimensions retain valid provenance."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    first_source = b"generated archived unsafe pixels one"
+    second_source = b"generated archived unsafe pixels two"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    relative_path = attach_generated_header_image(config, first_source)
+    codec = ScenarioImageCodec(
+        {
+            first_source: ImageInfo("PNG", 6000, 4000),
+            second_source: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    (config.source_root / relative_path).write_bytes(second_source)
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        archived_generation = db.execute(
+            """
+            SELECT generation_run_id FROM embedding_generation_history
+            WHERE modality = 'header_image'
+            """
+        ).fetchone()[0]
+        db.execute(
+            """
+            UPDATE image_input_provenance
+            SET source_bytes = 6000000,
+                source_width = 10000, source_height = 5000,
+                embedded_width = 6324, embedded_height = 3162
+            WHERE generation_run_id = ?
+            """,
+            [archived_generation],
+        )
+
+    issues = validate_embedding_outputs(config, image_codec=codec).issues
+
+    assert any(
+        issue.code == "invalid_image_input_provenance"
+        and "safe decode pixel ceiling" in issue.message
+        for issue in issues
+    )
+
+
+def test_validator_reports_nonpositive_image_dimensions_without_aborting(tmp_path):
+    """Break caught: malformed dimensions raise from policy scaling."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated malformed-dimension oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("UPDATE image_input_provenance SET source_width = 0")
+
+    result = validate_embedding_outputs(config, image_codec=codec)
+
+    assert "invalid_image_input_provenance" in {
+        issue.code for issue in result.issues
+    }
 
 
 def test_validator_reports_image_provenance_with_unknown_configuration(tmp_path):
