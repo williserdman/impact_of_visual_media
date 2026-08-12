@@ -33,6 +33,7 @@ from wsj_embeddings import (
     EmbeddingValidationResult,
     FakeEmbeddingAdapter,
     run_embedding_pipeline,
+    validate_embedding_corpus,
     validate_embedding_outputs,
 )
 from wsj_embeddings.adapters import (
@@ -5168,6 +5169,147 @@ def test_changed_configuration_keeps_both_vectors_and_requires_validation_select
         config, configuration_id=prior_id
     ) == EmbeddingValidationResult(issues=())
 
+    public_result = validate_embedding_corpus(config)
+    assert public_result.configuration_id is None
+    assert public_result.coverage is None
+    assert {issue.code for issue in public_result.issues} == {
+        "configuration_id_required"
+    }
+    assert validate_embedding_corpus(
+        config,
+        configuration_id=active_id,
+    ).coverage is not None
+
+
+def test_public_validator_accounts_for_incomplete_stale_retryable_and_orphaned_output(
+    tmp_path,
+):
+    """Break caught: invalid output lacks content-free coverage categories."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated coverage image")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute("DELETE FROM embedding_storage")
+        connection.execute(
+            """
+            UPDATE embedding_work_storage
+            SET state = 'retryable', error_code = 'timeout', attempt_count = 1,
+                generation_run_id = NULL
+            WHERE modality = 'article_text'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE embedding_work_storage
+            SET state = 'terminal', error_code = 'deterministic_request',
+                attempt_count = 1, generation_run_id = NULL
+            WHERE modality = 'header_image'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE embedding_work_storage
+            SET state = 'stale_input', input_sha256 = NULL,
+                generation_run_id = NULL
+            WHERE modality = 'multimodal_article'
+            """
+        )
+    orphan_namespace = config.embedding_output_root / "renditions" / ("a" * 64)
+    orphan_namespace.mkdir(parents=True)
+    (orphan_namespace / f"{'b' * 64}.jpg").write_bytes(b"generated orphan")
+
+    result = validate_embedding_corpus(config)
+
+    assert result.coverage is not None
+    assert asdict(result.coverage) == {
+        "canonical_articles": 1,
+        "text_success": 0,
+        "text_failure": 1,
+        "header_present": 1,
+        "header_absent": 0,
+        "header_success": 0,
+        "header_failure": 1,
+        "multimodal_success": 0,
+        "multimodal_unavailable": 0,
+        "multimodal_failure": 1,
+        "stale_work": 1,
+        "unresolved_retryable_work": 1,
+        "orphan_artifacts": 1,
+    }
+    assert not result.ok
+    assert "orphan_image_rendition" in {issue.code for issue in result.issues}
+
+
+def test_public_validator_reports_tampered_vector(tmp_path):
+    """Break caught: public validation accepts a changed stored vector."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        vector = list(
+            connection.execute("SELECT vector FROM embedding_storage").fetchone()[0]
+        )
+        vector[0] = 0.5
+        connection.execute("UPDATE embedding_storage SET vector = ?", [vector])
+
+    result = validate_embedding_corpus(config)
+
+    assert not result.ok
+    assert {"nonunit_vector", "vector_hash_mismatch"} <= {
+        issue.code for issue in result.issues
+    }
+
+
+def test_public_validator_rejects_canonical_corpus_without_configuration(tmp_path):
+    """Break caught: an exact empty embedding catalog reports complete coverage."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+
+    result = validate_embedding_corpus(config)
+
+    assert result.configuration_id is None
+    assert result.coverage is None
+    assert result.issues == (
+        EmbeddingValidationIssue(
+            "missing_embedding_configuration",
+            "canonical articles lack an embedding configuration",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    (
+        "ALTER TABLE runs DROP COLUMN embeddings",
+        "UPDATE metadata SET value = '999' WHERE key = 'schema_version'",
+    ),
+    ids=("malformed", "unsupported"),
+)
+def test_public_validator_fails_closed_on_schema_without_mutation(tmp_path, damage):
+    """Break caught: public validation repairs or opens unsupported output."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(damage)
+    before = hashlib.sha256(config.embedding_catalog.read_bytes()).hexdigest()
+
+    result = validate_embedding_corpus(config)
+
+    assert result.configuration_id is None
+    assert result.coverage is None
+    assert result.issues == (
+        EmbeddingValidationIssue(
+            "unsupported_embedding_catalog",
+            "embedding catalog does not match the supported contract",
+        ),
+    )
+    assert hashlib.sha256(config.embedding_catalog.read_bytes()).hexdigest() == before
+
 
 def test_explicit_reprocess_is_bounded_and_audits_replaced_success(tmp_path):
     """Break caught: reprocess expands beyond its limit or destroys prior provenance."""
@@ -5236,6 +5378,32 @@ def test_validator_reports_malformed_generation_history(tmp_path):
             ),
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    (
+        ("article_id", "wsj:ORPHANED-HISTORY"),
+        ("configuration_id", "f" * 64),
+    ),
+    ids=("missing-work-identity", "missing-configuration-identity"),
+)
+def test_validator_rejects_generation_history_without_work_configuration_identity(
+    tmp_path,
+    column,
+    value,
+):
+    """Break caught: history detaches from its durable work/config identity."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1, reprocess=True)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(f"UPDATE embedding_generation_history SET {column} = ?", [value])
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_generation_identity_reference" in codes
 
 
 @pytest.mark.parametrize(

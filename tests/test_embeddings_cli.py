@@ -149,6 +149,83 @@ def test_embedding_smoke_is_fixture_safe_and_deterministic(capsys) -> None:
     assert line == f"{json.dumps(json.loads(line), sort_keys=True)}\n"
 
 
+def test_validate_reports_fresh_corpus_coverage_without_adapter_or_mutation(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    """Break caught: validation lacks public content-free corpus accounting."""
+
+    roots = write_generated_cli_fixture(tmp_path)
+    assert (
+        main(
+            [
+                "run",
+                *root_arguments(*roots),
+                "--full",
+                "--authorize-hosted-processing",
+            ],
+            adapter_factory=RecordingFakeAdapter,
+        )
+        == 0
+    )
+    capsys.readouterr()
+    configuration_identifier = configuration_id(FakeEmbeddingAdapter.profile)
+    before = {
+        path.relative_to(tmp_path).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for root in roots
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+    def fail_if_constructed():
+        raise AssertionError("validation constructed an embedding adapter")
+
+    exit_code = main(
+        [
+            "validate",
+            *root_arguments(*roots),
+            "--configuration-id",
+            configuration_identifier,
+        ],
+        environment={},
+        adapter_factory=fail_if_constructed,
+    )
+    line = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert json.loads(line) == {
+        "configuration_id": configuration_identifier,
+        "coverage": {
+            "canonical_articles": 2,
+            "header_absent": 1,
+            "header_failure": 0,
+            "header_present": 1,
+            "header_success": 1,
+            "multimodal_failure": 0,
+            "multimodal_success": 1,
+            "multimodal_unavailable": 1,
+            "orphan_artifacts": 0,
+            "stale_work": 0,
+            "text_failure": 0,
+            "text_success": 2,
+            "unresolved_retryable_work": 0,
+        },
+        "issues": [],
+        "validation_ok": True,
+    }
+    assert line == f"{json.dumps(json.loads(line), sort_keys=True)}\n"
+    assert before == {
+        path.relative_to(tmp_path).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for root in roots
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 def test_inventory_is_credential_free_read_only_and_never_constructs_adapter(
     tmp_path: Path,
     capsys,

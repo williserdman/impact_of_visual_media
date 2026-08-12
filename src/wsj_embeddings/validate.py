@@ -78,6 +78,59 @@ class EmbeddingValidationResult:
         return not self.issues
 
 
+@dataclass(frozen=True, slots=True)
+class EmbeddingCoverage:
+    """Content-free accounting for one immutable embedding configuration."""
+
+    canonical_articles: int
+    text_success: int
+    text_failure: int
+    header_present: int
+    header_absent: int
+    header_success: int
+    header_failure: int
+    multimodal_success: int
+    multimodal_unavailable: int
+    multimodal_failure: int
+    stale_work: int
+    unresolved_retryable_work: int
+    orphan_artifacts: int
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingCorpusValidationResult:
+    """Integrity issues and coverage for one selected configuration."""
+
+    configuration_id: str | None
+    coverage: EmbeddingCoverage | None
+    issues: tuple[EmbeddingValidationIssue, ...]
+
+    @property
+    def ok(self) -> bool:
+        return not self.issues
+
+
+def validate_embedding_corpus(
+    config: EmbeddingPipelineConfig,
+    *,
+    configuration_id: str | None = None,
+    image_codec: ImageCodec | None = None,
+) -> EmbeddingCorpusValidationResult:
+    """Return read-only integrity and content-free coverage for one config."""
+
+    issues, selected_configuration_id, coverage = _validate_embedding_state(
+        config,
+        configuration_id=configuration_id,
+        image_codec=image_codec,
+        include_coverage=True,
+    )
+    return EmbeddingCorpusValidationResult(
+        configuration_id=selected_configuration_id,
+        coverage=coverage,
+        issues=issues,
+    )
+
+
 def validate_embedding_outputs(
     config: EmbeddingPipelineConfig,
     *,
@@ -86,8 +139,32 @@ def validate_embedding_outputs(
 ) -> EmbeddingValidationResult:
     """Check embedding output against canonical generated preprocessing state."""
 
+    issues, _selected_configuration_id, _coverage = _validate_embedding_state(
+        config,
+        configuration_id=configuration_id,
+        image_codec=image_codec,
+        include_coverage=False,
+    )
+    return EmbeddingValidationResult(issues)
+
+
+def _validate_embedding_state(
+    config: EmbeddingPipelineConfig,
+    *,
+    configuration_id: str | None,
+    image_codec: ImageCodec | None,
+    include_coverage: bool,
+) -> tuple[
+    tuple[EmbeddingValidationIssue, ...],
+    str | None,
+    EmbeddingCoverage | None,
+]:
+    """Validate and optionally account within one read-only catalog snapshot."""
+
     config.validate()
     issues: list[EmbeddingValidationIssue] = []
+    selected_configuration_id: str | None = None
+    coverage: EmbeddingCoverage | None = None
     try:
         with EmbeddingCatalog.read_only(config.embedding_catalog) as catalog:
             articles = _canonical_articles(config, issues)
@@ -96,11 +173,15 @@ def validate_embedding_outputs(
                 _validate_run_metrics(catalog.connection, issues)
                 _validate_run_lifecycle(catalog.connection, issues)
                 _validate_reconciliation_actions(catalog.connection, issues)
+                _validate_global_generation_history_references(
+                    catalog.connection,
+                    issues,
+                )
                 _validate_global_image_provenance_references(
                     catalog.connection,
                     issues,
                 )
-                _validate_rendition_artifacts(
+                orphan_artifacts = _validate_rendition_artifacts(
                     catalog.connection,
                     config,
                     issues,
@@ -162,6 +243,23 @@ def validate_embedding_outputs(
                     _validate_generation_history(
                         catalog.connection, selected_configuration_id, issues
                     )
+                    if include_coverage:
+                        coverage = _coverage_for_configuration(
+                            catalog.connection,
+                            articles,
+                            selected_configuration_id,
+                            orphan_artifacts=orphan_artifacts,
+                        )
+                elif (
+                    include_coverage
+                    and articles
+                    and not _connection_has_configurations(catalog.connection)
+                ):
+                    _append(
+                        issues,
+                        "missing_embedding_configuration",
+                        "canonical articles lack an embedding configuration",
+                    )
     except EmbeddingCatalogError:
         issues.append(
             EmbeddingValidationIssue(
@@ -176,8 +274,20 @@ def validate_embedding_outputs(
                 "embedding catalog could not be queried with the supported schema",
             )
         )
-    return EmbeddingValidationResult(
-        tuple(sorted(set(issues), key=lambda issue: (issue.code, issue.message)))
+    return (
+        tuple(sorted(set(issues), key=lambda issue: (issue.code, issue.message))),
+        selected_configuration_id,
+        coverage,
+    )
+
+
+def _connection_has_configurations(connection: duckdb.DuckDBPyConnection) -> bool:
+    """Return whether an exact catalog contains an embedding configuration."""
+
+    return bool(
+        connection.execute("SELECT count(*) FROM embedding_configurations").fetchone()[
+            0
+        ]
     )
 
 
@@ -453,6 +563,65 @@ def _select_configuration_id(
     return configuration_ids[0] if configuration_ids else None
 
 
+def _coverage_for_configuration(
+    connection: duckdb.DuckDBPyConnection,
+    articles: dict[str, CanonicalArticle],
+    configuration_id: str,
+    *,
+    orphan_artifacts: int,
+) -> EmbeddingCoverage:
+    """Account for canonical eligibility and current durable work states."""
+
+    work = {
+        (str(article_id), str(modality)): str(state)
+        for article_id, modality, state in connection.execute(
+            """
+            SELECT article_id, modality, state
+            FROM embedding_work_items
+            WHERE configuration_id = ?
+            """,
+            [configuration_id],
+        ).fetchall()
+    }
+    text_success = sum(
+        work.get((article_id, EmbeddingModality.ARTICLE_TEXT.value))
+        == WorkState.SUCCEEDED.value
+        for article_id in articles
+    )
+    header_present_ids = {
+        article_id
+        for article_id, article in articles.items()
+        if article.header_image_path is not None
+    }
+    header_success = sum(
+        work.get((article_id, EmbeddingModality.HEADER_IMAGE.value))
+        == WorkState.SUCCEEDED.value
+        for article_id in header_present_ids
+    )
+    multimodal_success = sum(
+        work.get((article_id, EmbeddingModality.MULTIMODAL_ARTICLE.value))
+        == WorkState.SUCCEEDED.value
+        for article_id in articles
+    )
+    return EmbeddingCoverage(
+        canonical_articles=len(articles),
+        text_success=text_success,
+        text_failure=len(articles) - text_success,
+        header_present=len(header_present_ids),
+        header_absent=len(articles) - len(header_present_ids),
+        header_success=header_success,
+        header_failure=len(header_present_ids) - header_success,
+        multimodal_success=multimodal_success,
+        multimodal_unavailable=len(articles) - len(header_present_ids),
+        multimodal_failure=len(header_present_ids) - multimodal_success,
+        stale_work=sum(state == WorkState.STALE_INPUT.value for state in work.values()),
+        unresolved_retryable_work=sum(
+            state == WorkState.RETRYABLE.value for state in work.values()
+        ),
+        orphan_artifacts=orphan_artifacts,
+    )
+
+
 def _validate_run_coverage(
     connection: duckdb.DuckDBPyConnection,
     configuration_id: str,
@@ -501,6 +670,50 @@ def _validate_run_coverage(
             issues,
             "missing_published_embedding",
             "successful embedding runs lack their published vectors",
+        )
+
+
+def _validate_global_generation_history_references(
+    connection: duckdb.DuckDBPyConnection,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Require history to retain its configuration and durable work identity."""
+
+    unsupported_modality = connection.execute(
+        """
+        SELECT count(*) FROM embedding_generation_history
+        WHERE modality NOT IN ('article_text', 'header_image', 'multimodal_article')
+        """
+    ).fetchone()[0]
+    if unsupported_modality:
+        _append(
+            issues,
+            "invalid_generation_modality",
+            "embedding generation history uses an unsupported modality",
+        )
+    invalid = connection.execute(
+        """
+        SELECT count(*)
+        FROM embedding_generation_history AS history
+        LEFT JOIN embedding_configurations AS configuration
+          ON configuration.configuration_id = history.configuration_id
+        LEFT JOIN runs AS generation_run
+          ON generation_run.run_id = history.generation_run_id
+         AND generation_run.configuration_id = history.configuration_id
+        LEFT JOIN embedding_work_storage AS work
+          ON work.article_id = history.article_id
+         AND work.modality = history.modality
+         AND work.configuration_id = history.configuration_id
+        WHERE configuration.configuration_id IS NULL
+           OR generation_run.run_id IS NULL
+           OR work.article_id IS NULL
+        """
+    ).fetchone()[0]
+    if invalid:
+        _append(
+            issues,
+            "invalid_generation_identity_reference",
+            "embedding generation history lacks its work or configuration identity",
         )
 
 
@@ -1352,23 +1565,29 @@ def _validate_rendition_artifacts(
     connection: duckdb.DuckDBPyConnection,
     config: EmbeddingPipelineConfig,
     issues: list[EmbeddingValidationIssue],
-) -> None:
+) -> int:
     """Scan the descriptor-anchored rendition namespace without following links."""
+    return _scan_rendition_artifacts(connection, config, issues)
 
-    referenced = {
-        str(row[0])
-        for row in connection.execute(
-            """
-            SELECT rendition_relative_path
-            FROM image_input_provenance
-            WHERE rendition_relative_path IS NOT NULL
-            """
-        ).fetchall()
-    }
+
+def _scan_rendition_artifacts(
+    connection: duckdb.DuckDBPyConnection,
+    config: EmbeddingPipelineConfig,
+    issues: list[EmbeddingValidationIssue],
+) -> int:
+    orphan_count = 0
+
+    def unsafe_entry() -> None:
+        _append(
+            issues,
+            "unsafe_image_rendition_entry",
+            "rendition namespace contains an unsafe entry",
+        )
+
     try:
         output_descriptor = os.open(config.embedding_output_root, _DIRECTORY_FLAGS)
     except OSError:
-        return
+        return 0
     try:
         try:
             rendition_descriptor = os.open(
@@ -1377,25 +1596,17 @@ def _validate_rendition_artifacts(
                 dir_fd=output_descriptor,
             )
         except FileNotFoundError:
-            return
+            return 0
         except OSError:
-            _append(
-                issues,
-                "unsafe_image_rendition_entry",
-                "rendition namespace contains an unsafe entry",
-            )
-            return
+            unsafe_entry()
+            return 0
         try:
             with os.scandir(rendition_descriptor) as namespaces:
                 for namespace in namespaces:
                     if namespace.is_symlink() or not namespace.is_dir(
                         follow_symlinks=False
                     ):
-                        _append(
-                            issues,
-                            "unsafe_image_rendition_entry",
-                            "rendition namespace contains an unsafe entry",
-                        )
+                        unsafe_entry()
                         continue
                     namespace_stat = namespace.stat(follow_symlinks=False)
                     try:
@@ -1405,11 +1616,7 @@ def _validate_rendition_artifacts(
                             dir_fd=rendition_descriptor,
                         )
                     except OSError:
-                        _append(
-                            issues,
-                            "unsafe_image_rendition_entry",
-                            "rendition namespace contains an unsafe entry",
-                        )
+                        unsafe_entry()
                         continue
                     try:
                         opened_stat = os.fstat(namespace_descriptor)
@@ -1418,57 +1625,48 @@ def _validate_rendition_artifacts(
                             or (namespace_stat.st_dev, namespace_stat.st_ino)
                             != (opened_stat.st_dev, opened_stat.st_ino)
                         ):
-                            _append(
-                                issues,
-                                "unsafe_image_rendition_entry",
-                                "rendition namespace contains an unsafe entry",
-                            )
+                            unsafe_entry()
                             continue
-                        _scan_rendition_namespace(
-                            namespace.name,
-                            namespace_descriptor,
-                            referenced,
-                            issues,
-                        )
+                        with os.scandir(namespace_descriptor) as entries:
+                            for entry in entries:
+                                if entry.is_symlink() or not entry.is_file(
+                                    follow_symlinks=False
+                                ):
+                                    unsafe_entry()
+                                    continue
+                                relative_path = (
+                                    f"renditions/{namespace.name}/{entry.name}"
+                                )
+                                if connection.execute(
+                                    """
+                                    SELECT 1 FROM image_input_provenance
+                                    WHERE rendition_relative_path = ? LIMIT 1
+                                    """,
+                                    [relative_path],
+                                ).fetchone() is not None:
+                                    continue
+                                orphan_count += 1
+                                _append(
+                                    issues,
+                                    (
+                                        "orphan_image_rendition_temp"
+                                        if entry.name.endswith(".tmp")
+                                        else "orphan_image_rendition"
+                                    ),
+                                    (
+                                        "unreferenced rendition staging "
+                                        "file remains"
+                                        if entry.name.endswith(".tmp")
+                                        else "unreferenced rendition file remains"
+                                    ),
+                                )
                     finally:
                         os.close(namespace_descriptor)
         finally:
             os.close(rendition_descriptor)
     finally:
         os.close(output_descriptor)
-
-
-def _scan_rendition_namespace(
-    namespace: str,
-    directory_descriptor: int,
-    referenced: set[str],
-    issues: list[EmbeddingValidationIssue],
-) -> None:
-    with os.scandir(directory_descriptor) as entries:
-        for entry in entries:
-            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
-                _append(
-                    issues,
-                    "unsafe_image_rendition_entry",
-                    "rendition namespace contains an unsafe entry",
-                )
-                continue
-            relative_path = f"renditions/{namespace}/{entry.name}"
-            if relative_path in referenced:
-                continue
-            _append(
-                issues,
-                (
-                    "orphan_image_rendition_temp"
-                    if entry.name.endswith(".tmp")
-                    else "orphan_image_rendition"
-                ),
-                (
-                    "unreferenced rendition staging file remains"
-                    if entry.name.endswith(".tmp")
-                    else "unreferenced rendition file remains"
-                ),
-            )
+    return orphan_count
 
 
 def _validate_multimodal_provenance(

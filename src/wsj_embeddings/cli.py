@@ -28,6 +28,7 @@ from wsj_embeddings.pipeline import (
     run_embedding_pipeline,
 )
 from wsj_embeddings.smoke import run_embedding_smoke
+from wsj_embeddings.validate import validate_embedding_corpus
 
 _OPTION_NAME = re.compile(r"(?<!\w)(--?[A-Za-z][A-Za-z0-9-]*)")
 _OPERATIONAL_ERROR_CODES = {
@@ -67,6 +68,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("pilot")
     inventory = commands.add_parser("inventory")
     _add_root_arguments(inventory)
+    validate = commands.add_parser("validate")
+    _add_root_arguments(validate)
+    validate.add_argument("--configuration-id")
     run = commands.add_parser("run")
     _add_root_arguments(run)
     scope = run.add_mutually_exclusive_group(required=True)
@@ -149,6 +153,18 @@ def main(
             return _report_operational_error(error)
         print(json.dumps(asdict(result), sort_keys=True))
         return 0
+    if args.command == "validate":
+        try:
+            result = validate_embedding_corpus(
+                _config_from_args(args),
+                configuration_id=args.configuration_id,
+            )
+        except _OPERATIONAL_ERRORS as error:
+            return _report_operational_error(error)
+        payload = asdict(result)
+        payload["validation_ok"] = result.ok
+        print(json.dumps(payload, sort_keys=True))
+        return 0 if result.ok else 1
     if args.command == "run":
         try:
             config = _config_from_args(

@@ -16,14 +16,19 @@ from wsj_embeddings.pipeline import (
 )
 from wsj_embeddings.smoke import EmbeddingSmokeResult, run_embedding_smoke
 from wsj_embeddings.validate import (
+    EmbeddingCorpusValidationResult,
+    EmbeddingCoverage,
     EmbeddingValidationIssue,
     EmbeddingValidationResult,
+    validate_embedding_corpus,
     validate_embedding_outputs,
 )
 
 __all__ = [
     "EmbeddingAdapter",
     "EmbeddingCatalogError",
+    "EmbeddingCorpusValidationResult",
+    "EmbeddingCoverage",
     "EmbeddingInventoryResult",
     "EmbeddingPipelineConfig",
     "EmbeddingPipelineFailpoints",
@@ -37,5 +42,6 @@ __all__ = [
     "inventory_embedding_articles",
     "run_embedding_pipeline",
     "run_embedding_smoke",
+    "validate_embedding_corpus",
     "validate_embedding_outputs",
 ]

@@ -128,20 +128,23 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/batching.py` | mixed-input payload packing, bounded concurrency, rate-aware retry waves, and safe observations | HTTP serialization or catalog publication |
 | `wsj_embeddings/catalog.py` | separate schema version 14, canonical current views, and bounded lifecycle/generation/provenance/reconciliation transactions | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection/full traversal, text/image encoding, composite derivation, publication, and reconciliation | hosted credential loading |
-| `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
+| `wsj_embeddings/validate.py` | read-only schema, corpus coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
 | `wsj_embeddings/pilot.py` | fixed generated hosted text/image/boundary probes and content-free observations | corpus or filesystem input/output |
-| `wsj_embeddings/cli.py` | `smoke`, `pilot`, credential-free `inventory`, and authorized exactly-one-of limit/full production `run` with bounded reprocess | preprocessing mutation |
+| `wsj_embeddings/cli.py` | `smoke`, `pilot`, credential-free `inventory`/`validate`, and authorized exactly-one-of limit/full production `run` with bounded reprocess | preprocessing mutation |
 
 The installed `wsj-embeddings` command accepts `smoke`, `pilot`, `inventory`,
-and `run`. `smoke`
+`validate`, and `run`. `smoke`
 creates three disjoint temporary roots, publishes one fake 2,048-dimensional
 `article_text` vector, validates it, emits
 `{"articles": 1, "embeddings": 1, "validation_ok": true}`, and deletes the
 temporary fixture. `pilot` has no selectors and, only with `JINA_API_KEY`, uses
 the hosted adapter for its fixed generated probes without creating a catalog or
 output root. `inventory` performs a read-only aggregate over canonical winners
-without constructing an adapter or requiring `JINA_API_KEY`. `run` requires
+without constructing an adapter or requiring `JINA_API_KEY`. `validate` opens
+both exact-schema catalogs read-only, requires an explicit configuration when
+multiple identities coexist, and returns stable integrity issues plus
+content-free coverage without constructing an adapter. `run` requires
 exactly one of positive `--limit` or explicit `--full`, three explicit disjoint
 roots, and `--authorize-hosted-processing`. Limited mode selects by
 `ORDER BY article_id LIMIT ?` and never reconciles unselected rows. Full mode
@@ -671,7 +674,11 @@ canonical Markdown to verify exact ordered, gapless, non-overlapping character
 and UTF-8 byte spans plus slice hashes. Messages
 never contain Markdown, vector values, or credentials. When configurations
 coexist, validation requires one explicit configuration identity and never
-mixes generations. Validation detects but does not repair state.
+mixes generations. Its public corpus result accounts for canonical articles;
+text success/failure; header present/absent/success/failure; multimodal
+success/unavailable/failure; stale and unresolved retryable work; and orphan
+rendition files. Validation detects but does not repair state, use a hosted
+credential, or make a network request.
 
 ## 11. Test map
 
@@ -689,7 +696,7 @@ directories. They must never read the licensed archive.
 | `test_validate.py` | every cross-artifact invariant and streaming behavior |
 | `test_smoke.py` | complete generated-fixture workflow and isolation from configured data |
 | `test_embeddings_pipeline.py` | exact downstream schema, no-follow reads, long-text boundaries/resume/aggregation, publication, run coverage, and validation |
-| `test_embeddings_cli.py` | deterministic smoke, inventory, authorization, and bounded-run public CLI seams |
+| `test_embeddings_cli.py` | deterministic smoke, inventory, validation coverage, authorization, and bounded-run public CLI seams |
 
 The standard verification set is `pytest -q`, `ruff check .`,
 `wsj-pipeline smoke`, and `wsj-embeddings smoke`.

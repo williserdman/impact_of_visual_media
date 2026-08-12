@@ -76,12 +76,13 @@ smoke                     run the complete workflow on generated temporary fixtu
 Argument parsing, configuration, lock, schema, or unexpected pipeline errors
 can exit before a JSON summary is produced.
 
-The separate `wsj-embeddings` CLI has these four subcommands:
+The separate `wsj-embeddings` CLI has these five subcommands:
 
 ```text
 smoke      publish and validate one generated article text embedding
 pilot      send fixed generated text/image probes to hosted Jina v4
 inventory  count canonical/text/header eligibility without credentials
+validate   check integrity and content-free coverage without credentials
 run        embed or reprocess a positive lexical article-id limit after authorization
 ```
 
@@ -106,7 +107,7 @@ run. Automated tests never call the hosted API: they inject simulated HTTP
 responses or a fake adapter at the same public seams.
 
 `wsj-embeddings` does not accept the preprocessing TOML configuration and has
-no implicit root defaults. `inventory` and `run` require explicit source,
+no implicit root defaults. `inventory`, `validate`, and `run` require explicit source,
 preprocessing-output, and embedding-output roots; resolving them must produce
 three pairwise-disjoint paths.
 
@@ -221,6 +222,25 @@ scope. Success JSON includes content-free `reused`, `attempted`, `succeeded`,
 `retryable`, `terminal`, `interrupted`, `header_absent`, and `header_failed`
 counts plus the deterministic, content-free `configuration_id` required for
 research queries.
+
+Validate the completed corpus without a Jina credential or hosted request:
+
+```bash
+.venv/bin/wsj-embeddings validate \
+  --source-root data/wsj_archive \
+  --preprocessing-output-root data/processed/wsj \
+  --embedding-output-root data/embeddings/wsj \
+  --configuration-id '<configuration_id>'
+```
+
+`--configuration-id` may be omitted only while the catalog contains zero or
+one configuration. The result reports stable integrity issues and content-free
+counts for canonical articles; text success/failure; header present/absent,
+success/failure; multimodal success/unavailable/failure; stale work;
+unresolved retryable work; and orphan rendition artifacts. A nonempty issue
+list returns a nonzero status. Validation opens both catalogs read-only, does
+not construct an embedding adapter, and never repairs, migrates, deletes, or
+downloads anything.
 
 Then inventory the configured archive without changing either source or
 generated state:

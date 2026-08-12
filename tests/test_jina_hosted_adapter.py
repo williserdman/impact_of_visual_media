@@ -235,6 +235,30 @@ def test_hosted_adapter_serializes_fixed_contract_and_maps_indexed_vectors():
     )
 
 
+def test_hosted_adapter_normalizes_safe_numeric_usage_strings() -> None:
+    """Break caught: validated usage numbers persist as JSON strings."""
+
+    transport = RecordingTransport(
+        JinaHttpResponse(
+            status_code=200,
+            headers={},
+            body=json.dumps(
+                {
+                    "model": "jina-embeddings-v4",
+                    "data": [{"index": 0, "embedding": _embedding(1.0, 0.0)}],
+                    "usage": {"prompt_tokens": "11", "total_tokens": "11.5"},
+                }
+            ).encode(),
+        )
+    )
+
+    result = _adapter(transport).embed(
+        (JinaEmbeddingInput.text("generated test text"),)
+    )
+
+    assert result.usage == {"prompt_tokens": 11.0, "total_tokens": 11.5}
+
+
 def test_hosted_batch_returns_independent_indexed_mixed_item_outcomes():
     """Break caught: one malformed batch item discards validated siblings."""
 

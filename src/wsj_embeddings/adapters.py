@@ -651,7 +651,7 @@ def _safe_usage(value: object) -> dict[str, int | float]:
         count = value.get(key)
         number = _safe_numeric_value(count, maximum=None)
         if number is not None:
-            usage[key] = count
+            usage[key] = number
     return usage
 
 
