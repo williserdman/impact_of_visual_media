@@ -669,7 +669,7 @@ reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
-and local header-image embeddings. It checks the exact version-15 embedding
+and local header-image embeddings. It checks the exact version-16 embedding
 schema first, opens the
 preprocessing catalog through its public exact-schema contract, and reports
 stable sorted issues for configuration identity/reference failures, malformed
