@@ -2135,8 +2135,12 @@ def test_batch_auth_failure_stops_run_scope_without_transient_retry(tmp_path, co
     assert len(adapter.calls) == 1
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
-            "SELECT state, attempt_count FROM embedding_work_items"
-        ).fetchall() == [("in_progress", 1), ("not_applicable", 0)]
+            "SELECT modality, state, attempt_count FROM embedding_work_items "
+            "ORDER BY modality"
+        ).fetchall() == [
+            ("article_text", "in_progress", 1),
+            ("header_image", "not_applicable", 0),
+        ]
         assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
         assert db.execute(
             """
@@ -5131,9 +5135,11 @@ def test_pillow_jpeg_build_identity_changes_configuration_and_mismatch_fails_clo
     second_codec = PillowImageCodec()
     first_adapter = JinaEmbeddingAdapter(
         environment={"JINA_API_KEY": "generated-fixture-key"},
+        observed_model="jina-embeddings-v4",
     )
     second_adapter = JinaEmbeddingAdapter(
         environment={"JINA_API_KEY": "generated-fixture-key"},
+        observed_model="jina-embeddings-v4",
     )
     first_adapter.bind_image_codec(first_codec)
     second_adapter.bind_image_codec(second_codec)
@@ -5717,6 +5723,7 @@ def test_replaying_unchanged_success_reuses_checkpoint_without_adapter_call(tmp_
             SELECT state, attempt_count, error_code, status_code,
                    retry_after_seconds
             FROM embedding_work_items
+            WHERE modality = 'article_text'
             """
         ).fetchone() == ("succeeded", 1, None, None, None)
 
@@ -6507,7 +6514,8 @@ def test_restart_recovers_in_progress_work_after_adapter_interruption(
 
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
-            "SELECT state, attempt_count FROM embedding_work_items"
+            "SELECT state, attempt_count FROM embedding_work_items "
+            "WHERE modality = 'article_text'"
         ).fetchone() == ("in_progress", 1)
         assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
 
@@ -6583,7 +6591,8 @@ def test_success_checkpoint_survives_interruptions_around_catalog_commit(
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (1,)
         assert db.execute(
-            "SELECT state, attempt_count FROM embedding_work_items"
+            "SELECT state, attempt_count FROM embedding_work_items "
+            "WHERE modality = 'article_text'"
         ).fetchone() == ("succeeded", 1 if commit_side == "after" else 2)
 
 
@@ -6707,6 +6716,7 @@ def test_terminal_failure_is_visible_and_not_retried_implicitly(tmp_path):
             SELECT state, attempt_count, error_code, status_code,
                    retry_after_seconds
             FROM embedding_work_items
+            WHERE modality = 'article_text'
             """
         ).fetchone() == ("terminal", 1, "deterministic_request", 413, None)
 
@@ -6780,7 +6790,7 @@ def test_changed_input_removes_stale_active_vector_until_recovery(
             """
             SELECT state
             FROM embedding_work_items
-            WHERE configuration_id = ?
+            WHERE configuration_id = ? AND modality = 'article_text'
             """,
             [active_configuration_id],
         ).fetchone() == (expected_state,)
@@ -8123,31 +8133,142 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
     with EmbeddingCatalog.open(config.embedding_catalog):
         pass
     with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP VIEW embeddings")
+        db.execute("DROP VIEW embedding_work_items")
+        db.execute("DROP TABLE reconciliation_actions")
+        db.execute("DROP TABLE full_run_articles")
         db.execute("DROP TABLE image_input_provenance")
         db.execute("DROP TABLE long_text_part_generations")
-        for column in ("char_start", "char_end", "byte_start", "byte_end"):
-            db.execute(f"ALTER TABLE long_text_parts DROP COLUMN {column}")
-        for column in ("tokenizer_engine", "long_text_part_attempt_limit"):
+        db.execute(
+            "ALTER TABLE embedding_work_storage RENAME TO embedding_work_items"
+        )
+        db.execute("ALTER TABLE embedding_storage RENAME TO embeddings")
+        db.execute(
+            "ALTER TABLE embedding_configurations RENAME COLUMN "
+            "client_api_contract_version TO observed_api_version"
+        )
+        for column in (
+            "tokenizer_engine",
+            "long_text_part_attempt_limit",
+            "batch_max_items",
+            "batch_max_estimated_tokens",
+            "batch_max_encoded_bytes",
+            "batch_max_response_bytes",
+            "batch_max_concurrency",
+            "batch_max_attempts",
+            "batch_initial_backoff_seconds",
+            "batch_max_backoff_seconds",
+        ):
             db.execute(
                 f"ALTER TABLE embedding_configurations DROP COLUMN {column}"
             )
-        expected_v8_columns = {
-            table: columns
-            for table, columns in EXPECTED_EMBEDDING_TABLE_COLUMNS.items()
-            if table
-            not in {"image_input_provenance", "long_text_part_generations"}
+        for column in (
+            "scope",
+            "status",
+            "discovery_complete",
+            "reconciliation_complete",
+            "hosted_requests",
+            "hosted_retries",
+            "usage_json",
+            "throttles",
+            "elapsed_seconds",
+            "finished_at",
+        ):
+            db.execute(f"ALTER TABLE runs DROP COLUMN {column}")
+        for table in ("embeddings", "embedding_generation_history"):
+            for column in (
+                "derivation_kind",
+                "raw_response_sha256",
+                "response_model",
+            ):
+                db.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        for column in (
+            "char_start",
+            "char_end",
+            "byte_start",
+            "byte_end",
+            "derivation_kind",
+            "raw_response_sha256",
+            "response_model",
+        ):
+            db.execute(f"ALTER TABLE long_text_parts DROP COLUMN {column}")
+        expected_v8_columns = {}
+        v8_excluded_tables = {
+            "full_run_articles",
+            "image_input_provenance",
+            "long_text_part_generations",
+            "reconciliation_actions",
         }
+        v8_table_names = {
+            "embedding_work_storage": "embedding_work_items",
+            "embedding_storage": "embeddings",
+        }
+        for table, columns in EXPECTED_EMBEDDING_TABLE_COLUMNS.items():
+            if table not in v8_excluded_tables:
+                expected_v8_columns[v8_table_names.get(table, table)] = columns
         expected_v8_columns["embedding_configurations"] = tuple(
-            column
+            (
+                "observed_api_version",
+                *column[1:],
+            )
+            if column[0] == "client_api_contract_version"
+            else column
             for column in expected_v8_columns["embedding_configurations"]
             if column[0]
-            not in {"tokenizer_engine", "long_text_part_attempt_limit"}
+            not in {
+                "tokenizer_engine",
+                "long_text_part_attempt_limit",
+                "batch_max_items",
+                "batch_max_estimated_tokens",
+                "batch_max_encoded_bytes",
+                "batch_max_response_bytes",
+                "batch_max_concurrency",
+                "batch_max_attempts",
+                "batch_initial_backoff_seconds",
+                "batch_max_backoff_seconds",
+            }
         )
+        expected_v8_columns["runs"] = tuple(
+            column
+            for column in expected_v8_columns["runs"]
+            if column[0]
+            not in {
+                "scope",
+                "status",
+                "discovery_complete",
+                "reconciliation_complete",
+                "hosted_requests",
+                "hosted_retries",
+                "usage_json",
+                "throttles",
+                "elapsed_seconds",
+                "finished_at",
+            }
+        )
+        for table in ("embeddings", "embedding_generation_history"):
+            expected_v8_columns[table] = tuple(
+                column
+                for column in expected_v8_columns[table]
+                if column[0]
+                not in {
+                    "derivation_kind",
+                    "raw_response_sha256",
+                    "response_model",
+                }
+            )
         expected_v8_columns["long_text_parts"] = tuple(
             column
             for column in expected_v8_columns["long_text_parts"]
             if column[0]
-            not in {"char_start", "char_end", "byte_start", "byte_end"}
+            not in {
+                "char_start",
+                "char_end",
+                "byte_start",
+                "byte_end",
+                "derivation_kind",
+                "raw_response_sha256",
+                "response_model",
+            }
         )
         assert {
             row[0]
@@ -8160,7 +8281,7 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             for row in db.execute(
                 "SELECT view_name FROM duckdb_views() WHERE internal = false"
             ).fetchall()
-        } == set(EXPECTED_EMBEDDING_VIEW_COLUMNS)
+        } == set()
         assert {
             table: tuple(
                 (row[1], row[2], row[3], row[4], row[5])
@@ -8196,25 +8317,11 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             "vector",
             "updated_at",
         ]
-        expected_v8_primary_keys = (
-            EXPECTED_EMBEDDING_PRIMARY_KEYS
-            - {
-                (
-                    "image_input_provenance",
-                    ("article_id", "configuration_id", "generation_run_id"),
-                ),
-                (
-                    "long_text_part_generations",
-                    (
-                        "article_id",
-                        "configuration_id",
-                        "article_input_sha256",
-                        "part_index",
-                        "generation_run_id",
-                    ),
-                )
-            }
-        )
+        expected_v8_primary_keys = {
+            (v8_table_names.get(table, table), columns)
+            for table, columns in EXPECTED_EMBEDDING_PRIMARY_KEYS
+            if table not in v8_excluded_tables
+        }
         expected_v8_constraints = Counter(
             (table, "PRIMARY KEY", columns, None, None, ())
             for table, columns in expected_v8_primary_keys
@@ -8263,15 +8370,52 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             row[0] for row in db.execute("SHOW TABLES").fetchall()
         }
         assert {
+            row[0]
+            for row in db.execute(
+                "SELECT view_name FROM duckdb_views() WHERE internal = false"
+            ).fetchall()
+        } == set()
+        assert {
             row[1]
             for row in db.execute("PRAGMA table_info('long_text_parts')").fetchall()
-        }.isdisjoint({"char_start", "char_end", "byte_start", "byte_end"})
+        }.isdisjoint(
+            {
+                "char_start",
+                "char_end",
+                "byte_start",
+                "byte_end",
+                "derivation_kind",
+                "raw_response_sha256",
+                "response_model",
+            }
+        )
+        for table in ("embeddings", "embedding_generation_history"):
+            assert {
+                row[1]
+                for row in db.execute(f"PRAGMA table_info('{table}')").fetchall()
+            }.isdisjoint(
+                {"derivation_kind", "raw_response_sha256", "response_model"}
+            )
         assert {
             row[1]
             for row in db.execute(
                 "PRAGMA table_info('embedding_configurations')"
             ).fetchall()
-        }.isdisjoint({"tokenizer_engine", "long_text_part_attempt_limit"})
+        }.isdisjoint(
+            {
+                "client_api_contract_version",
+                "tokenizer_engine",
+                "long_text_part_attempt_limit",
+                "batch_max_items",
+                "batch_max_estimated_tokens",
+                "batch_max_encoded_bytes",
+                "batch_max_response_bytes",
+                "batch_max_concurrency",
+                "batch_max_attempts",
+                "batch_initial_backoff_seconds",
+                "batch_max_backoff_seconds",
+            }
+        )
 
 
 def test_pipeline_refuses_exact_version_nine_catalog_without_migration(tmp_path):

@@ -671,6 +671,8 @@ def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
             *root_arguments(*roots),
             "--limit",
             "1",
+            "--observed-model",
+            "jina-embeddings-v4",
             "--authorize-hosted-processing",
         ],
         environment={"JINA_API_KEY": "credential-secret"},
@@ -755,6 +757,8 @@ def test_run_reports_post_construction_hosted_failure_without_unsafe_output(
             *root_arguments(*roots),
             "--limit",
             "1",
+            "--observed-model",
+            "jina-embeddings-v4",
             "--authorize-hosted-processing",
         ],
         environment={"JINA_API_KEY": "credential-secret"},
@@ -905,8 +909,12 @@ def test_run_reports_pipeline_failure_without_article_identity_or_path(
         assert forbidden not in captured.out
     with duckdb.connect(str(roots[2] / "catalog.duckdb"), read_only=True) as db:
         assert db.execute(
-            "SELECT state, attempt_count FROM embedding_work_items"
-        ).fetchone() == ("in_progress", 1)
+            "SELECT modality, state, attempt_count FROM embedding_work_items "
+            "ORDER BY modality"
+        ).fetchall() == [
+            ("article_text", "in_progress", 1),
+            ("header_image", "eligible", 0),
+        ]
         assert db.execute("SELECT count(*) FROM embeddings").fetchone() == (0,)
     assert not (roots[2] / "pipeline.lock").exists()
 
