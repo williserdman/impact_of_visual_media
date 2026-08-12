@@ -712,10 +712,15 @@ historical part counts do not enlarge its Python working set. Relational checks
 run in DuckDB rather than Python corpus dictionaries. Rendition references are
 streamed into a content-free temporary SQLite primary-key index. The validator
 probes only scratch parents proven to be neither inside nor ancestors of any
-configured root; with no safe writable candidate it emits
-`validation_scratch_unavailable` and creates no fallback index. The no-follow
-walk probes the selected index one leaf at a time, and the scratch directory is
-removed when validation returns. A duplicate-sensitive,
+configured root. It holds the verified parent descriptor for the full SQLite
+lifetime, creates and opens the private child descriptor-relatively, and gives
+SQLite only `/proc/self/fd/<child-fd>/references.sqlite3`; parent-path
+substitution cannot redirect creation or later access. With no safe writable
+candidate or Linux descriptor filesystem it emits
+`validation_scratch_unavailable` and creates no pathname fallback. The
+no-follow walk probes the selected index one leaf at a time, and cleanup
+reverifies identities and removes the child descriptor-relatively. A
+duplicate-sensitive,
 order-independent rendition-tree digest avoids a corpus-sized directory sort.
 
 ## 11. Test map

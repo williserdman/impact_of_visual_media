@@ -16,6 +16,15 @@ directory. It resolves and probes an explicit sequence of scratch parents,
 rejects any candidate inside or above a configured source or output root, and
 fails closed with `validation_scratch_unavailable` when none is safe and
 writable. The content-free SQLite reference index is always removed on return.
+The verified parent and private child descriptors remain open throughout the
+SQLite lifetime; creation and cleanup are descriptor-relative, while SQLite
+receives only the held child's `/proc/self/fd` path. Generated failpoints replace
+the parent pathname after parent verification and after child creation, proving
+that neither substitution redirects a write into configured roots.
+The focused descriptor-race gate passed nine generated validator fixtures,
+including both substitution windows, unavailable procfs, unsafe/default-temp
+candidates, orphan detection, concurrent artifact change, and ordinary output.
+Both generated smokes and changed-file Ruff also passed.
 Generated tests cover a default-temp/source collision, an injected no-safe
 candidate set with byte-identical configured trees, scratch cleanup, a corrupt
 vector beyond two pages, one canonical query per page, one long-aggregate join

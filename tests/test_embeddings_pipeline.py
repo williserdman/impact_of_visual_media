@@ -5881,32 +5881,101 @@ def test_default_temp_equal_to_source_root_is_rejected(monkeypatch, tmp_path):
 
     config = write_generated_preprocessing_fixture(tmp_path)
     run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
-    original_mkdtemp = validation_module.tempfile.mkdtemp
-    selected_parents: list[Path] = []
-    scratch_directories: list[Path] = []
-
-    def record_mkdtemp(*args, **kwargs):
-        directory = kwargs.get("dir", args[2] if len(args) > 2 else None)
-        selected_parents.append(Path(directory).resolve())
-        created = Path(original_mkdtemp(*args, **kwargs))
-        scratch_directories.append(created)
-        return str(created)
+    source_before = tuple(config.source_root.iterdir())
 
     monkeypatch.setattr(
         validation_module.tempfile,
         "gettempdir",
         lambda: str(config.source_root),
     )
-    monkeypatch.setattr(validation_module.tempfile, "mkdtemp", record_mkdtemp)
 
     result = validate_embedding_corpus(config)
 
     assert "validation_scratch_unavailable" not in {
         issue.code for issue in result.issues
     }
-    assert selected_parents
-    assert config.source_root.resolve() not in selected_parents
-    assert all(not path.exists() for path in scratch_directories)
+    assert tuple(config.source_root.iterdir()) == source_before
+
+
+@pytest.mark.parametrize(
+    "failpoint_name",
+    ("after_scratch_parent_verified", "after_scratch_child_created"),
+)
+def test_validation_scratch_stays_anchored_when_parent_path_is_replaced(
+    tmp_path, failpoint_name
+):
+    """Break caught: verified scratch pathname is substituted before SQLite opens."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    scratch_parent = tmp_path / "validation-scratch"
+    moved_parent = tmp_path / "verified-scratch-parent"
+    scratch_parent.mkdir()
+    source_directory_mtime = config.source_root.stat().st_mtime_ns
+    configured_before = snapshot_fixture_inputs(config) | {
+        f"embedding/{path.relative_to(config.embedding_output_root).as_posix()}":
+        hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in config.embedding_output_root.rglob("*")
+        if path.is_file()
+    }
+
+    def replace_parent_path() -> None:
+        scratch_parent.rename(moved_parent)
+        scratch_parent.symlink_to(config.source_root, target_is_directory=True)
+
+    callbacks = {failpoint_name: replace_parent_path}
+    result = validate_embedding_corpus(
+        config,
+        failpoints=EmbeddingValidationFailpoints(
+            scratch_parent_candidates=(scratch_parent,),
+            **callbacks,
+        ),
+    )
+
+    configured_after = snapshot_fixture_inputs(config) | {
+        f"embedding/{path.relative_to(config.embedding_output_root).as_posix()}":
+        hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in config.embedding_output_root.rglob("*")
+        if path.is_file()
+    }
+    assert result.ok
+    assert configured_after == configured_before
+    assert config.source_root.stat().st_mtime_ns == source_directory_mtime
+    assert scratch_parent.is_symlink()
+    assert list(moved_parent.iterdir()) == []
+
+
+def test_validation_scratch_fails_closed_without_descriptor_filesystem(
+    monkeypatch, tmp_path
+):
+    """Break caught: missing procfs falls back to a re-resolved scratch pathname."""
+
+    import wsj_embeddings.validate as validation_module
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    scratch_parent = tmp_path / "validation-scratch"
+    scratch_parent.mkdir()
+    original_stat = validation_module.os.stat
+
+    def hide_descriptor_filesystem(path, *args, **kwargs):
+        if os.fspath(path).startswith("/proc/self/fd/"):
+            raise FileNotFoundError("generated missing procfs")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(validation_module.os, "stat", hide_descriptor_filesystem)
+
+    result = validate_embedding_corpus(
+        config,
+        failpoints=EmbeddingValidationFailpoints(
+            scratch_parent_candidates=(scratch_parent,),
+        ),
+    )
+
+    assert "validation_scratch_unavailable" in {
+        issue.code for issue in result.issues
+    }
+    assert list(scratch_parent.iterdir()) == []
 
 
 def test_public_validator_streams_to_a_corrupt_vector_after_the_first_page(tmp_path):

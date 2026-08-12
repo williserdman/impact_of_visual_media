@@ -6,14 +6,15 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import sqlite3
 import stat
 import struct
 import tempfile
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from itertools import chain, groupby
-from tempfile import TemporaryDirectory
 from typing import Protocol
 
 import duckdb
@@ -221,6 +222,8 @@ class EmbeddingValidationFailpoints:
 
     after_state_snapshot: Callable[[], None] | None = None
     scratch_parent_candidates: tuple[os.PathLike[str] | str, ...] | None = None
+    after_scratch_parent_verified: Callable[[], None] | None = None
+    after_scratch_child_created: Callable[[], None] | None = None
 
 
 def validate_embedding_corpus(
@@ -380,7 +383,7 @@ def _validate_stable_state(
         embedding,
         config,
         issues,
-        scratch_parent_candidates=failpoints.scratch_parent_candidates,
+        failpoints=failpoints,
     )
     selected_configuration_id = _select_configuration_id(
         embedding,
@@ -2237,7 +2240,7 @@ def _scan_rendition_artifacts(
     config: EmbeddingPipelineConfig,
     issues: list[EmbeddingValidationIssue],
     *,
-    scratch_parent_candidates: tuple[os.PathLike[str] | str, ...] | None,
+    failpoints: EmbeddingValidationFailpoints,
 ) -> int:
     def unsafe_entry() -> None:
         _append(
@@ -2246,61 +2249,89 @@ def _scan_rendition_artifacts(
             "rendition namespace contains an unsafe entry",
         )
 
-    scratch_parent = _safe_scratch_parent(config, scratch_parent_candidates)
-    if scratch_parent is None:
-        _append(
-            issues,
-            "validation_scratch_unavailable",
-            "no safe writable validation scratch parent is available",
-        )
-        return 0
-    try:
-        with TemporaryDirectory(
-            prefix="wsj-embedding-validation-",
-            dir=scratch_parent,
-        ) as scratch:
+    for parent_fd, parent_identity in _safe_scratch_parents(
+        config, failpoints.scratch_parent_candidates
+    ):
+        child_fd: int | None = None
+        child_name: str | None = None
+        child_identity: tuple[int, int] | None = None
+        reference_index: sqlite3.Connection | None = None
+        result: int | None = None
+        cleanup_safe = True
+        try:
+            if failpoints.after_scratch_parent_verified is not None:
+                failpoints.after_scratch_parent_verified()
+            if _file_identity(os.fstat(parent_fd)) != parent_identity:
+                raise OSError("scratch parent identity changed")
+            child_name, child_fd, child_identity = _create_scratch_child(parent_fd)
+            if failpoints.after_scratch_child_created is not None:
+                failpoints.after_scratch_child_created()
+            if _file_identity(os.fstat(parent_fd)) != parent_identity:
+                raise OSError("scratch parent identity changed")
+            if _file_identity(os.fstat(child_fd)) != child_identity:
+                raise OSError("scratch child identity changed")
+            proc_child = f"/proc/self/fd/{child_fd}"
+            if _file_identity(os.stat(proc_child)) != child_identity:
+                raise OSError("descriptor filesystem is unavailable")
             reference_index = sqlite3.connect(
-                os.path.join(scratch, "references.sqlite3")
+                f"{proc_child}/references.sqlite3"
             )
-            try:
+            reference_index.execute(
+                "CREATE TABLE referenced_paths (path TEXT PRIMARY KEY)"
+            )
+            for (relative_path,) in stream_rows(
+                connection,
+                """
+                SELECT DISTINCT rendition_relative_path
+                FROM image_input_provenance
+                WHERE rendition_relative_path IS NOT NULL
+                ORDER BY rendition_relative_path
+                """,
+            ):
                 reference_index.execute(
-                    "CREATE TABLE referenced_paths (path TEXT PRIMARY KEY)"
+                    "INSERT INTO referenced_paths VALUES (?)",
+                    [str(relative_path)],
                 )
-                for (relative_path,) in stream_rows(
-                    connection,
-                    """
-                    SELECT DISTINCT rendition_relative_path
-                    FROM image_input_provenance
-                    WHERE rendition_relative_path IS NOT NULL
-                    ORDER BY rendition_relative_path
-                    """,
-                ):
-                    reference_index.execute(
-                        "INSERT INTO referenced_paths VALUES (?)",
-                        [str(relative_path)],
-                    )
-                reference_index.commit()
-                return _scan_rendition_artifacts_with_index(
-                    reference_index,
-                    config,
-                    issues,
-                    unsafe_entry,
+            reference_index.commit()
+            result = _scan_rendition_artifacts_with_index(
+                reference_index,
+                config,
+                issues,
+                unsafe_entry,
+            )
+        except (OSError, sqlite3.Error):
+            result = None
+        finally:
+            if reference_index is not None:
+                try:
+                    reference_index.close()
+                except sqlite3.Error:
+                    cleanup_safe = False
+            if child_fd is not None:
+                cleanup_safe &= _cleanup_scratch_child(
+                    parent_fd,
+                    parent_identity,
+                    child_fd,
+                    child_name,
+                    child_identity,
                 )
-            finally:
-                reference_index.close()
-    except (OSError, sqlite3.Error):
-        _append(
-            issues,
-            "validation_scratch_unavailable",
-            "no safe writable validation scratch parent is available",
-        )
-        return 0
+            os.close(parent_fd)
+        if result is not None and cleanup_safe:
+            return result
+        if not cleanup_safe:
+            break
+    _append(
+        issues,
+        "validation_scratch_unavailable",
+        "no safe writable validation scratch parent is available",
+    )
+    return 0
 
 
-def _safe_scratch_parent(
+def _safe_scratch_parents(
     config: EmbeddingPipelineConfig,
     candidates: tuple[os.PathLike[str] | str, ...] | None,
-) -> str | None:
+) -> Iterator[tuple[int, tuple[int, int]]]:
     configured = tuple(
         path.resolve(strict=False)
         for path in (
@@ -2319,7 +2350,8 @@ def _safe_scratch_parent(
         descriptor: int | None = None
         try:
             candidate_path = type(config.source_root)(candidate).resolve(strict=True)
-            if not candidate_path.is_dir():
+            candidate_stat = os.stat(candidate_path, follow_symlinks=False)
+            if not stat.S_ISDIR(candidate_stat.st_mode):
                 continue
             if any(
                 candidate_path == root
@@ -2329,21 +2361,95 @@ def _safe_scratch_parent(
             ):
                 continue
             descriptor = os.open(candidate_path, _DIRECTORY_FLAGS)
-            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            opened_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened_stat.st_mode)
+                or _file_identity(opened_stat) != _file_identity(candidate_stat)
+                or _file_identity(
+                    os.stat(candidate_path, follow_symlinks=False)
+                )
+                != _file_identity(opened_stat)
+            ):
                 continue
-            probe = tempfile.mkdtemp(
-                prefix="wsj-embedding-validation-probe-",
-                dir=candidate_path,
-            )
         except OSError:
             continue
         else:
-            os.rmdir(probe)
-            return str(candidate_path)
+            yielded_descriptor = descriptor
+            descriptor = None
+            yield yielded_descriptor, _file_identity(opened_stat)
         finally:
             if descriptor is not None:
                 os.close(descriptor)
-    return None
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def _create_scratch_child(parent_fd: int) -> tuple[str, int, tuple[int, int]]:
+    for _attempt in range(32):
+        name = f"wsj-embedding-validation-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        child_fd: int | None = None
+        try:
+            child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            child_stat = os.fstat(child_fd)
+            named_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(child_stat.st_mode)
+                or _file_identity(child_stat) != _file_identity(named_stat)
+            ):
+                raise OSError("scratch child identity changed")
+            return name, child_fd, _file_identity(child_stat)
+        except OSError:
+            if child_fd is not None:
+                os.close(child_fd)
+            with suppress(OSError):
+                os.rmdir(name, dir_fd=parent_fd)
+            raise
+    raise OSError("scratch child name collisions exceeded limit")
+
+
+def _cleanup_scratch_child(
+    parent_fd: int,
+    parent_identity: tuple[int, int],
+    child_fd: int,
+    child_name: str | None,
+    child_identity: tuple[int, int] | None,
+) -> bool:
+    safe = True
+    try:
+        for name in os.listdir(child_fd):
+            if name not in {
+                "references.sqlite3",
+                "references.sqlite3-journal",
+                "references.sqlite3-shm",
+                "references.sqlite3-wal",
+            }:
+                safe = False
+                continue
+            os.unlink(name, dir_fd=child_fd)
+    except OSError:
+        safe = False
+    finally:
+        os.close(child_fd)
+    if child_name is None or child_identity is None:
+        return False
+    try:
+        named_stat = os.stat(child_name, dir_fd=parent_fd, follow_symlinks=False)
+        safe &= (
+            _file_identity(os.fstat(parent_fd)) == parent_identity
+            and stat.S_ISDIR(named_stat.st_mode)
+            and _file_identity(named_stat) == child_identity
+        )
+        if safe:
+            os.rmdir(child_name, dir_fd=parent_fd)
+    except OSError:
+        return False
+    return safe
 
 
 def _scan_rendition_artifacts_with_index(
