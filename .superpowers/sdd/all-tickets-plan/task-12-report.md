@@ -156,3 +156,40 @@ showed the required `(--limit LIMIT | --full)` scope.
 Pending visible article-text, header-image, and multimodal generations are also
 treated as logical history until compaction; the generated multimodal marker
 fixture validated cleanly (`1 passed in 6.29s`).
+
+## Correction round 2: monotonic cursors and canonical-view integrity
+
+Action staging and physical compaction now expose explicit composite cursors
+through their bounded catalog page seams. Staging advances strictly by
+`(article_id, modality, configuration_id)` and compaction by
+`(run_id, article_id, modality, configuration_id)`, with the SQL `LIMIT`
+applying to exact action rows. Neither loop restarts at the remaining
+relation's beginning. The generated observer fixture first failed because the
+catalog accepted no cursor (`1 failed in 13.98s`), then passed after both
+coordinator loops forwarded each returned cursor (`1 passed in 7.07s`).
+
+Schema 14 remains unchanged. Its exact validation now fingerprints normalized
+behavior-bearing SQL returned by `duckdb_views()` for both canonical views.
+The same-column storage bypass initially opened successfully (`1 failed in
+3.63s`); the parametrized `embeddings` and `embedding_work_items` mutations
+then refused byte-for-byte alongside the exact schema fixture (`3 passed in
+1.75s`).
+
+The `stale_input` validator now requires a header association equal to the
+retained canonical article's current path, including null, and requires null
+when the article disappeared. Generated retained-wrong-safe-path and
+disappeared-nonnull fixtures initially produced no issue (`2 failed in
+16.71s`), then passed with the valid content-free baseline (`3 passed in
+16.12s`). README and crash-course operator contracts enumerate and define this
+state.
+
+Final focused lifecycle verification covered cursor progression, both altered
+views, exact schema 14, all three stale-input cases, staging-page rollback,
+atomic marker visibility, interrupted/resumed compaction, overlay/base identity
+checking, and pending multimodal history (`12 passed in 49.30s`). Changed
+Python files passed Ruff and `git diff --check`; the final cursor and both view
+mutation cases passed `3 passed in 8.72s`. The generated smoke returned
+`{"articles": 1, "embeddings": 1, "validation_ok": true}`, and live run help
+showed `(--limit LIMIT | --full)`. All fixtures used temporary generated
+catalogs and content; no hosted request, network access, licensed archive
+traversal, real full run, or external issue/ledger update occurred.

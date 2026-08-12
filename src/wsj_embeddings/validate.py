@@ -629,6 +629,7 @@ def _validate_work_items(
                     "embedding rows lack a matching successful work checkpoint",
                 )
         elif work_state is WorkState.STALE_INPUT:
+            article = articles.get(article_id)
             if (
                 input_sha256 is not None
                 or attempt_count != 0
@@ -636,8 +637,22 @@ def _validate_work_items(
                 or generation_run_id is not None
                 or (
                     modality == EmbeddingModality.HEADER_IMAGE.value
-                    and source_relative_path is not None
-                    and not is_safe_source_relative_path(source_relative_path)
+                    and (
+                        (
+                            source_relative_path is not None
+                            and not is_safe_source_relative_path(
+                                source_relative_path
+                            )
+                        )
+                        or (
+                            article is None
+                            and source_relative_path is not None
+                        )
+                        or (
+                            article is not None
+                            and source_relative_path != article.header_image_path
+                        )
+                    )
                 )
                 or (
                     modality != EmbeddingModality.HEADER_IMAGE.value

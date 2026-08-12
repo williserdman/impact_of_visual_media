@@ -266,6 +266,14 @@ _VIEW_COLUMNS = {
         ]
     ),
 }
+_VIEW_SQL_FINGERPRINTS = {
+    "embedding_work_items": (
+        "b7e0432cc58fac7135221ff6a6fa06405ab953d02d62a78dc416fc99411019bf"
+    ),
+    "embeddings": (
+        "a1e0f2b7089d7e41ff015280ba6da384b92bd67d29c7b416cbb71822f7abe159"
+    ),
+}
 _KEY_CONSTRAINTS = {
     ("metadata", "PRIMARY KEY", ("key",)),
     ("embedding_configurations", "PRIMARY KEY", ("configuration_id",)),
@@ -366,6 +374,12 @@ _RUN_COUNT_COLUMNS = frozenset(
 
 class EmbeddingCatalogError(RuntimeError):
     """Raised when the embedding catalog cannot be safely published."""
+
+
+def _normalize_view_sql(sql: str) -> str:
+    """Normalize non-behavioral formatting before fingerprinting view SQL."""
+
+    return " ".join(sql.strip().removesuffix(";").split())
 
 
 def _raise_unsafe_catalog_path() -> None:
@@ -1070,6 +1084,19 @@ class EmbeddingCatalog:
             )
             for view in _VIEW_COLUMNS
         }
+        view_sql_fingerprints = {
+            str(view_name): hashlib.sha256(
+                _normalize_view_sql(str(sql)).encode("utf-8")
+            ).hexdigest()
+            for view_name, sql in self.connection.execute(
+                """
+                SELECT view_name, sql FROM duckdb_views()
+                WHERE database_name = current_database()
+                  AND schema_name = 'main'
+                  AND view_name IN ('embeddings', 'embedding_work_items')
+                """
+            ).fetchall()
+        }
         constraints = Counter(
             (
                 row[0],
@@ -1098,6 +1125,7 @@ class EmbeddingCatalog:
         if (
             table_columns != _TABLE_COLUMNS
             or view_columns != _VIEW_COLUMNS
+            or view_sql_fingerprints != _VIEW_SQL_FINGERPRINTS
             or constraints != _EXPECTED_CONSTRAINTS
             or indexes
         ):
@@ -1421,9 +1449,10 @@ class EmbeddingCatalog:
         self,
         run_id: str,
         *,
+        after_action_key: tuple[str, str, str] | None,
         page_size: int,
         before_commit: Callable[[int], None] | None = None,
-    ) -> int:
+    ) -> tuple[int, tuple[str, str, str] | None]:
         """Stage one bounded page of exact, still-invisible work actions."""
 
         if page_size < 1:
@@ -1438,8 +1467,26 @@ class EmbeddingCatalog:
             raise EmbeddingCatalogError(
                 "full reconciliation requires completed discovery"
             )
-        rows = self.connection.execute(
+        cursor_clause = ""
+        parameters: list[object] = [
+            EmbeddingModality.HEADER_IMAGE.value,
+            EmbeddingModality.HEADER_IMAGE.value,
+            WorkState.NOT_APPLICABLE.value,
+            WorkState.STALE_INPUT.value,
+            run_id,
+            EmbeddingModality.HEADER_IMAGE.value,
+            EmbeddingModality.MULTIMODAL_ARTICLE.value,
+            EmbeddingModality.HEADER_IMAGE.value,
+        ]
+        if after_action_key is not None:
+            cursor_clause = """
+                AND (work.article_id, work.modality, work.configuration_id)
+                    > (?, ?, ?)
             """
+            parameters.extend(after_action_key)
+        parameters.append(page_size)
+        rows = self.connection.execute(
+            f"""
             SELECT work.article_id, work.modality, work.configuration_id,
                    CASE
                      WHEN seen.article_id IS NULL THEN NULL
@@ -1462,11 +1509,7 @@ class EmbeddingCatalog:
               ON vector.article_id = work.article_id
              AND vector.modality = work.modality
              AND vector.configuration_id = work.configuration_id
-            LEFT JOIN reconciliation_actions AS prior
-              ON prior.run_id = ? AND prior.article_id = work.article_id
-             AND prior.modality = work.modality
-             AND prior.configuration_id = work.configuration_id
-            WHERE prior.run_id IS NULL AND (
+            WHERE (
                 seen.article_id IS NULL
                 OR (
                     work.modality = ?
@@ -1484,21 +1527,11 @@ class EmbeddingCatalog:
                     )
                 )
             )
+            {cursor_clause}
             ORDER BY work.article_id, work.modality, work.configuration_id
             LIMIT ?
             """,
-            [
-                EmbeddingModality.HEADER_IMAGE.value,
-                EmbeddingModality.HEADER_IMAGE.value,
-                WorkState.NOT_APPLICABLE.value,
-                WorkState.STALE_INPUT.value,
-                run_id,
-                run_id,
-                EmbeddingModality.HEADER_IMAGE.value,
-                EmbeddingModality.MULTIMODAL_ARTICLE.value,
-                EmbeddingModality.HEADER_IMAGE.value,
-                page_size,
-            ],
+            parameters,
         ).fetchmany(page_size)
         if rows:
             self.connection.executemany(
@@ -1510,7 +1543,10 @@ class EmbeddingCatalog:
             )
         if before_commit is not None and rows:
             before_commit(len(rows))
-        return len(rows)
+        next_cursor = (
+            tuple(str(value) for value in rows[-1][:3]) if rows else after_action_key
+        )
+        return len(rows), next_cursor
 
     def commit_reconciliation_visibility(self, run_id: str) -> None:
         """Atomically expose one fully staged, identity-bound action set."""
@@ -1548,15 +1584,25 @@ class EmbeddingCatalog:
     def compact_reconciliation_page(
         self,
         *,
+        after_action_key: tuple[str, str, str, str] | None,
         page_size: int,
         before_commit: Callable[[int], None] | None = None,
-    ) -> int:
+    ) -> tuple[int, tuple[str, str, str, str] | None]:
         """Materialize one exact action-row page without changing public state."""
 
         if page_size < 1:
             raise ValueError("page size must be positive")
-        actions = self.connection.execute(
+        cursor_clause = ""
+        parameters: list[object] = []
+        if after_action_key is not None:
+            cursor_clause = """
+              AND (action.run_id, action.article_id, action.modality,
+                   action.configuration_id) > (?, ?, ?, ?)
             """
+            parameters.extend(after_action_key)
+        parameters.append(page_size)
+        actions = self.connection.execute(
+            f"""
             SELECT action.run_id, action.article_id, action.modality,
                    action.configuration_id,
                    action.target_source_relative_path, action.target_state,
@@ -1569,11 +1615,12 @@ class EmbeddingCatalog:
             FROM reconciliation_actions AS action
             JOIN runs ON runs.run_id = action.run_id
             WHERE runs.reconciliation_complete
+            {cursor_clause}
             ORDER BY action.run_id, action.article_id, action.modality,
                      action.configuration_id
             LIMIT ?
             """,
-            [page_size],
+            parameters,
         ).fetchmany(page_size)
         for action in actions:
             (
@@ -1656,7 +1703,12 @@ class EmbeddingCatalog:
             )
         if before_commit is not None and actions:
             before_commit(len(actions))
-        return len(actions)
+        next_cursor = (
+            tuple(str(value) for value in actions[-1][:4])
+            if actions
+            else after_action_key
+        )
+        return len(actions), next_cursor
 
     def discard_invisible_reconciliation_page(self, *, page_size: int) -> int:
         """Drop one bounded page staged by terminal non-visible runs."""

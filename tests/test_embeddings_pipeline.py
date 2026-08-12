@@ -5974,6 +5974,75 @@ def test_full_reconciliation_compaction_is_bounded_resumable_and_view_invariant(
         ).fetchone() == (0,)
 
 
+def test_reconciliation_action_pages_advance_monotonic_composite_cursors(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: every action page rescans the remaining relation start."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:SYNTHETIC-EMBEDDING-B",
+        markdown="# Generated article B\n",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+
+    stage_inputs = []
+    stage_outputs = []
+    compact_inputs = []
+    compact_outputs = []
+    real_stage = EmbeddingCatalog.stage_reconciliation_page
+    real_compact = EmbeddingCatalog.compact_reconciliation_page
+
+    def observe_stage(self, run_id, **kwargs):
+        stage_inputs.append(kwargs["after_action_key"])
+        page = real_stage(self, run_id, **kwargs)
+        stage_outputs.append(page)
+        return page
+
+    def observe_compact(self, **kwargs):
+        compact_inputs.append(kwargs["after_action_key"])
+        page = real_compact(self, **kwargs)
+        compact_outputs.append(page)
+        return page
+
+    monkeypatch.setattr(EmbeddingCatalog, "stage_reconciliation_page", observe_stage)
+    monkeypatch.setattr(
+        EmbeddingCatalog,
+        "compact_reconciliation_page",
+        observe_compact,
+    )
+
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+
+    assert stage_inputs[0] is None
+    assert len(stage_inputs) > 2
+    assert all(count in {0, 1} for count, _cursor in stage_outputs)
+    assert stage_inputs[1:] == [page[1] for page in stage_outputs[:-1]]
+    stage_cursors = [cursor for cursor in stage_inputs if cursor is not None]
+    assert stage_cursors == sorted(set(stage_cursors))
+    post_visibility_start = max(
+        index
+        for index, cursor in enumerate(compact_inputs)
+        if cursor is None
+    )
+    observed_compact_inputs = compact_inputs[post_visibility_start:]
+    observed_compact_outputs = compact_outputs[post_visibility_start:]
+    assert len(observed_compact_inputs) > 2
+    assert all(count in {0, 1} for count, _cursor in observed_compact_outputs)
+    assert observed_compact_inputs[1:] == [
+        page[1] for page in observed_compact_outputs[:-1]
+    ]
+    compact_cursors = [
+        cursor for cursor in observed_compact_inputs if cursor is not None
+    ]
+    assert compact_cursors == sorted(set(compact_cursors))
+
+
 def test_full_discovery_and_processing_are_bounded_lexical_pages(
     tmp_path,
     monkeypatch,
@@ -6920,6 +6989,39 @@ def test_pipeline_refuses_exact_version_thirteen_catalog_without_migration(tmp_p
         )["embeddings"] == "BASE TABLE"
 
 
+@pytest.mark.parametrize(
+    ("view_name", "storage_name"),
+    (
+        ("embeddings", "embedding_storage"),
+        ("embedding_work_items", "embedding_work_storage"),
+    ),
+)
+def test_pipeline_refuses_same_columns_with_malformed_canonical_view(
+    tmp_path,
+    view_name,
+    storage_name,
+):
+    """Break caught: a view that bypasses committed actions passes schema checks."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(f"DROP VIEW {view_name}")
+        db.execute(f"CREATE VIEW {view_name} AS SELECT * FROM {storage_name}")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT count(*) FROM reconciliation_actions"
+        ).fetchone() == (0,)
+
+
 def test_pipeline_refuses_malformed_current_schema_with_version_eight_label(
     tmp_path,
 ):
@@ -7023,6 +7125,80 @@ def test_validator_accepts_content_free_stale_input_disposition(tmp_path):
     result = validate_embedding_outputs(config)
 
     assert result.ok
+
+
+def test_validator_rejects_stale_header_path_not_matching_retained_article(tmp_path):
+    """Break caught: stale header work may retain any safe unrelated path."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated retained header A")
+    run_embedding_pipeline(config, PriorConfigurationAdapter(), full=True, page_size=1)
+    current_path = attach_generated_header_image(
+        config,
+        b"generated retained header B",
+        relative_path="synthetic/current-header.png",
+    )
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    prior_id = configuration_id(PriorConfigurationAdapter.profile)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        assert connection.execute(
+            """
+            SELECT source_relative_path FROM embedding_work_items
+            WHERE configuration_id = ? AND modality = 'header_image'
+            """,
+            [prior_id],
+        ).fetchone() == (current_path,)
+        connection.execute(
+            """
+            UPDATE embedding_work_storage
+            SET source_relative_path = 'synthetic/unrelated-safe.png'
+            WHERE configuration_id = ? AND modality = 'header_image'
+            """,
+            [prior_id],
+        )
+
+    codes = {
+        issue.code
+        for issue in validate_embedding_outputs(
+            config,
+            configuration_id=prior_id,
+        ).issues
+    }
+
+    assert "invalid_stale_input_checkpoint" in codes
+
+
+def test_validator_rejects_nonnull_stale_header_path_for_disappeared_article(
+    tmp_path,
+):
+    """Break caught: disappeared article retains a plausible stale image path."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated disappearing header")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    current_id = configuration_id(FakeEmbeddingAdapter.profile)
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(
+            """
+            UPDATE embedding_work_storage
+            SET source_relative_path = 'synthetic/unrelated-safe.png'
+            WHERE configuration_id = ? AND modality = 'header_image'
+            """,
+            [current_id],
+        )
+
+    codes = {
+        issue.code
+        for issue in validate_embedding_outputs(
+            config,
+            configuration_id=current_id,
+        ).issues
+    }
+
+    assert "invalid_stale_input_checkpoint" in codes
 
 
 def test_validator_rejects_visible_reconciliation_base_identity_mismatch(tmp_path):

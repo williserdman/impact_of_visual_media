@@ -259,9 +259,12 @@ ORDER BY published_at_utc, article_id;
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
 catalog. Embedding schema version 14 has exactly thirteen base tables, two
-canonical views, and no indexes. Versions 1 through 13 and malformed output are refused without
-migration. `full_run_articles` stores only run/article identity and the optional
-source-relative header association, never Markdown or image bytes.
+canonical views, and no indexes. Exact validation includes normalized
+behavior-bearing SQL fingerprints for both views, so a same-column view that
+bypasses the visibility overlay is malformed. Versions 1 through 13 and
+malformed output are refused without migration. `full_run_articles` stores
+only run/article identity and the optional source-relative header association,
+never Markdown or image bytes.
 
 | Table | Ordered columns and DuckDB types | Primary key |
 |---|---|---|
@@ -586,13 +589,17 @@ association to the run inventory. No disappearance inference occurs unless
 that traversal exhausts.
 The coordinator then reopens and processes each inventory page through the
 existing bounded modality pipeline. Only after all pages return does it stage
-exact reconciliation actions in bounded keyset pages. Failed staging remains
-invisible. One run-marker transaction exposes all actions atomically through
-the canonical `embeddings` and `embedding_work_items` views. Bounded physical
-compaction checks the expected generation/vector/work identity and cannot
-change the public result; interruption resumes safely. Header actions are exact
-per configuration, preserving work that already matches the new association.
-`stale_input` is a content-free, generation-free disposition with no input hash.
+exact reconciliation actions in bounded keyset pages, using a strict monotonic
+`(article_id, modality, configuration_id)` cursor and an exact action-row
+limit. Failed staging remains invisible. One run-marker transaction exposes
+all actions atomically through the canonical `embeddings` and
+`embedding_work_items` views. Bounded physical compaction advances a strict
+monotonic `(run_id, article_id, modality, configuration_id)` cursor, checks the
+expected generation/vector/work identity, and cannot change the public result;
+interruption resumes safely. Header actions are exact per configuration,
+preserving work that already matches the new association. `stale_input` is a
+content-free, generation-free disposition with no input hash; its header path
+must match a retained canonical article or be null when the article disappeared.
 Obsolete derived renditions are descriptor-checked one candidate at a time and
 queried for exact current/historical reference before unlinking. Interrupted
 cleanup leaves a validator-visible harmless orphan for a later full run.

@@ -374,10 +374,14 @@ def run_embedding_pipeline(
                 )
             if not discarded:
                 break
+        compaction_cursor: tuple[str, str, str, str] | None = None
         while True:
             with catalog.transaction():
-                compacted = catalog.compact_reconciliation_page(
-                    page_size=page_size
+                compacted, compaction_cursor = (
+                    catalog.compact_reconciliation_page(
+                        after_action_key=compaction_cursor,
+                        page_size=page_size,
+                    )
                 )
             if not compacted:
                 break
@@ -733,10 +737,14 @@ def _run_full_embedding_pipeline(
                 )
             if not discarded:
                 break
+        compaction_cursor: tuple[str, str, str, str] | None = None
         while True:
             with catalog.transaction():
-                compacted = catalog.compact_reconciliation_page(
-                    page_size=page_size
+                compacted, compaction_cursor = (
+                    catalog.compact_reconciliation_page(
+                        after_action_key=compaction_cursor,
+                        page_size=page_size,
+                    )
                 )
             if not compacted:
                 break
@@ -814,10 +822,12 @@ def _run_full_embedding_pipeline(
                         failpoints.after_full_processing_page(len(articles))
                     after_article_id = article_ids[-1]
 
+            staging_cursor: tuple[str, str, str] | None = None
             while True:
                 with catalog.transaction():
-                    reconciled = catalog.stage_reconciliation_page(
+                    reconciled, staging_cursor = catalog.stage_reconciliation_page(
                         run_id,
+                        after_action_key=staging_cursor,
                         page_size=page_size,
                         before_commit=(
                             failpoints.during_full_reconciliation_page
@@ -838,9 +848,11 @@ def _run_full_embedding_pipeline(
             result = catalog.run_result(run_id)
             if failpoints.after_full_reconciliation_visibility is not None:
                 failpoints.after_full_reconciliation_visibility()
+            compaction_cursor = None
             while True:
                 with catalog.transaction():
-                    compacted = catalog.compact_reconciliation_page(
+                    compacted, compaction_cursor = catalog.compact_reconciliation_page(
+                        after_action_key=compaction_cursor,
                         page_size=page_size,
                         before_commit=(
                             failpoints.during_full_reconciliation_compaction_page

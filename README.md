@@ -349,11 +349,14 @@ safe-path `retryable` header with `missing_header_image`, zero adapter attempts,
 and no active vector or generation. The three failure-detail columns retain
 classified codes and numeric response/retry metadata, never exception text or
 editorial content. Work states are `queued`, `in_progress`, `succeeded`,
-`retryable`, `terminal`, `interrupted`, and `not_applicable`. `not_applicable`
-means no canonical header; header failures remain distinct and count in
-`header_failed`. Changed exact image bytes archive the prior image generation
-as `input_changed` and invalidate only that image plus its same-configuration
-multimodal dependent. A changed configuration uses a separate work key and
+`retryable`, `terminal`, `interrupted`, `not_applicable`, and `stale_input`.
+`stale_input` is a generation-free completed-full-run disposition; its header
+path equals the retained canonical association, or is null when the article
+disappeared. `not_applicable` means no canonical header; header failures remain
+distinct and count in `header_failed`. Changed exact image bytes archive the
+prior image generation as `input_changed` and invalidate only that image plus
+its same-configuration multimodal dependent. A changed configuration uses a
+separate work key and
 leaves the prior configuration queryable.
 
 Production requests may mix article text, header images, and long-text parts.
@@ -438,9 +441,12 @@ unchanged across reuse. Supersession history therefore names the run that
 actually generated the archived vector rather than a later replay.
 
 Full reconciliation first stages exact identity-bound actions in bounded action
-pages. Failed staging is invisible. One run-marker commit exposes the complete
-action set atomically through the canonical views, then bounded idempotent
-compaction materializes the same state. Header association changes preserve a
+pages using strict monotonic `(article_id, modality, configuration_id)` cursors.
+Failed staging is invisible. One run-marker commit exposes the complete action
+set atomically through the canonical views, then bounded idempotent compaction
+materializes the same state with a monotonic cursor that also includes
+`run_id`. Exact schema validation fingerprints the normalized behavior-bearing
+SQL of both canonical views. Header association changes preserve a
 configuration already matching the new path and stale only mismatched header
 and dependent multimodal work. Derived renditions are removed only after their
 catalog references commit, with one exact history-reference query per scanned
