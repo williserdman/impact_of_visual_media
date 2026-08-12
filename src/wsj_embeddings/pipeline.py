@@ -270,12 +270,7 @@ def run_embedding_pipeline(
         raise ValueError("reprocess must be boolean")
     config.validate()
     _ensure_source_root(config.source_root)
-    profile = adapter.profile
     active_failpoints = failpoints or EmbeddingPipelineFailpoints()
-    if profile.dimensions != _VECTOR_DIMENSIONS:
-        raise ValueError("adapter profile dimensions must be 2048")
-    if profile.long_text_part_attempt_limit < 1:
-        raise ValueError("long-text part attempt limit must be positive")
     articles = _read_articles(config, limit)
     prepared_images = {
         article.article_id: _prepare_header_image(config, article)
@@ -284,13 +279,28 @@ def run_embedding_pipeline(
     active_image_codec = image_codec
     if active_image_codec is None:
         active_image_codec = getattr(adapter, "image_codec", None)
-    if active_image_codec is None and any(
-        isinstance(image, _PreparedHeaderImage) for image in prepared_images.values()
+    bind_image_codec = getattr(adapter, "bind_image_codec", None)
+    if active_image_codec is None and (
+        callable(bind_image_codec)
+        or any(
+            isinstance(image, _PreparedHeaderImage)
+            for image in prepared_images.values()
+        )
     ):
         try:
             active_image_codec = PillowImageCodec()
         except ImageCodecError as error:
             raise EmbeddingPipelineError(error.code, "image_preparation") from error
+    if callable(bind_image_codec) and active_image_codec is not None:
+        try:
+            bind_image_codec(active_image_codec)
+        except ImageCodecError as error:
+            raise EmbeddingPipelineError(error.code, "image_preparation") from error
+    profile = adapter.profile
+    if profile.dimensions != _VECTOR_DIMENSIONS:
+        raise ValueError("adapter profile dimensions must be 2048")
+    if profile.long_text_part_attempt_limit < 1:
+        raise ValueError("long-text part attempt limit must be positive")
     configuration_identifier = configuration_id(profile)
     run_id = str(uuid4())
     with (

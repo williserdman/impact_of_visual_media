@@ -3,7 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import stat
 import struct
+import sys
+import types
+import warnings
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict, replace
@@ -15,6 +20,7 @@ import pytest
 
 import wsj_embeddings.canonical_markdown as canonical_markdown_module
 import wsj_embeddings.catalog as embedding_catalog_module
+import wsj_embeddings.image_rendition as image_rendition_module
 import wsj_embeddings.pipeline as embedding_pipeline_module
 import wsj_embeddings.source_image as source_image_module
 from wsj_embeddings import (
@@ -32,7 +38,11 @@ from wsj_embeddings import (
 from wsj_embeddings.adapters import JinaEmbeddingAdapter, JinaHostedAdapterError
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingConfigError
-from wsj_embeddings.image_rendition import ImageCodecError, ImageInfo
+from wsj_embeddings.image_rendition import (
+    ImageCodecError,
+    ImageInfo,
+    PillowImageCodec,
+)
 from wsj_embeddings.pipeline import (
     EmbeddingPipelineError,
     EmbeddingPipelineLockedError,
@@ -493,6 +503,51 @@ class ScenarioImageAdapter(RecordingMultimodalAdapter):
         image_input_rules=ScenarioImageCodec.input_rules,
         image_transform=ScenarioImageCodec.transform_id,
     )
+
+
+def install_synthetic_pillow(
+    monkeypatch,
+    *,
+    jpeg_version: str,
+    turbo_version: str,
+    open_image,
+) -> None:
+    """Install a complete synthetic Pillow import boundary without a wheel."""
+
+    class DecompressionBombError(Exception):
+        pass
+
+    class DecompressionBombWarning(RuntimeWarning):
+        pass
+
+    class UnidentifiedImageError(Exception):
+        pass
+
+    image = types.SimpleNamespace(
+        DecompressionBombError=DecompressionBombError,
+        DecompressionBombWarning=DecompressionBombWarning,
+        open=open_image,
+    )
+    features = types.SimpleNamespace(
+        check=lambda name: name == "webp",
+        check_codec=lambda name: name in {"jpg", "zlib"},
+        check_feature=lambda name: name == "libjpeg_turbo",
+        version_codec=lambda name: {
+            "jpg": jpeg_version,
+            "zlib": "1.3.1",
+        }[name],
+        version_feature=lambda name: (
+            turbo_version if name == "libjpeg_turbo" else None
+        ),
+        version_module=lambda name: "1.5.0" if name == "webp" else None,
+    )
+    pillow = types.ModuleType("PIL")
+    pillow.__version__ = "11.3.0"
+    pillow.Image = image
+    pillow.ImageOps = types.SimpleNamespace(exif_transpose=lambda value: value)
+    pillow.UnidentifiedImageError = UnidentifiedImageError
+    pillow.features = features
+    monkeypatch.setitem(sys.modules, "PIL", pillow)
 
 
 class InterruptingImageAdapter(RecordingMultimodalAdapter):
@@ -1912,7 +1967,10 @@ def test_pipeline_publishes_all_three_modalities_with_source_provenance(tmp_path
     assert provenance[2] == provenance[12]
     assert provenance[3:7] == provenance[8:12]
     assert provenance[7] == "l2-normalize-0.5-text-0.5-image-v1"
-    assert validate_embedding_outputs(config) == EmbeddingValidationResult(issues=())
+    assert validate_embedding_outputs(
+        config,
+        image_codec=image_codec,
+    ) == EmbeddingValidationResult(issues=())
 
 
 def test_composite_only_recovery_reuses_both_source_generations(
@@ -2485,7 +2543,7 @@ def test_oversized_header_image_publishes_verified_versioned_rendition(tmp_path)
             codec.transform_id,
             expected_relative_path,
         )
-    assert validate_embedding_outputs(config).ok
+    assert validate_embedding_outputs(config, image_codec=codec).ok
 
 
 @pytest.mark.parametrize(
@@ -2621,6 +2679,163 @@ def test_rendition_install_interruption_precedes_embedding_state_commit(tmp_path
     assert snapshot_fixture_inputs(config) == before
 
 
+def test_rendition_directory_entries_are_fsynced_before_nested_publication(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: a crash loses newly created rendition directories."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated fsync oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    events: list[tuple[str, str | int, int]] = []
+    real_mkdir = os.mkdir
+    real_fsync = os.fsync
+    real_link = os.link
+
+    def observed_mkdir(path, mode=0o777, *, dir_fd=None):
+        result = real_mkdir(path, mode=mode, dir_fd=dir_fd)
+        if dir_fd is not None:
+            events.append(("mkdir", str(path), os.fstat(dir_fd).st_ino))
+        return result
+
+    def observed_fsync(descriptor):
+        descriptor_stat = os.fstat(descriptor)
+        if stat.S_ISDIR(descriptor_stat.st_mode):
+            events.append(("fsync", descriptor_stat.st_ino, descriptor_stat.st_ino))
+        return real_fsync(descriptor)
+
+    def observed_link(
+        source,
+        destination,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
+        assert dst_dir_fd is not None
+        events.append(("link", str(destination), os.fstat(dst_dir_fd).st_ino))
+        return real_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(image_rendition_module.os, "mkdir", observed_mkdir)
+    monkeypatch.setattr(image_rendition_module.os, "fsync", observed_fsync)
+    monkeypatch.setattr(image_rendition_module.os, "link", observed_link)
+
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+
+    output_inode = config.embedding_output_root.stat().st_ino
+    rendition_inode = (config.embedding_output_root / "renditions").stat().st_ino
+    transform_namespace = hashlib.sha256(codec.transform_id.encode()).hexdigest()
+    transform_inode = (
+        config.embedding_output_root / "renditions" / transform_namespace
+    ).stat().st_ino
+    derived_sha256 = hashlib.sha256(derived_bytes).hexdigest()
+    relevant = [
+        event
+        for event in events
+        if event
+        in {
+            ("mkdir", "renditions", output_inode),
+            ("fsync", output_inode, output_inode),
+            ("mkdir", transform_namespace, rendition_inode),
+            ("fsync", rendition_inode, rendition_inode),
+            ("link", f"{derived_sha256}.jpg", transform_inode),
+            ("fsync", transform_inode, transform_inode),
+        }
+    ]
+    assert relevant == [
+        ("mkdir", "renditions", output_inode),
+        ("fsync", output_inode, output_inode),
+        ("mkdir", transform_namespace, rendition_inode),
+        ("fsync", rendition_inode, rendition_inode),
+        ("link", f"{derived_sha256}.jpg", transform_inode),
+        ("fsync", transform_inode, transform_inode),
+    ]
+
+
+@pytest.mark.parametrize("replacement_kind", ("replacement", "hardlink", "symlink"))
+def test_rendition_final_leaf_replacement_is_refused_before_state_commit(
+    tmp_path,
+    replacement_kind,
+):
+    """Break caught: final path identity changes after its verified descriptor read."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated raced oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    transform_id = ScenarioImageCodec.transform_id
+    transform_namespace = hashlib.sha256(transform_id.encode()).hexdigest()
+    derived_sha256 = hashlib.sha256(derived_bytes).hexdigest()
+    final_path = (
+        config.embedding_output_root
+        / "renditions"
+        / transform_namespace
+        / f"{derived_sha256}.jpg"
+    )
+
+    class ReplacingCodec(ScenarioImageCodec):
+        def __init__(self):
+            super().__init__(
+                {
+                    source_bytes: ImageInfo("PNG", 6000, 4000),
+                    derived_bytes: ImageInfo("JPEG", 5477, 3651),
+                }
+            )
+            self.derived_inspections = 0
+
+        def inspect(self, data: bytes, *, max_decode_pixels: int) -> ImageInfo:
+            result = super().inspect(data, max_decode_pixels=max_decode_pixels)
+            if data == derived_bytes:
+                self.derived_inspections += 1
+                if self.derived_inspections == 3:
+                    sibling = final_path.with_suffix(f".{replacement_kind}")
+                    if replacement_kind == "hardlink":
+                        os.link(final_path, sibling)
+                    else:
+                        final_path.replace(sibling)
+                        if replacement_kind == "symlink":
+                            final_path.symlink_to(sibling.name)
+                        else:
+                            final_path.write_bytes(derived_bytes)
+            return result
+
+    codec = ReplacingCodec()
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(
+            config,
+            ScenarioImageAdapter(),
+            limit=1,
+            image_codec=codec,
+        )
+
+    assert raised.value.code == "unsafe_rendition_output"
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone() == (0,)
+        assert db.execute("SELECT count(*) FROM embedding_work_items").fetchone() == (
+            0,
+        )
+
+
 def test_validator_requires_exact_image_provenance_and_rendition_bytes(tmp_path):
     """Break caught: image generations survive missing or changed embedded input."""
 
@@ -2658,6 +2873,159 @@ def test_validator_requires_exact_image_provenance_and_rendition_bytes(tmp_path)
     codes = {issue.code for issue in validate_embedding_outputs(config).issues}
 
     assert "missing_image_input_provenance" in codes
+
+
+def test_validator_decodes_source_bytes_to_verify_declared_image_facts(tmp_path):
+    """Break caught: self-consistent false image facts pass read-only validation."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated decoded pass-through png"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec({source_bytes: ImageInfo("PNG", 640, 360)})
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            UPDATE image_input_provenance
+            SET source_format = 'JPEG', embedded_format = 'JPEG'
+            """
+        )
+
+    codes = {
+        issue.code
+        for issue in validate_embedding_outputs(config, image_codec=codec).issues
+    }
+
+    assert "invalid_image_input_provenance" in codes
+
+
+def test_validator_fails_closed_without_matching_image_decoder(tmp_path):
+    """Break caught: provenance is accepted without a decoder for its profile."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated decoder-required png"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec({source_bytes: ImageInfo("PNG", 640, 360)})
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "image_codec_unavailable" in codes
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "UPDATE image_input_provenance SET embedded_format = 'PNG'",
+        """
+        UPDATE image_input_provenance
+        SET source_width = 640, source_height = 360
+        """,
+    ),
+    ids=("derived-must-be-jpeg", "declared-within-limit-must-pass-through"),
+)
+def test_validator_rejects_malformed_derived_image_contract(tmp_path, mutation):
+    """Break caught: a derived row can contradict the pinned hosted contract."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated malformed derived png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(mutation)
+
+    codes = {
+        issue.code
+        for issue in validate_embedding_outputs(config, image_codec=codec).issues
+    }
+
+    assert "invalid_image_input_provenance" in codes
+
+
+def test_validator_reports_image_provenance_with_unknown_configuration(tmp_path):
+    """Break caught: unselected provenance can reference no known configuration."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated unknown configuration image")
+    run_embedding_pipeline(config, RecordingMultimodalAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            INSERT INTO image_input_provenance
+            SELECT article_id, repeat('f', 64), generation_run_id,
+                   source_sha256, source_format, source_bytes,
+                   source_width, source_height, embedded_input_sha256,
+                   embedded_format, embedded_bytes, embedded_width,
+                   embedded_height, transform_id, rendition_relative_path,
+                   created_at
+            FROM image_input_provenance
+            """
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "unknown_image_provenance_configuration" in codes
+
+
+def test_validator_scans_renditions_for_orphans_temps_and_symlinks(tmp_path):
+    """Break caught: unreferenced or unsafe rendition output remains invisible."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated orphan scan oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    rendition_root = config.embedding_output_root / "renditions"
+    namespace = next(path for path in rendition_root.iterdir() if path.is_dir())
+    (namespace / "unreferenced.jpg").write_bytes(b"generated orphan")
+    (namespace / ".interrupted.tmp").write_bytes(b"generated stage")
+    outside = config.embedding_output_root / "generated-outside-rendition"
+    outside.write_bytes(b"generated outside")
+    (namespace / "unsafe-link.jpg").symlink_to(outside)
+
+    codes = {
+        issue.code
+        for issue in validate_embedding_outputs(config, image_codec=codec).issues
+    }
+
+    assert {
+        "orphan_image_rendition",
+        "orphan_image_rendition_temp",
+        "unsafe_image_rendition_entry",
+    } <= codes
 
 
 def test_changed_image_transform_creates_distinct_vectors_and_renditions(tmp_path):
@@ -2750,10 +3118,12 @@ def test_changed_image_transform_creates_distinct_vectors_and_renditions(tmp_pat
     assert validate_embedding_outputs(
         config,
         configuration_id=first_configuration,
+        image_codec=first_codec,
     ).ok
     assert validate_embedding_outputs(
         config,
         configuration_id=second_configuration,
+        image_codec=second_codec,
     ).ok
 
 
@@ -2783,6 +3153,133 @@ def test_image_codec_profile_mismatch_fails_before_state_or_hosted_request(tmp_p
         assert db.execute("SELECT count(*) FROM embedding_work_items").fetchone() == (
             0,
         )
+
+
+@pytest.mark.parametrize("bomb_kind", ("error", "warning"))
+def test_pillow_decompression_bomb_is_terminal_unsafe_image_without_vector(
+    tmp_path,
+    monkeypatch,
+    bomb_kind,
+):
+    """Break caught: Pillow's bomb exception escapes and aborts the run."""
+
+    def raise_bomb(stream):
+        del stream
+        image = sys.modules["PIL"].Image
+        if bomb_kind == "warning":
+            warnings.warn(
+                "synthetic header bomb",
+                image.DecompressionBombWarning,
+                stacklevel=2,
+            )
+            raise AssertionError("bomb warning was not promoted to an exception")
+        raise image.DecompressionBombError
+
+    install_synthetic_pillow(
+        monkeypatch,
+        jpeg_version="9e",
+        turbo_version="3.1.0",
+        open_image=raise_bomb,
+    )
+    codec = PillowImageCodec()
+
+    class BombAdapter(RecordingMultimodalAdapter):
+        profile = replace(
+            FakeEmbeddingAdapter.profile,
+            image_transform=codec.transform_id,
+        )
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated bomb header"
+    attach_generated_header_image(config, source_bytes)
+    adapter = BombAdapter()
+
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        image_codec=codec,
+    )
+
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=1,
+        succeeded=1,
+        terminal=1,
+        header_failed=1,
+    )
+    assert adapter.image_calls == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code
+            FROM embedding_work_items
+            WHERE modality = 'header_image'
+            """
+        ).fetchone() == ("terminal", 0, "unsafe_image")
+        assert db.execute(
+            "SELECT count(*) FROM embeddings WHERE modality = 'header_image'"
+        ).fetchone() == (0,)
+
+
+def test_pillow_jpeg_build_identity_changes_configuration_and_mismatch_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    """Break caught: distinct linked JPEG builds claim identical vector meaning."""
+
+    install_synthetic_pillow(
+        monkeypatch,
+        jpeg_version="9e",
+        turbo_version="3.1.0",
+        open_image=lambda stream: None,
+    )
+    first_codec = PillowImageCodec()
+    install_synthetic_pillow(
+        monkeypatch,
+        jpeg_version="9f",
+        turbo_version="3.2.0",
+        open_image=lambda stream: None,
+    )
+    second_codec = PillowImageCodec()
+    first_adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "generated-fixture-key"},
+    )
+    second_adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "generated-fixture-key"},
+    )
+    first_adapter.bind_image_codec(first_codec)
+    second_adapter.bind_image_codec(second_codec)
+
+    assert first_codec.transform_id != second_codec.transform_id
+    assert first_adapter.profile.image_transform == first_codec.transform_id
+    assert second_adapter.profile.image_transform == second_codec.transform_id
+    assert configuration_id(first_adapter.profile) != configuration_id(
+        second_adapter.profile
+    )
+    with pytest.raises(ImageCodecError) as rebound:
+        first_adapter.bind_image_codec(second_codec)
+    assert rebound.value.code == "ambiguous_image_configuration"
+
+    class SecondBuildAdapter(RecordingMultimodalAdapter):
+        profile = second_adapter.profile
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated mismatched jpeg build"
+    attach_generated_header_image(config, source_bytes)
+    adapter = SecondBuildAdapter()
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(
+            config,
+            adapter,
+            limit=1,
+            image_codec=first_codec,
+        )
+
+    assert raised.value.code == "ambiguous_image_configuration"
+    assert adapter.image_calls == 0
 
 
 def test_deterministic_header_rejection_becomes_terminal_after_three_attempts(

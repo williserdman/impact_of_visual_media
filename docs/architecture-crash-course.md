@@ -336,7 +336,11 @@ hosted pixel ceiling, and encoded as JPEG by exactly Pillow 11.3.0 with quality
 85, 4:2:0 subsampling, Lanczos resize, and progressive/optimize disabled. This
 conservative transform is implementation policy pending a credentialed
 synthetic pilot that confirms the live image contract. Both the input rules and
-transform ID participate in `configuration_id`.
+transform ID participate in `configuration_id`. The runtime transform ID also
+binds the linked JPEG, libjpeg-turbo, zlib, and WebP build versions; codec/profile
+ambiguity fails before configuration or work publication. The production Pillow
+path remains unexecuted in the shared environment and requires Task 14/ticket
+15's clean-install synthetic verification.
 
 The rendition is staged below `renditions/<transform-hash>/`, fsynced, reopened,
 decoded, byte-compared, hashed, and atomically installed before the run or work
@@ -614,6 +618,12 @@ unsupported modality/dimension, orphaned canonical identities, publication
 mismatch, unsafe or missing canonical Markdown/header images, rendition and
 image-input-provenance mismatches, input-hash
 mismatch, non-finite/zero/non-unit vectors, and float32 vector-hash mismatch.
+For current image generations it uses the exact matching profile codec to decode
+source and embedded bytes and prove the declared hashes, formats, byte counts,
+dimensions, pass-through decision, and derived-JPEG contract. It also rejects
+globally unknown provenance configuration references and descriptor-scans the
+rendition namespace without following symlinks, reporting unsafe entries and
+unreferenced final or temporary files without deleting them.
 It also checks bounded long-text lifecycle/vector state and resolves complete
 active and archived aggregate provenance to immutable part generations. It
 recomputes every aggregate hash, compares active vectors, and reopens current

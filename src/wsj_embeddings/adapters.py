@@ -11,13 +11,15 @@ import struct
 import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from wsj_embeddings.image_rendition import (
     PRODUCTION_IMAGE_INPUT_RULES,
     PRODUCTION_IMAGE_TRANSFORM_ID,
     FixturePassthroughImageCodec,
+    ImageCodec,
+    ImageCodecError,
 )
 from wsj_embeddings.long_text import TextOffsetTokenizer
 from wsj_embeddings.models import EmbeddingProfile
@@ -245,6 +247,28 @@ class JinaEmbeddingAdapter:
         """Tokenize locally with the immutable checksum-verified v4 artifact."""
 
         return self._tokenizer.token_offsets(text)
+
+    def bind_image_codec(self, codec: ImageCodec) -> None:
+        """Bind runtime encoder-build meaning before configuration publication."""
+
+        if (
+            codec.input_rules != PRODUCTION_IMAGE_INPUT_RULES
+            or not codec.transform_id.startswith(
+                f"{PRODUCTION_IMAGE_TRANSFORM_ID}-build-"
+            )
+        ):
+            raise ImageCodecError("ambiguous_image_configuration")
+        existing = getattr(self, "image_codec", None)
+        if existing is not None and (
+            existing.input_rules != codec.input_rules
+            or existing.transform_id != codec.transform_id
+        ):
+            raise ImageCodecError("ambiguous_image_configuration")
+        self.image_codec = codec
+        self.profile = replace(
+            JinaEmbeddingAdapter.profile,
+            image_transform=codec.transform_id,
+        )
 
     def embed_text(self, text: str) -> tuple[float, ...]:
         """Maintain the existing coordinator adapter seam for text-only callers."""

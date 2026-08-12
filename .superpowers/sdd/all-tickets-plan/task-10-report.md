@@ -153,3 +153,83 @@ coordinator tests exercised the same policy and publication seam with a
 deterministic injectable codec. Ticket 15 owns a clean temporary dependency
 install and production-codec test with synthetic Pillow fixtures before real
 corpus authorization.
+
+## Review-fix round 1
+
+Pillow decompression-bomb exceptions and warnings promoted during header open,
+verify, decode, orientation, or render now map to the stable local terminal
+`unsafe_image`. They do not abort the complete run, purchase an image request,
+or publish a placeholder. A synthetic production-import seam covers both the
+exception and warning paths without installing Pillow into the shared
+environment.
+
+The runtime transform identity now extends the pinned algorithm with sanitized
+linked JPEG, libjpeg-turbo, zlib, and WebP build versions reported by Pillow.
+The production adapter binds this codec before calculating or publishing its
+profile/configuration identity. Rebinding to a different build or supplying a
+codec that does not exactly match the declared profile fails closed before run
+state. Two injected build matrices produce distinct runtime profiles and
+configuration IDs. This verifies binding logic, not the real encoder; Task
+14/ticket 15 still owns clean-install execution of Pillow 11.3.0 with generated
+images.
+
+Rendition directory creation is now crash durable: each newly created
+descriptor-relative child entry is followed by fsync of its parent before the
+next nested publication. Final verification holds the no-follow descriptor
+through read/hash/decode, proves regular/single-link/size and pre/post descriptor
+stability, then re-resolves the leaf without following links and requires the
+same device/inode before returning. Replacement, added-hardlink, and symlink
+races all abort before run or work state.
+
+Read-only validation now uses the exact matching profile codec to decode current
+source and embedded bytes. It independently checks hashes, formats, byte counts,
+dimensions, exact pass-through eligibility, and the derived JPEG/hosted limits.
+It fails closed when no matching decoder is available, detects image provenance
+for unknown configurations globally, and descriptor-scans all rendition
+namespaces without following symlinks. Unsafe entries, unreferenced final files,
+and interrupted temporary files are reported without cleanup.
+
+Review-fix RED/GREEN evidence:
+
+- bomb and build identity initially observed `2 failed, 138 deselected`; after
+  adding the warning case the complete RED was `3 failed, 138 deselected`, then
+  GREEN was `3 passed, 138 deselected in 5.07s`;
+- parent-fsync and final re-anchor fixtures observed
+  `4 failed, 141 deselected in 18.80s`, then
+  `4 passed, 141 deselected in 8.52s`;
+- decoded source facts observed `1 failed, 145 deselected`, then
+  `1 passed, 145 deselected in 4.94s`;
+- unknown-configuration and descriptor-orphan scanning observed
+  `2 failed, 148 deselected in 9.51s`; the combined decoded-facts,
+  derived-contract, global-reference, and orphan selection then passed
+  `5 passed, 145 deselected in 26.64s`;
+- fail-closed missing decoder observed `1 failed, 150 deselected`, then
+  `1 passed, 150 deselected in 5.32s`; and
+- production-adapter runtime binding observed `1 failed, 149 deselected`, then
+  `1 passed, 149 deselected in 1.82s`.
+
+The combined affected implementation selection passed
+`18 passed, 133 deselected in 48.86s`; changed-file Ruff and `git diff --check`
+were clean at that checkpoint.
+
+An established pass-through/oversized/fresh-validation/transform selection
+then exposed one stricter-validator fixture wiring omission: three passed and
+the synthetic three-modality case reported `image_codec_unavailable`. Supplying
+that fixture's already injected matching codec produced GREEN:
+`1 passed, 150 deselected in 4.81s`.
+
+Review-fix self-review confirmed that build identity is captured before
+`configuration_id` and `begin_run`; local bomb dispositions remain distinct
+from hosted-attempt failures; every successful derived row declares and decodes
+as JPEG; directory-entry fsync ordering precedes deeper publication; final leaf
+verification compares descriptor and path identity; and orphan traversal never
+follows a rendition symlink. No schema shape changed, so schema version 10
+remains correct.
+
+Final fix-round verification (no full suite): changed-file Ruff passed; embedding
+smoke returned `{"articles": 1, "embeddings": 1, "validation_ok": true}`;
+preprocessing smoke returned two articles, three successful inputs, one
+duplicate, zero failures, and validation true; `run --help` retained its three
+explicit roots, positive limit, bounded reprocess, and hosted authorization;
+diff whitespace, tracked generated artifacts, stale current schema claims, and
+relative operator-document links had no findings.

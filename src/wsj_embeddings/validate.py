@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
+import stat
 import struct
 from dataclasses import dataclass
 
@@ -16,7 +18,18 @@ from wsj_embeddings.canonical_markdown import (
 from wsj_embeddings.catalog import EmbeddingCatalog, EmbeddingCatalogError
 from wsj_embeddings.catalog import configuration_id as profile_configuration_id
 from wsj_embeddings.config import EmbeddingPipelineConfig
-from wsj_embeddings.image_rendition import SOURCE_BYTES_TRANSFORM_ID
+from wsj_embeddings.image_rendition import (
+    MAX_HOSTED_IMAGE_BYTES,
+    MAX_HOSTED_IMAGE_PIXELS,
+    MAX_SAFE_DECODE_PIXELS,
+    PRODUCTION_IMAGE_INPUT_RULES,
+    PRODUCTION_IMAGE_TRANSFORM_ID,
+    SOURCE_BYTES_TRANSFORM_ID,
+    FixturePassthroughImageCodec,
+    ImageCodec,
+    ImageCodecError,
+    PillowImageCodec,
+)
 from wsj_embeddings.models import (
     CanonicalArticle,
     EmbeddingModality,
@@ -39,6 +52,8 @@ from wsj_embeddings.source_image import (
     read_source_image,
 )
 from wsj_pipeline.catalog import Catalog, CatalogError
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +79,7 @@ def validate_embedding_outputs(
     config: EmbeddingPipelineConfig,
     *,
     configuration_id: str | None = None,
+    image_codec: ImageCodec | None = None,
 ) -> EmbeddingValidationResult:
     """Check embedding output against canonical generated preprocessing state."""
 
@@ -74,12 +90,27 @@ def validate_embedding_outputs(
             articles = _canonical_articles(config, issues)
             if articles is not None:
                 _validate_configurations(catalog.connection, issues)
+                _validate_global_image_provenance_references(
+                    catalog.connection,
+                    issues,
+                )
+                _validate_rendition_artifacts(
+                    catalog.connection,
+                    config,
+                    issues,
+                )
                 selected_configuration_id = _select_configuration_id(
                     catalog.connection,
                     configuration_id,
                     issues,
                 )
                 if selected_configuration_id is not None:
+                    resolved_image_codec = _resolve_validation_image_codec(
+                        catalog.connection,
+                        selected_configuration_id,
+                        image_codec,
+                        issues,
+                    )
                     _validate_run_coverage(
                         catalog.connection, selected_configuration_id, issues
                     )
@@ -112,8 +143,10 @@ def validate_embedding_outputs(
                     _validate_image_input_provenance(
                         catalog.connection,
                         config,
+                        articles,
                         selected_configuration_id,
                         issues,
+                        resolved_image_codec,
                     )
                     _validate_multimodal_provenance(
                         catalog.connection,
@@ -716,8 +749,10 @@ def _validate_embeddings(
 def _validate_image_input_provenance(
     connection: duckdb.DuckDBPyConnection,
     config: EmbeddingPipelineConfig,
+    articles: dict[str, CanonicalArticle],
     configuration_id: str,
     issues: list[EmbeddingValidationIssue],
+    image_codec: ImageCodec | None,
 ) -> None:
     """Resolve every image generation to the exact bytes supplied to Jina."""
 
@@ -739,13 +774,35 @@ def _validate_image_input_provenance(
         (str(article_id), str(generation_run_id), str(source_sha256))
         for article_id, generation_run_id, source_sha256 in generation_rows
     }
-    configured_transform = connection.execute(
+    active_generations = {
+        (str(article_id), str(generation_run_id))
+        for article_id, generation_run_id in connection.execute(
+            """
+            SELECT article_id, generation_run_id
+            FROM embedding_work_items
+            WHERE configuration_id = ? AND modality = 'header_image'
+              AND state = 'succeeded' AND generation_run_id IS NOT NULL
+            """,
+            [configuration_id],
+        ).fetchall()
+    }
+    configured_input_rules, configured_transform = connection.execute(
         """
-        SELECT image_transform FROM embedding_configurations
+        SELECT image_input_rules, image_transform FROM embedding_configurations
         WHERE configuration_id = ?
         """,
         [configuration_id],
-    ).fetchone()[0]
+    ).fetchone()
+    if image_codec is not None and (
+        image_codec.input_rules != configured_input_rules
+        or image_codec.transform_id != configured_transform
+    ):
+        _append(
+            issues,
+            "invalid_image_input_provenance",
+            "image decoder differs from configuration identity",
+        )
+        image_codec = None
     rows = connection.execute(
         """
         SELECT article_id, generation_run_id, source_sha256, source_format,
@@ -807,6 +864,43 @@ def _validate_image_input_provenance(
                 "invalid_image_input_provenance",
                 "image input provenance contains invalid content-free facts",
             )
+        source_data: bytes | None = None
+        decoded_source = None
+        if (
+            image_codec is not None
+            and (str(article_id), str(generation_run_id)) in active_generations
+        ):
+            article = articles.get(str(article_id))
+            try:
+                if article is None or article.header_image_path is None:
+                    raise SourceImageError("missing")
+                source_data = read_source_image(
+                    config.source_root,
+                    article.header_image_path,
+                )
+                decoded_source = image_codec.inspect(
+                    source_data,
+                    max_decode_pixels=MAX_SAFE_DECODE_PIXELS,
+                )
+            except (ImageCodecError, SourceImageError):
+                _append(
+                    issues,
+                    "invalid_image_input_provenance",
+                    "source image cannot prove declared provenance facts",
+                )
+            else:
+                if (
+                    hashlib.sha256(source_data).hexdigest() != source_sha256
+                    or len(source_data) != source_bytes
+                    or decoded_source.format != source_format
+                    or decoded_source.width != source_width
+                    or decoded_source.height != source_height
+                ):
+                    _append(
+                        issues,
+                        "invalid_image_input_provenance",
+                        "decoded source image differs from declared provenance facts",
+                    )
         if rendition_relative_path is None:
             if (
                 transform_id != SOURCE_BYTES_TRANSFORM_ID
@@ -821,7 +915,22 @@ def _validate_image_input_provenance(
                     "invalid_image_input_provenance",
                     "source-byte image provenance does not identify exact input",
                 )
+            if source_data is not None and (
+                hashlib.sha256(source_data).hexdigest() != embedded_sha256
+                or len(source_data) != embedded_bytes
+            ):
+                _append(
+                    issues,
+                    "invalid_image_input_provenance",
+                    "source-byte image does not match exact embedded input",
+                )
             continue
+        if embedded_format != "JPEG":
+            _append(
+                issues,
+                "invalid_image_input_provenance",
+                "derived image input does not declare the JPEG contract",
+            )
         transform_namespace = hashlib.sha256(str(transform_id).encode()).hexdigest()
         if transform_id != configured_transform:
             _append(
@@ -868,12 +977,240 @@ def _validate_image_input_provenance(
                 "rendition_hash_mismatch",
                 "image rendition bytes differ from embedded input provenance",
             )
+        if image_codec is not None:
+            try:
+                decoded_embedded = image_codec.inspect(
+                    rendition,
+                    max_decode_pixels=MAX_SAFE_DECODE_PIXELS,
+                )
+            except ImageCodecError:
+                _append(
+                    issues,
+                    "invalid_image_input_provenance",
+                    "rendition cannot prove declared embedded-input facts",
+                )
+            else:
+                if (
+                    embedded_format != "JPEG"
+                    or decoded_embedded.format != "JPEG"
+                    or decoded_embedded.width != embedded_width
+                    or decoded_embedded.height != embedded_height
+                    or decoded_embedded.pixels > MAX_HOSTED_IMAGE_PIXELS
+                    or len(rendition) > MAX_HOSTED_IMAGE_BYTES
+                ):
+                    _append(
+                        issues,
+                        "invalid_image_input_provenance",
+                        "decoded rendition differs from the hosted JPEG contract",
+                    )
+        if (
+            decoded_source is not None
+            and source_data is not None
+            and len(source_data) <= MAX_HOSTED_IMAGE_BYTES
+            and decoded_source.pixels <= MAX_HOSTED_IMAGE_PIXELS
+        ):
+            _append(
+                issues,
+                "invalid_image_input_provenance",
+                "within-limit supported source image was not passed through",
+            )
     if expected_generations - observed_generations:
         _append(
             issues,
             "missing_image_input_provenance",
             "header-image generations lack exact input provenance",
         )
+
+
+def _resolve_validation_image_codec(
+    connection: duckdb.DuckDBPyConnection,
+    configuration_id: str,
+    supplied: ImageCodec | None,
+    issues: list[EmbeddingValidationIssue],
+) -> ImageCodec | None:
+    if supplied is not None:
+        return supplied
+    provenance_count = connection.execute(
+        """
+        SELECT count(*) FROM image_input_provenance
+        WHERE configuration_id = ?
+        """,
+        [configuration_id],
+    ).fetchone()[0]
+    if not provenance_count:
+        return None
+    input_rules, transform_id = connection.execute(
+        """
+        SELECT image_input_rules, image_transform
+        FROM embedding_configurations
+        WHERE configuration_id = ?
+        """,
+        [configuration_id],
+    ).fetchone()
+    if (
+        input_rules == PRODUCTION_IMAGE_INPUT_RULES
+        and transform_id == PRODUCTION_IMAGE_TRANSFORM_ID
+    ):
+        return FixturePassthroughImageCodec()
+    if (
+        input_rules == PRODUCTION_IMAGE_INPUT_RULES
+        and str(transform_id).startswith(f"{PRODUCTION_IMAGE_TRANSFORM_ID}-build-")
+    ):
+        try:
+            codec = PillowImageCodec()
+        except ImageCodecError:
+            codec = None
+        if codec is not None and codec.transform_id == transform_id:
+            return codec
+    _append(
+        issues,
+        "image_codec_unavailable",
+        "configured image provenance cannot be decoded locally",
+    )
+    return None
+
+
+def _validate_global_image_provenance_references(
+    connection: duckdb.DuckDBPyConnection,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    unknown = connection.execute(
+        """
+        SELECT count(*)
+        FROM image_input_provenance AS p
+        LEFT JOIN embedding_configurations AS c USING (configuration_id)
+        WHERE c.configuration_id IS NULL
+        """
+    ).fetchone()[0]
+    if unknown:
+        _append(
+            issues,
+            "unknown_image_provenance_configuration",
+            "image input provenance references an unknown configuration",
+        )
+
+
+def _validate_rendition_artifacts(
+    connection: duckdb.DuckDBPyConnection,
+    config: EmbeddingPipelineConfig,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Scan the descriptor-anchored rendition namespace without following links."""
+
+    referenced = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT rendition_relative_path
+            FROM image_input_provenance
+            WHERE rendition_relative_path IS NOT NULL
+            """
+        ).fetchall()
+    }
+    try:
+        output_descriptor = os.open(config.embedding_output_root, _DIRECTORY_FLAGS)
+    except OSError:
+        return
+    try:
+        try:
+            rendition_descriptor = os.open(
+                "renditions",
+                _DIRECTORY_FLAGS,
+                dir_fd=output_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        except OSError:
+            _append(
+                issues,
+                "unsafe_image_rendition_entry",
+                "rendition namespace contains an unsafe entry",
+            )
+            return
+        try:
+            with os.scandir(rendition_descriptor) as namespaces:
+                for namespace in namespaces:
+                    if namespace.is_symlink() or not namespace.is_dir(
+                        follow_symlinks=False
+                    ):
+                        _append(
+                            issues,
+                            "unsafe_image_rendition_entry",
+                            "rendition namespace contains an unsafe entry",
+                        )
+                        continue
+                    namespace_stat = namespace.stat(follow_symlinks=False)
+                    try:
+                        namespace_descriptor = os.open(
+                            namespace.name,
+                            _DIRECTORY_FLAGS,
+                            dir_fd=rendition_descriptor,
+                        )
+                    except OSError:
+                        _append(
+                            issues,
+                            "unsafe_image_rendition_entry",
+                            "rendition namespace contains an unsafe entry",
+                        )
+                        continue
+                    try:
+                        opened_stat = os.fstat(namespace_descriptor)
+                        if (
+                            not stat.S_ISDIR(opened_stat.st_mode)
+                            or (namespace_stat.st_dev, namespace_stat.st_ino)
+                            != (opened_stat.st_dev, opened_stat.st_ino)
+                        ):
+                            _append(
+                                issues,
+                                "unsafe_image_rendition_entry",
+                                "rendition namespace contains an unsafe entry",
+                            )
+                            continue
+                        _scan_rendition_namespace(
+                            namespace.name,
+                            namespace_descriptor,
+                            referenced,
+                            issues,
+                        )
+                    finally:
+                        os.close(namespace_descriptor)
+        finally:
+            os.close(rendition_descriptor)
+    finally:
+        os.close(output_descriptor)
+
+
+def _scan_rendition_namespace(
+    namespace: str,
+    directory_descriptor: int,
+    referenced: set[str],
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    with os.scandir(directory_descriptor) as entries:
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                _append(
+                    issues,
+                    "unsafe_image_rendition_entry",
+                    "rendition namespace contains an unsafe entry",
+                )
+                continue
+            relative_path = f"renditions/{namespace}/{entry.name}"
+            if relative_path in referenced:
+                continue
+            _append(
+                issues,
+                (
+                    "orphan_image_rendition_temp"
+                    if entry.name.endswith(".tmp")
+                    else "orphan_image_rendition"
+                ),
+                (
+                    "unreferenced rendition staging file remains"
+                    if entry.name.endswith(".tmp")
+                    else "unreferenced rendition file remains"
+                ),
+            )
 
 
 def _validate_multimodal_provenance(

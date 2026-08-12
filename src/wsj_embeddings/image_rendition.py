@@ -6,7 +6,9 @@ import hashlib
 import io
 import math
 import os
+import re
 import stat
+import warnings
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -81,7 +83,7 @@ class PillowImageCodec:
     def __init__(self) -> None:
         try:
             import PIL
-            from PIL import Image, ImageOps, UnidentifiedImageError
+            from PIL import Image, ImageOps, UnidentifiedImageError, features
         except ImportError as error:
             raise ImageCodecError("image_codec_unavailable") from error
         if PIL.__version__ != "11.3.0":
@@ -89,26 +91,33 @@ class PillowImageCodec:
         self._image = Image
         self._image_ops = ImageOps
         self._unidentified_error = UnidentifiedImageError
+        self._bomb_error = Image.DecompressionBombError
+        self._bomb_warning = Image.DecompressionBombWarning
+        self.transform_id = _pillow_transform_id(features)
 
     def inspect(self, data: bytes, *, max_decode_pixels: int) -> ImageInfo:
         """Fully verify and decode one bounded in-memory image."""
 
         try:
-            with self._image.open(io.BytesIO(data)) as initial:
-                image_format = str(initial.format or "").upper()
-                frames = int(getattr(initial, "n_frames", 1))
-                width, height = initial.size
-                if width * height > max_decode_pixels:
-                    raise ImageCodecError("unsafe_image")
-                initial.verify()
-            with self._image.open(io.BytesIO(data)) as decoded:
-                oriented = self._image_ops.exif_transpose(decoded)
-                oriented.load()
-                oriented_width, oriented_height = oriented.size
-                if oriented_width * oriented_height > max_decode_pixels:
-                    raise ImageCodecError("unsafe_image")
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", self._bomb_warning)
+                with self._image.open(io.BytesIO(data)) as initial:
+                    image_format = str(initial.format or "").upper()
+                    frames = int(getattr(initial, "n_frames", 1))
+                    width, height = initial.size
+                    if width * height > max_decode_pixels:
+                        raise ImageCodecError("unsafe_image")
+                    initial.verify()
+                with self._image.open(io.BytesIO(data)) as decoded:
+                    oriented = self._image_ops.exif_transpose(decoded)
+                    oriented.load()
+                    oriented_width, oriented_height = oriented.size
+                    if oriented_width * oriented_height > max_decode_pixels:
+                        raise ImageCodecError("unsafe_image")
         except ImageCodecError:
             raise
+        except (self._bomb_error, self._bomb_warning) as error:
+            raise ImageCodecError("unsafe_image") from error
         except (OSError, SyntaxError, ValueError, self._unidentified_error) as error:
             raise ImageCodecError("corrupt_image") from error
         return ImageInfo(image_format, oriented_width, oriented_height, frames)
@@ -123,32 +132,70 @@ class PillowImageCodec:
         """Render metadata-free RGB JPEG with one pinned encoder contract."""
 
         try:
-            with self._image.open(io.BytesIO(data)) as decoded:
-                image = self._image_ops.exif_transpose(decoded)
-                image.load()
-                if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
-                    rgba = image.convert("RGBA")
-                    background = self._image.new("RGBA", rgba.size, "white")
-                    image = self._image.alpha_composite(background, rgba).convert("RGB")
-                else:
-                    image = image.convert("RGB")
-                if image.size != (width, height):
-                    image = image.resize(
-                        (width, height),
-                        resample=self._image.Resampling.LANCZOS,
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", self._bomb_warning)
+                with self._image.open(io.BytesIO(data)) as decoded:
+                    image = self._image_ops.exif_transpose(decoded)
+                    image.load()
+                    if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+                        rgba = image.convert("RGBA")
+                        background = self._image.new("RGBA", rgba.size, "white")
+                        image = self._image.alpha_composite(background, rgba).convert(
+                            "RGB"
+                        )
+                    else:
+                        image = image.convert("RGB")
+                    if image.size != (width, height):
+                        image = image.resize(
+                            (width, height),
+                            resample=self._image.Resampling.LANCZOS,
+                        )
+                    output = io.BytesIO()
+                    image.save(
+                        output,
+                        format="JPEG",
+                        quality=85,
+                        subsampling=2,
+                        optimize=False,
+                        progressive=False,
                     )
-                output = io.BytesIO()
-                image.save(
-                    output,
-                    format="JPEG",
-                    quality=85,
-                    subsampling=2,
-                    optimize=False,
-                    progressive=False,
-                )
+        except (self._bomb_error, self._bomb_warning) as error:
+            raise ImageCodecError("unsafe_image") from error
         except (OSError, SyntaxError, ValueError, self._unidentified_error) as error:
             raise ImageCodecError("image_encode_failure") from error
         return output.getvalue()
+
+
+def _pillow_transform_id(features: object) -> str:
+    """Bind deterministic transform meaning to the linked Pillow codec build."""
+
+    try:
+        if not features.check_codec("jpg") or not features.check_codec("zlib"):
+            raise ImageCodecError("image_codec_unavailable")
+        if not features.check("webp"):
+            raise ImageCodecError("image_codec_unavailable")
+        jpeg = _safe_build_version(features.version_codec("jpg"))
+        zlib = _safe_build_version(features.version_codec("zlib"))
+        webp = _safe_build_version(features.version_module("webp"))
+        turbo = (
+            _safe_build_version(features.version_feature("libjpeg_turbo"))
+            if features.check_feature("libjpeg_turbo")
+            else "none"
+        )
+    except ImageCodecError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise ImageCodecError("image_codec_unavailable") from error
+    return (
+        f"{PRODUCTION_IMAGE_TRANSFORM_ID}-build-jpeg-{jpeg}-turbo-{turbo}-"
+        f"zlib-{zlib}-webp-{webp}"
+    )
+
+
+def _safe_build_version(value: object) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._+\-]+", value):
+        raise ImageCodecError("image_codec_unavailable")
+    return value
 
 
 class FixturePassthroughImageCodec:
@@ -370,13 +417,22 @@ def install_image_rendition(
 def _open_or_create_directory(parent_descriptor: int, name: str) -> int:
     if not name or name in {".", ".."} or os.path.basename(name) != name:
         raise ImageCodecError("unsafe_rendition_output")
+    descriptor: int | None = None
+    created = False
     try:
-        with suppress(FileExistsError):
+        try:
             os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+            created = True
+        except FileExistsError:
+            pass
         descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_descriptor)
         descriptor_stat = os.fstat(descriptor)
         path_stat = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if created:
+            os.fsync(parent_descriptor)
     except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
         raise ImageCodecError("unsafe_rendition_output") from error
     if (
         not stat.S_ISDIR(path_stat.st_mode)
@@ -410,20 +466,31 @@ def _verify_rendition_leaf(
             raise ImageCodecError("unsafe_rendition_output")
         with os.fdopen(descriptor, "rb", closefd=False) as stream:
             observed = stream.read(MAX_HOSTED_IMAGE_BYTES + 1)
+        observed_info = _validated_info(
+            codec.inspect(observed, max_decode_pixels=MAX_HOSTED_IMAGE_PIXELS)
+        )
         after = os.fstat(descriptor)
+        path_stat = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
     except OSError as error:
         raise ImageCodecError("unsafe_rendition_output") from error
     finally:
         os.close(descriptor)
     if (
-        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        not stat.S_ISREG(after.st_mode)
+        or after.st_nlink != 1
+        or after.st_size != len(expected_data)
+        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
         != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or path_stat.st_nlink != 1
+        or (path_stat.st_dev, path_stat.st_ino) != (after.st_dev, after.st_ino)
         or observed != expected_data
         or hashlib.sha256(observed).hexdigest()
         != hashlib.sha256(expected_data).hexdigest()
-        or _validated_info(
-            codec.inspect(observed, max_decode_pixels=MAX_HOSTED_IMAGE_PIXELS)
-        )
-        != expected_info
+        or observed_info != expected_info
     ):
         raise ImageCodecError("unsafe_rendition_output")

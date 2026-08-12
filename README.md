@@ -173,7 +173,11 @@ the embedding output root before image work state can commit. This conservative
 transform is implementation policy pending confirmation by a credentialed
 synthetic pilot; changing it creates a new configuration identity. Unsupported,
 animated, corrupt, unsafe, or still-oversized input is terminal and publishes
-no placeholder vector. Markdown at or below the conservative 8,000-token input
+no placeholder vector. At runtime the transform identity additionally includes
+the linked JPEG, libjpeg-turbo, zlib, and WebP build versions; an unavailable or
+mismatched build fails before configuration or work publication. The production
+Pillow path still requires the clean-install synthetic verification owned by
+Task 14/ticket 15. Markdown at or below the conservative 8,000-token input
 ceiling keeps the single hosted-input path, reserving 192 tokens below the
 confirmed 8,192-token model context. Longer Markdown is greedily partitioned at
 complete blank-line-delimited block boundaries; an individually oversized
@@ -338,6 +342,12 @@ source and exact embedded-input hashes, formats, byte counts, dimensions,
 transform identity, and an optional output-relative rendition path. It stores
 no image bytes. Pass-through uses `exact-source-bytes-v1`; derived rows name
 the pinned transform and exact JPEG rendition supplied to the adapter.
+Read-only validation decodes current source and embedded bytes with the matching
+profile codec, proves their recorded hashes/formats/byte counts/dimensions and
+the pass-through-versus-JPEG decision, rejects unknown provenance configuration
+references, and descriptor-scans the rendition namespace without following
+symlinks. Unreferenced final and interrupted temporary renditions are reported
+as harmless orphans rather than deleted.
 The configured archive root is opened as an accessible, no-follow directory
 before the preprocessing catalog, any item, or embedding output is touched. An
 absent, non-directory, or inaccessible archive root is an operational
