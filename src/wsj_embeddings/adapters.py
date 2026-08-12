@@ -11,7 +11,7 @@ import struct
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Protocol
@@ -32,6 +32,8 @@ from wsj_embeddings.tokenizer import (
 )
 
 _JINA_EMBEDDINGS_URL = "https://api.jina.ai/v1/embeddings"
+_JINA_MODELS_URL = "https://api.jina.ai/v1/models"
+_JINA_OPENAPI_URL = "https://api.jina.ai/openapi.json"
 _JINA_MODEL = "jina-embeddings-v4"
 _JINA_TASK = "retrieval.passage"
 _JINA_DIMENSIONS = 2048
@@ -42,6 +44,9 @@ _TOKENIZER_IDENTITY = (
 )
 _SAFE_USAGE_FIELDS = frozenset(
     {"input_tokens", "output_tokens", "prompt_tokens", "total_tokens"}
+)
+_SAFE_BILLING_FIELDS = frozenset(
+    {"amount", "charged_tokens", "cost", "credits", "total"}
 )
 _SAFE_RATE_LIMIT_HEADERS = frozenset(
     {
@@ -173,6 +178,15 @@ class JinaTransport(Protocol):
         max_response_bytes: int,
     ) -> JinaHttpResponse: ...
 
+    def get(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        max_response_bytes: int,
+    ) -> JinaHttpResponse: ...
+
 
 class _JinaResponseTooLarge(RuntimeError):
     """Internal content-free signal from the bounded HTTP reader."""
@@ -204,11 +218,47 @@ class UrllibJinaTransport:
         timeout_seconds: float,
         max_response_bytes: int,
     ) -> JinaHttpResponse:
+        return self._request(
+            url,
+            method="POST",
+            headers=headers,
+            body=body,
+            timeout_seconds=timeout_seconds,
+            max_response_bytes=max_response_bytes,
+        )
+
+    def get(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+        max_response_bytes: int,
+    ) -> JinaHttpResponse:
+        return self._request(
+            url,
+            method="GET",
+            headers=headers,
+            body=None,
+            timeout_seconds=timeout_seconds,
+            max_response_bytes=max_response_bytes,
+        )
+
+    @staticmethod
+    def _request(
+        url: str,
+        *,
+        method: str,
+        headers: Mapping[str, str],
+        body: bytes | None,
+        timeout_seconds: float,
+        max_response_bytes: int,
+    ) -> JinaHttpResponse:
         request = urllib.request.Request(
             url,
             data=body,
             headers=dict(headers),
-            method="POST",
+            method=method,
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
@@ -257,6 +307,7 @@ class JinaEmbeddingResponse:
     vectors: tuple[JinaEmbeddedVector, ...]
     usage: dict[str, int | float]
     response_metadata: JinaResponseMetadata
+    billing: dict[str, int | float | str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +329,7 @@ class JinaEmbeddingBatchResponse:
     items: tuple[JinaBatchItemOutcome, ...]
     usage: dict[str, int | float]
     response_metadata: JinaResponseMetadata
+    billing: dict[str, int | float | str] = field(default_factory=dict)
 
 
 class JinaHostedAdapterError(RuntimeError):
@@ -351,6 +403,31 @@ class JinaEmbeddingAdapter:
 
         return self._tokenizer.token_offsets(text)
 
+    def fetch_openapi_document(
+        self, *, max_response_bytes: int = 4_000_000
+    ) -> tuple[Mapping[str, object], int]:
+        """Fetch the fixed public OpenAPI document through the bounded transport."""
+
+        return self._fetch_metadata_document(
+            _JINA_OPENAPI_URL,
+            headers={"Accept": "application/json"},
+            max_response_bytes=max_response_bytes,
+        )
+
+    def fetch_model_catalogue(
+        self, *, max_response_bytes: int = 1_000_000
+    ) -> tuple[Mapping[str, object], int]:
+        """Fetch the fixed authenticated model catalogue through the transport."""
+
+        return self._fetch_metadata_document(
+            _JINA_MODELS_URL,
+            headers={
+                "Accept": "application/json",
+                "Authorization": self._authorization,
+            },
+            max_response_bytes=max_response_bytes,
+        )
+
     def bind_image_codec(self, codec: ImageCodec) -> None:
         """Bind runtime encoder-build meaning before configuration publication."""
 
@@ -410,6 +487,7 @@ class JinaEmbeddingAdapter:
             ),
             usage=batch.usage,
             response_metadata=batch.response_metadata,
+            billing=batch.billing,
         )
 
     def embed_batch(
@@ -479,6 +557,7 @@ class JinaEmbeddingAdapter:
                 model=model,
                 rate_limit_headers=rate_headers,
             ),
+            billing=_safe_billing(payload.get("billing")),
         )
 
     def _send(self, body: bytes, *, max_response_bytes: int) -> JinaHttpResponse:
@@ -500,11 +579,42 @@ class JinaEmbeddingAdapter:
         except OSError:
             raise JinaHostedAdapterError("connection", retryable=True) from None
 
+    def _fetch_metadata_document(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        max_response_bytes: int,
+    ) -> tuple[Mapping[str, object], int]:
+        if max_response_bytes < 1:
+            raise ValueError("metadata response limit must be positive")
+        try:
+            response = self._transport.get(
+                url,
+                headers=headers,
+                timeout_seconds=self._timeout_seconds,
+                max_response_bytes=max_response_bytes,
+            )
+        except _JinaResponseTooLarge:
+            raise JinaHostedAdapterError("invalid_response", retryable=False) from None
+        except TimeoutError:
+            raise JinaHostedAdapterError("timeout", retryable=True) from None
+        except OSError:
+            raise JinaHostedAdapterError("connection", retryable=True) from None
+        if len(response.body) > max_response_bytes:
+            raise JinaHostedAdapterError("invalid_response", retryable=False)
+        if not 200 <= response.status_code < 300:
+            self._raise_for_status(response)
+        payload = self._decode_success(response)
+        if not _metadata_shape_is_bounded(payload):
+            raise JinaHostedAdapterError("invalid_response", retryable=False)
+        return payload, response.status_code
+
     @staticmethod
     def _decode_success(response: JinaHttpResponse) -> Mapping[str, object]:
         try:
             payload = json.loads(response.body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             raise JinaHostedAdapterError("invalid_response", retryable=False) from None
         if not isinstance(payload, dict):
             raise JinaHostedAdapterError("invalid_response", retryable=False)
@@ -694,6 +804,44 @@ def _safe_usage(value: object) -> dict[str, int | float]:
         if number is not None:
             usage[key] = number
     return usage
+
+
+def _metadata_shape_is_bounded(value: object) -> bool:
+    """Reject deeply nested or item-heavy metadata before pilot parsing."""
+
+    remaining = 100_000
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        remaining -= 1
+        if remaining < 0 or depth > 32:
+            return False
+        if isinstance(item, dict):
+            if len(item) > 20_000:
+                return False
+            stack.extend((key, depth + 1) for key in item)
+            stack.extend((nested, depth + 1) for nested in item.values())
+        elif isinstance(item, list):
+            if len(item) > 20_000:
+                return False
+            stack.extend((nested, depth + 1) for nested in item)
+        elif isinstance(item, str) and len(item.encode("utf-8")) > 65_536:
+            return False
+    return True
+
+
+def _safe_billing(value: object) -> dict[str, int | float | str]:
+    if not isinstance(value, dict) or len(value) > 32:
+        return {}
+    billing: dict[str, int | float | str] = {}
+    currency = _safe_response_model(value.get("currency"))
+    if currency is not None:
+        billing["currency"] = currency
+    for key in _SAFE_BILLING_FIELDS:
+        number = _safe_numeric_value(value.get(key), maximum=None)
+        if number is not None:
+            billing[key] = number
+    return billing
 
 
 def _safe_response_model(value: object) -> str | None:

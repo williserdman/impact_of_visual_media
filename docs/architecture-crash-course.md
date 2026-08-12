@@ -142,7 +142,12 @@ creates three disjoint temporary roots, publishes one fake 2,048-dimensional
 `{"articles": 1, "embeddings": 1, "validation_ok": true}`, and deletes the
 temporary fixture. `pilot` has no selectors and, only with `JINA_API_KEY`, uses
 the hosted adapter for its fixed generated probes without creating a catalog or
-output root. `inventory` performs a read-only aggregate over canonical winners
+output root. It queries only the fixed hosted OpenAPI, model-catalogue, and
+embeddings endpoints through bounded response readers. Its versioned JSON keeps
+the implemented client contract separate from live returned metadata, reports
+actual scheduler retry and overlap observations, and represents unavailable
+metadata or billing explicitly instead of inferring values. `inventory`
+performs a read-only aggregate over canonical winners
 without constructing an adapter or requiring `JINA_API_KEY`. `validate` opens
 both exact-schema catalogs read-only, requires an explicit configuration when
 multiple identities coexist, and returns stable integrity issues plus
@@ -357,8 +362,9 @@ input is accepted for decoding only through 40,000,000 pixels, EXIF-oriented,
 converted to metadata-free RGB on white, aspect-scaled only when above the
 hosted pixel ceiling, and encoded as JPEG by exactly Pillow 11.3.0 with quality
 85, 4:2:0 subsampling, Lanczos resize, and progressive/optimize disabled. This
-conservative transform is implementation policy pending a credentialed
-synthetic pilot that confirms the live image contract. Both the input rules and
+conservative transform is implementation policy. A credentialed synthetic pilot
+measures current exact-byte image-boundary outcomes for operator review but does
+not rewrite or automatically approve that policy. Both the input rules and
 transform ID participate in `configuration_id`. The runtime transform ID also
 binds the linked JPEG, libjpeg-turbo, zlib, and WebP build versions; codec/profile
 ambiguity fails before configuration or work publication. The production Pillow
@@ -762,10 +768,12 @@ Production runs and the generated pilot use the real hosted Jina API; automated
 tests use injected fake adapters or simulated HTTP transports only. Before
 licensed content is transmitted, the operator must have the required license
 authorization and accept the provider's current privacy and data-handling
-terms. The hosted model name is a mutable alias, so recorded model/API metadata
-improves provenance but cannot guarantee exact hosted reproducibility. Current
-cost and throughput remain unknown until a successful pilot is reviewed, and a
-real full-corpus run must not be left unattended.
+terms. The hosted model name is a mutable alias, so returned model/API metadata
+improves provenance but cannot guarantee exact hosted reproducibility. The pilot
+reports returned usage, billing fields, safe rate headers, and a small measured
+concurrency overlap; fields not returned remain unknown, and the observation is
+not a full-corpus cost or throughput promise. A real full-corpus run must not be
+left unattended.
 
 - The fixture tracer queries `articles`, opens `cleaned_markdown_path` and any
   source-relative `header_image_path`, and writes all three vector modalities
@@ -775,8 +783,14 @@ real full-corpus run must not be left unattended.
   no-follow descriptors. Catalog and lock mutations remain relative to that
   anchor even if the pathname changes, and lock cleanup removes only the inode
   created by the current coordinator.
-- The explicit `wsj-embeddings pilot` sends generated probes only. The separate
-  `wsj-embeddings run` is the licensed-content Jina call surface: affirmative
+- The explicit `wsj-embeddings pilot` sends generated probes only. The client
+  contract revision is never labeled as a live observation. Bounded OpenAPI and
+  model-catalogue reads retain strict allowlisted facts or a classified
+  `not_observed` outcome. Normal text/image/mixed success at the configured
+  dimension makes the result `ready_for_operator_review`; boundary settings are
+  confirmed only by their own generated probe outcomes. This readiness does not
+  authorize or automatically enable a run.
+- The separate `wsj-embeddings run` is the licensed-content Jina call surface: affirmative
   hosted-processing authorization and exactly one positive lexical article
   limit or explicit full scope are mandatory. Unchanged successful article
   text is reused; retryable/interrupted work resumes and terminal work is not retried

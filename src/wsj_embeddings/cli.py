@@ -18,6 +18,7 @@ from wsj_embeddings.adapters import (
 )
 from wsj_embeddings.catalog import EmbeddingCatalogError, configuration_id
 from wsj_embeddings.config import EmbeddingConfigError, EmbeddingPipelineConfig
+from wsj_embeddings.long_text import TextOffsetTokenizer
 from wsj_embeddings.pilot import run_jina_pilot
 from wsj_embeddings.pipeline import (
     EmbeddingOutputRootError,
@@ -128,6 +129,7 @@ def main(
     environment: Mapping[str, str] | None = None,
     transport: JinaTransport | None = None,
     adapter_factory: Callable[[], EmbeddingAdapter] | None = None,
+    tokenizer: TextOffsetTokenizer | None = None,
 ) -> int:
     """Run one fixture-safe command or the explicit hosted generated pilot."""
 
@@ -139,7 +141,11 @@ def main(
     if args.command == "pilot":
         try:
             result = run_jina_pilot(
-                JinaEmbeddingAdapter(environment=environment, transport=transport)
+                JinaEmbeddingAdapter(
+                    environment=environment,
+                    transport=transport,
+                    tokenizer=tokenizer,
+                )
             )
         except JinaHostedAdapterError as error:
             print(json.dumps({"error": error.code}, sort_keys=True))

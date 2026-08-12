@@ -95,12 +95,26 @@ It prints this deterministic, content-free result on success:
 `pilot` accepts no source, output, article, text, or file selector. It requires
 `JINA_API_KEY` in its environment, calls the fixed hosted adapter with
 `truncate: false`, and emits one deterministic content-free JSON record. The
-record includes the recorded OpenAPI observation, per-probe returned model,
-dimensions, raw-vector norms, usage, safe rate-limit headers, retry count, and
-the observed outcomes for nominal 8,192/32,768-unit text and 5/8 MB PNG
-boundaries. It may report a boundary as rejected; that is a measurement, not a
-silent truncation. Missing or rejected credentials return only a classified
-content-free error and create no catalog, output, or log artifact.
+record separates the client's requested model and implemented-against OpenAPI
+contract version from live observations. Bounded requests to the fixed Jina
+OpenAPI and model-catalogue endpoints report only allowlisted fields actually
+returned; unavailable or malformed metadata is `not_observed`, and an absent
+billing currency or embedding-response billing object is `not_returned` rather
+than zero or an invented value. Per-probe results include returned model labels,
+dimensions, raw-vector norms, usage, safe rate-limit headers, actual scheduler
+requests/retries/throttles, and the observed outcomes for locally tokenized
+8,192/32,768-target text and exact 5/8 MB PNG boundaries. A separate two-request
+generated probe reports attempted scheduler fan-out and measured overlap; it is
+not a throughput promise. Natural service failures may exercise bounded retry,
+but the pilot never induces a billable failure to claim retry behavior.
+
+`ready_for_operator_review` means only that normal text, image, and mixed probes
+succeeded with the configured dimension, task, and `truncate: false` contract.
+It does not authorize corpus transmission or enable `run`. A context or image
+setting is confirmed only by its actual boundary probe outcome, not because a
+catalogue or OpenAPI document names it. Missing or rejected credentials return
+only a classified content-free error and create no catalog, output, or log
+artifact.
 
 Run a successful credentialed pilot before authorizing a real-corpus embedding
 run. Automated tests never call the hosted API: they inject simulated HTTP
@@ -111,10 +125,12 @@ Before either command is used, the operator must be authorized to transmit the
 selected licensed material and must confirm that the provider's current terms,
 privacy controls, and data-handling policy are acceptable. The configured
 `jina-embeddings-v4` name is a hosted mutable alias: each hosted generation
-records the returned model, while the pilot separately reports current API
-observations. Exact hosted reproducibility is not guaranteed if the provider
-changes behavior behind that alias. Cost and
-throughput are unknown until a successful current pilot is reviewed.
+records the returned model, while the pilot separately reports current bounded
+API observations. Exact hosted reproducibility is not guaranteed if the
+provider changes behavior behind that alias. A pilot reports returned usage,
+billing fields, rate metadata, and one small concurrency observation; absent
+fields remain unknown, and the result is not a full-corpus cost or throughput
+estimate.
 
 `wsj-embeddings` does not accept the preprocessing TOML configuration and has
 no implicit root defaults. `inventory`, `validate`, and `run` require explicit source,
@@ -195,8 +211,9 @@ rendition is staged, reopened, decoded, hashed, and atomically installed below
 the embedding output root. The full output-root/rendition/transform/leaf chain
 is reanchored after decode and reverified again immediately before run state can
 begin. This conservative
-transform is implementation policy pending confirmation by a credentialed
-synthetic pilot; changing it creates a new configuration identity. Unsupported,
+transform is implementation policy. The operator must compare current synthetic
+image-boundary outcomes with that policy before a corpus run; the pilot never
+mutates the configuration automatically. Changing it creates a new configuration identity. Unsupported,
 animated, corrupt, unsafe, or still-oversized input is terminal and publishes
 no placeholder vector. At runtime the transform identity additionally includes
 the linked JPEG, libjpeg-turbo, zlib, and WebP build versions; an unavailable or

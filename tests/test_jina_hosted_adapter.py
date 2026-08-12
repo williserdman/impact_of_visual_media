@@ -681,6 +681,43 @@ def test_urllib_transport_rejects_oversized_success_and_error_bodies(
     assert secret.decode() not in "".join(traceback.format_exception(raised.value))
 
 
+def test_urllib_transport_bounds_fixed_metadata_get_response(monkeypatch) -> None:
+    """Break caught: metadata GET bypasses the production bounded reader."""
+
+    class BoundedMetadataStream:
+        status = 200
+
+        def __init__(self) -> None:
+            self.headers = {}
+            self.data = b"12345678metadata-secret-after-ceiling"
+            self.offset = 0
+
+        def read(self, size: int) -> bytes:
+            chunk = self.data[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    stream = BoundedMetadataStream()
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: stream)
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=UrllibJinaTransport(),
+    )
+
+    with pytest.raises(JinaHostedAdapterError) as raised:
+        adapter.fetch_openapi_document(max_response_bytes=8)
+
+    assert raised.value.code == "invalid_response"
+    assert stream.offset == 9
+    assert "metadata-secret" not in "".join(traceback.format_exception(raised.value))
+
+
 def test_hosted_adapter_retains_only_numeric_named_rate_limit_metadata():
     """Break caught: arbitrary rate-limit header strings become metadata."""
 
