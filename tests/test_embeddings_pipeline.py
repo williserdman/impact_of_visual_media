@@ -8138,6 +8138,7 @@ def test_pipeline_refuses_exact_version_fourteen_catalog_without_migration(
         pass
     with duckdb.connect(str(config.embedding_catalog)) as db:
         db.execute("DROP VIEW embeddings")
+        db.execute("DROP TABLE hosted_request_reservations")
         for column in (
             "derivation_kind",
             "raw_response_sha256",
@@ -8221,11 +8222,15 @@ def test_pipeline_refuses_exact_version_fourteen_catalog_without_migration(
                     "configuration_id",
                     "model",
                     "observed_model",
-                    "client_api_contract_version",
-                    "batch_max_response_bytes",
+                        "client_api_contract_version",
+                        "batch_max_response_bytes",
+                        "quota_max_requests",
+                        "quota_max_estimated_tokens",
+                        "quota_window_seconds",
                 }
             ),
         )
+        expected_v14.pop("hosted_request_reservations")
         for table, columns in tuple(expected_v14.items()):
             excluded = {
                 "embedding_storage": {
@@ -8513,6 +8518,7 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
         db.execute("DROP TABLE full_run_articles")
         db.execute("DROP TABLE image_input_provenance")
         db.execute("DROP TABLE long_text_part_generations")
+        db.execute("DROP TABLE hosted_request_reservations")
         db.execute(
             "ALTER TABLE embedding_work_storage RENAME TO embedding_work_items"
         )
@@ -8532,6 +8538,9 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             "batch_max_attempts",
             "batch_initial_backoff_seconds",
             "batch_max_backoff_seconds",
+            "quota_max_requests",
+            "quota_max_estimated_tokens",
+            "quota_window_seconds",
         ):
             db.execute(
                 f"ALTER TABLE embedding_configurations DROP COLUMN {column}"
@@ -8572,6 +8581,7 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             "image_input_provenance",
             "long_text_part_generations",
             "reconciliation_actions",
+            "hosted_request_reservations",
         }
         v8_table_names = {
             "embedding_work_storage": "embedding_work_items",
@@ -8600,6 +8610,9 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
                 "batch_max_attempts",
                 "batch_initial_backoff_seconds",
                 "batch_max_backoff_seconds",
+                "quota_max_requests",
+                "quota_max_estimated_tokens",
+                "quota_window_seconds",
             }
         )
         expected_v8_columns["runs"] = tuple(
@@ -8788,6 +8801,9 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
                 "batch_max_attempts",
                 "batch_initial_backoff_seconds",
                 "batch_max_backoff_seconds",
+                "quota_max_requests",
+                "quota_max_estimated_tokens",
+                "quota_window_seconds",
             }
         )
 
