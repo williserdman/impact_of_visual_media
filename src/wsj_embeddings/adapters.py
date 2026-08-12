@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import struct
 import urllib.error
 import urllib.request
@@ -60,6 +61,8 @@ _SAFE_RATE_LIMIT_HEADERS = frozenset(
     }
 )
 _MAX_SAFE_RATE_LIMIT_VALUE = 1_000_000_000_000_000.0
+_SAFE_MODEL_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,127}$")
+_SAFE_CURRENCY = re.compile(r"^[A-Z]{3}$")
 
 
 class EmbeddingAdapter(Protocol):
@@ -825,8 +828,12 @@ def _metadata_shape_is_bounded(value: object) -> bool:
             if len(item) > 20_000:
                 return False
             stack.extend((nested, depth + 1) for nested in item)
-        elif isinstance(item, str) and len(item.encode("utf-8")) > 65_536:
-            return False
+        elif isinstance(item, str):
+            try:
+                if len(item.encode("utf-8")) > 65_536:
+                    return False
+            except UnicodeError:
+                return False
     return True
 
 
@@ -834,11 +841,13 @@ def _safe_billing(value: object) -> dict[str, int | float | str]:
     if not isinstance(value, dict) or len(value) > 32:
         return {}
     billing: dict[str, int | float | str] = {}
-    currency = _safe_response_model(value.get("currency"))
-    if currency is not None:
+    currency = value.get("currency")
+    if isinstance(currency, str) and _SAFE_CURRENCY.fullmatch(currency) is not None:
         billing["currency"] = currency
     for key in _SAFE_BILLING_FIELDS:
-        number = _safe_numeric_value(value.get(key), maximum=None)
+        number = _safe_numeric_value(
+            value.get(key), maximum=_MAX_SAFE_RATE_LIMIT_VALUE
+        )
         if number is not None:
             billing[key] = number
     return billing
@@ -847,9 +856,7 @@ def _safe_billing(value: object) -> dict[str, int | float | str]:
 def _safe_response_model(value: object) -> str | None:
     """Retain a bounded content-free model label exactly as returned."""
 
-    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 256:
-        return None
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+    if not isinstance(value, str) or _SAFE_MODEL_LABEL.fullmatch(value) is None:
         return None
     return value
 

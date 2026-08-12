@@ -25,6 +25,11 @@ from wsj_embeddings.batching import (
 )
 
 _SAFE_METADATA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_API_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,127}$")
+_SAFE_MODEL_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,127}$")
+_SAFE_MODALITY = re.compile(r"^[a-z][a-z0-9._+\-]{0,63}$")
+_SAFE_CURRENCY = re.compile(r"^[A-Z]{3}$")
+_MAX_SAFE_METADATA_NUMBER = 1_000_000_000_000_000.0
 _SAFE_MODEL_NUMERIC_FIELDS = (
     "context_length",
     "max_image_bytes",
@@ -89,8 +94,14 @@ class _ObservingAdapter:
 def run_jina_pilot(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
     """Measure fixed synthetic hosted requests without reading or writing state."""
 
-    probes = _probes(adapter)
-    results = tuple(_run_probe(adapter, probe) for probe in probes)
+    normal_probes = _normal_probes()
+    first_result = _run_probe(adapter, normal_probes[0])
+    boundary_probes = _boundary_probes(adapter)
+    results = (
+        first_result,
+        *(_run_probe(adapter, probe) for probe in normal_probes[1:]),
+        *(_run_probe(adapter, probe) for probe in boundary_probes),
+    )
     concurrency_result = _run_concurrency_probe(adapter)
     openapi_observation = _observe_openapi(adapter)
     model_catalogue_observation = _observe_model_catalogue(adapter)
@@ -153,8 +164,13 @@ def _run_probe(
     except BatchExecutionFatal as error:
         if error.code in {"authentication", "authorization"}:
             raise
+        status_codes = {
+            response.response_metadata.status_code for response in observer.responses
+        }
+        if error.status_code is not None:
+            status_codes.add(error.status_code)
         result: dict[str, object] = {
-            "billing": {"outcome": "not_returned"},
+            "billing": _billing_observation(observer.responses),
             "concurrency_attempted": 1,
             "concurrency_observed": observer.max_active,
             "dimensions": [],
@@ -162,12 +178,12 @@ def _run_probe(
             "name": probe.name,
             "rate_limit_headers": _rate_header_observation(observer),
             "requests": error.requests,
-            "response_models": [],
+            "response_models": sorted(
+                {response.response_metadata.model for response in observer.responses}
+            ),
             "retries": error.retries,
             "status": "rejected",
-            "status_codes": (
-                [] if error.status_code is None else [error.status_code]
-            ),
+            "status_codes": sorted(status_codes),
             "throttles": error.throttles,
             "usage": dict(error.usage),
             "vector_norms": [],
@@ -348,7 +364,11 @@ def _observe_openapi(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
     except JinaHostedAdapterError as error:
         return _metadata_failure(error)
     info = payload.get("info")
-    version = _safe_label(info.get("version")) if isinstance(info, Mapping) else None
+    version = (
+        _safe_domain_label(info.get("version"), _SAFE_API_VERSION)
+        if isinstance(info, Mapping)
+        else None
+    )
     if version is None:
         return {
             "outcome": "not_observed",
@@ -375,7 +395,8 @@ def _observe_model_catalogue(adapter: JinaEmbeddingAdapter) -> dict[str, object]
             item
             for item in data
             if isinstance(item, Mapping)
-            and _safe_label(item.get("id")) == adapter.profile.model
+            and _safe_domain_label(item.get("id"), _SAFE_MODEL_LABEL)
+            == adapter.profile.model
         ),
         None,
     )
@@ -387,14 +408,23 @@ def _observe_model_catalogue(adapter: JinaEmbeddingAdapter) -> dict[str, object]
         }
     safe_model: dict[str, object] = {"id": adapter.profile.model}
     for name in _SAFE_MODEL_NUMERIC_FIELDS:
+        if name not in model:
+            continue
         number = _safe_nonnegative_number(model.get(name))
-        if number is not None:
-            safe_model[name] = number
+        if number is None:
+            return _malformed_metadata(status_code)
+        safe_model[name] = number
     for name in ("input_modalities", "output_modalities"):
-        labels = _safe_label_list(model.get(name))
-        if labels is not None:
-            safe_model[name] = labels
-    safe_model["pricing"] = _safe_pricing(model.get("pricing"))
+        if name not in model:
+            continue
+        labels = _safe_label_list(model.get(name), pattern=_SAFE_MODALITY)
+        if labels is None:
+            return _malformed_metadata(status_code)
+        safe_model[name] = labels
+    pricing = _safe_pricing(model.get("pricing"))
+    if pricing is None:
+        return _malformed_metadata(status_code)
+    safe_model["pricing"] = pricing
     return {
         "model": safe_model,
         "outcome": "observed",
@@ -412,39 +442,49 @@ def _metadata_failure(error: JinaHostedAdapterError) -> dict[str, object]:
     return result
 
 
-def _safe_pricing(value: object) -> dict[str, object]:
+def _malformed_metadata(status_code: int) -> dict[str, object]:
+    return {
+        "outcome": "not_observed",
+        "reason": "malformed_metadata",
+        "status_code": status_code,
+    }
+
+
+def _safe_pricing(value: object) -> dict[str, object] | None:
     pricing: dict[str, object] = {"currency": "not_returned"}
-    if not isinstance(value, Mapping) or len(value) > 32:
+    if value is None:
         return pricing
+    if not isinstance(value, Mapping) or len(value) > 32:
+        return None
     for key, raw_value in value.items():
         if not isinstance(key, str) or _SAFE_METADATA_KEY.fullmatch(key) is None:
             continue
         if key == "currency":
-            label = _safe_label(raw_value)
-            if label is not None:
-                pricing[key] = label
+            label = _safe_domain_label(raw_value, _SAFE_CURRENCY)
+            if label is None:
+                return None
+            pricing[key] = label
             continue
         if key not in _SAFE_PRICING_FIELDS:
             continue
         number = _safe_nonnegative_number(raw_value)
-        if number is not None:
-            pricing[key] = number
+        if number is None:
+            return None
+        pricing[key] = number
     return pricing
 
 
-def _safe_label_list(value: object) -> list[str] | None:
+def _safe_label_list(value: object, *, pattern: re.Pattern[str]) -> list[str] | None:
     if not isinstance(value, list) or len(value) > 32:
         return None
-    labels = [_safe_label(item) for item in value]
+    labels = [_safe_domain_label(item, pattern) for item in value]
     if any(label is None for label in labels):
         return None
     return [label for label in labels if label is not None]
 
 
-def _safe_label(value: object) -> str | None:
-    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 256:
-        return None
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+def _safe_domain_label(value: object, pattern: re.Pattern[str]) -> str | None:
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
         return None
     return value
 
@@ -452,19 +492,31 @@ def _safe_label(value: object) -> str | None:
 def _safe_nonnegative_number(value: object) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
-    if not math.isfinite(number) or number < 0:
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(number)
+        or number < 0
+        or number > _MAX_SAFE_METADATA_NUMBER
+    ):
         return None
     return value
 
 
-def _probes(adapter: JinaEmbeddingAdapter) -> tuple[_PilotProbe, ...]:
+def _normal_probes() -> tuple[_PilotProbe, ...]:
     normal_text = JinaEmbeddingInput.text("generated pilot text")
     normal_image = JinaEmbeddingInput.image_base64(_encoded_png())
     return (
         _PilotProbe("text_normal", (normal_text,)),
         _PilotProbe("image_normal", (normal_image,)),
         _PilotProbe("mixed_normal", (normal_text, normal_image)),
+    )
+
+
+def _boundary_probes(adapter: JinaEmbeddingAdapter) -> tuple[_PilotProbe, ...]:
+    return (
         *(
             _text_probe(adapter, tokens) for tokens in _TEXT_PROBE_UNITS
         ),

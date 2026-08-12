@@ -29,6 +29,7 @@ from wsj_embeddings.pipeline import (
     run_embedding_pipeline,
 )
 from wsj_embeddings.smoke import run_embedding_smoke
+from wsj_embeddings.tokenizer import PinnedTokenizerError
 from wsj_embeddings.validate import validate_embedding_corpus
 
 _OPTION_NAME = re.compile(r"(?<!\w)(--?[A-Za-z][A-Za-z0-9-]*)")
@@ -147,6 +148,9 @@ def main(
                     tokenizer=tokenizer,
                 )
             )
+        except PinnedTokenizerError:
+            print(json.dumps({"error": "pilot_tokenizer_unavailable"}, sort_keys=True))
+            return 1
         except JinaHostedAdapterError as error:
             print(json.dumps({"error": error.code}, sort_keys=True))
             return 1

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import struct
 import threading
@@ -14,6 +15,7 @@ import pytest
 from wsj_embeddings.adapters import JinaHttpResponse
 from wsj_embeddings.cli import build_parser, main
 from wsj_embeddings.pilot import _encoded_png
+from wsj_embeddings.tokenizer import PinnedJinaV4Tokenizer, PinnedTokenizerError
 
 
 class PilotTransport:
@@ -94,6 +96,15 @@ class PilotTokenizer:
         )
 
 
+class FailingPilotTokenizer:
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
+        del text
+        raise PinnedTokenizerError(self.message)
+
+
 def _run_pilot(transport, *, capsys) -> dict[str, object]:
     assert (
         main(
@@ -138,6 +149,22 @@ def _run_pilot(transport, *, capsys) -> dict[str, object]:
             ),
             {"outcome": "not_observed", "reason": "invalid_response"},
         ),
+        (
+            JinaHttpResponse(200, {}, b'{"info":{"version":"\\ud800"}}'),
+            {"outcome": "not_observed", "reason": "invalid_response"},
+        ),
+        (
+            JinaHttpResponse(
+                200,
+                {},
+                (
+                    '{"info":{"version":"safe"},"data":[],"number":'
+                    + ("9" * 500)
+                    + "}"
+                ).encode(),
+            ),
+            {"outcome": "observed", "status_code": 200, "version": "safe"},
+        ),
     ],
 )
 def test_pilot_classifies_unavailable_malformed_and_oversized_metadata(
@@ -177,6 +204,99 @@ def test_pilot_classifies_unavailable_malformed_and_oversized_metadata(
     assert "metadata-secret" not in output
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "payload"),
+    [
+        (
+            "openapi.json",
+            {"info": {"version": "Bearer metadata-secret-token"}},
+        ),
+        (
+            "v1/models",
+            {
+                "data": [
+                    {
+                        "id": "jina-embeddings-v4",
+                        "context_length": 10**500,
+                        "input_modalities": ["text"],
+                    }
+                ]
+            },
+        ),
+        (
+            "v1/models",
+            {
+                "data": [
+                    {
+                        "id": "jina-embeddings-v4",
+                        "pricing": {
+                            "currency": "Bearer metadata-secret-token",
+                            "prompt_tokens": 0.00000005,
+                        },
+                    }
+                ]
+            },
+        ),
+        (
+            "v1/models",
+            {
+                "data": [
+                    {
+                        "id": "jina-embeddings-v4",
+                        "input_modalities": ["text", "Bearer metadata-secret-token"],
+                    }
+                ]
+            },
+        ),
+    ],
+)
+def test_pilot_rejects_unsafe_allowlisted_metadata_values_content_free(
+    endpoint: str,
+    payload: dict[str, object],
+    capsys,
+) -> None:
+    """Break caught: allowlisted metadata names make arbitrary values safe."""
+
+    class UnsafeMetadataTransport(PilotTransport):
+        def get(self, url: str, **kwargs) -> JinaHttpResponse:
+            if url.endswith(endpoint):
+                return JinaHttpResponse(200, {}, json.dumps(payload).encode())
+            return super().get(url, **kwargs)
+
+    result = _run_pilot(UnsafeMetadataTransport(), capsys=capsys)
+    output = json.dumps(result)
+    observation = (
+        result["metadata"]["openapi"]
+        if endpoint == "openapi.json"
+        else result["metadata"]["model_catalogue"]
+    )
+
+    assert observation["outcome"] == "not_observed"
+    assert "metadata-secret-token" not in output
+
+
+def test_pilot_rejects_secret_like_returned_model_without_echo(capsys) -> None:
+    """Break caught: printable response model labels can carry arbitrary secrets."""
+
+    class UnsafeModelTransport(PilotTransport):
+        def post(self, url: str, **kwargs) -> JinaHttpResponse:
+            response = super().post(url, **kwargs)
+            payload = json.loads(response.body)
+            payload["model"] = "Bearer response-model-secret"
+            return JinaHttpResponse(
+                response.status_code,
+                response.headers,
+                json.dumps(payload).encode(),
+            )
+
+    result = _run_pilot(UnsafeModelTransport(), capsys=capsys)
+    output = json.dumps(result)
+
+    assert result["probes"][0]["status"] == "rejected"
+    assert result["probes"][0]["error"] == "invalid_response"
+    assert "response-model-secret" not in output
+
+
 def test_pilot_metadata_is_observed_from_fixed_live_endpoints(capsys) -> None:
     """Break caught: recorded research facts are presented as live observations."""
 
@@ -202,6 +322,106 @@ def test_pilot_metadata_is_observed_from_fixed_live_endpoints(capsys) -> None:
         "task": "retrieval.passage",
         "truncate": False,
     }
+
+
+@pytest.mark.parametrize(
+    "unsafe_message",
+    [
+        "/private/cache/tokenizer.json missing",
+        "checksum expected-secret-sha",
+        "loader response-body-secret",
+    ],
+)
+def test_pilot_maps_tokenizer_failures_after_auth_without_leaking_details(
+    unsafe_message: str,
+    capsys,
+) -> None:
+    """Break caught: tokenizer failure escapes with cache/checksum/load details."""
+
+    transport = PilotTransport()
+
+    exit_code = main(
+        ["pilot"],
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=transport,
+        tokenizer=FailingPilotTokenizer(unsafe_message),
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert json.loads(captured.out) == {"error": "pilot_tokenizer_unavailable"}
+    assert captured.err == ""
+    assert unsafe_message not in captured.out
+    assert len(transport.requests) == 1
+
+
+def test_pilot_checks_hosted_auth_before_loading_boundary_tokenizer(
+    capsys,
+) -> None:
+    """Break caught: an invalid credential is hidden by local tokenizer failure."""
+
+    class AuthenticationFailureTransport(PilotTransport):
+        def post(self, url: str, **kwargs) -> JinaHttpResponse:
+            del url, kwargs
+            self.requests.append({})
+            return JinaHttpResponse(401, {}, b"{}")
+
+    transport = AuthenticationFailureTransport()
+
+    exit_code = main(
+        ["pilot"],
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=transport,
+        tokenizer=FailingPilotTokenizer("private-tokenizer-secret"),
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert json.loads(output) == {"error": "authentication"}
+    assert "private-tokenizer-secret" not in output
+    assert len(transport.requests) == 1
+
+
+def test_pilot_maps_real_resolve_checksum_and_load_failures_content_free(
+    capsys, tmp_path
+) -> None:
+    """Break caught: only a synthetic exception bypasses tokenizer detail leaks."""
+
+    artifact = tmp_path / "tokenizer.json"
+    artifact.write_bytes(b"generated tokenizer fixture")
+
+    def missing_resolver(_repo: str, _filename: str, _revision: str):
+        raise OSError("/private/cache/tokenizer-secret.json")
+
+    tokenizers = (
+        PinnedJinaV4Tokenizer(resolver=missing_resolver),
+        PinnedJinaV4Tokenizer(resolver=lambda *_args: artifact),
+        PinnedJinaV4Tokenizer(
+            resolver=lambda *_args: artifact,
+            expected_sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            loader=lambda _serialized: (_ for _ in ()).throw(
+                RuntimeError("loader-response-secret")
+            ),
+        ),
+    )
+
+    for tokenizer in tokenizers:
+        transport = PilotTransport()
+        exit_code = main(
+            ["pilot"],
+            environment={"JINA_API_KEY": "synthetic-secret"},
+            transport=transport,
+            tokenizer=tokenizer,
+        )
+        captured = capsys.readouterr()
+
+        assert exit_code == 1
+        assert json.loads(captured.out) == {"error": "pilot_tokenizer_unavailable"}
+        assert captured.err == ""
+        assert "private" not in captured.out
+        assert "checksum" not in captured.out
+        assert "loader-response-secret" not in captured.out
+        assert len(transport.requests) == 1
 
 
 def test_pilot_reports_natural_retry_from_production_scheduler(capsys) -> None:
@@ -241,6 +461,67 @@ def test_pilot_reports_natural_retry_from_production_scheduler(capsys) -> None:
     assert text_probe["retries"] == 1
     assert text_probe["rate_limit_headers"]["retry-after"] == [0.0]
     assert result["retry_behavior"] == {"outcome": "observed", "retries": 1}
+
+
+def test_pilot_preserves_prior_observations_when_retry_becomes_fatal(
+    capsys,
+) -> None:
+    """Break caught: a later fatal attempt discards safe earlier measurements."""
+
+    class MissingThenFatalTransport(PilotTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sequence = 0
+
+        def post(self, url: str, **kwargs) -> JinaHttpResponse:
+            self.sequence += 1
+            if self.sequence == 1:
+                return JinaHttpResponse(
+                    200,
+                    {"X-RateLimit-Remaining-Requests": "9"},
+                    json.dumps(
+                        {
+                            "billing": {"amount": 0.25, "currency": "USD"},
+                            "data": [],
+                            "model": "jina-embeddings-v4-observed-a",
+                            "usage": {"prompt_tokens": 5, "total_tokens": 5},
+                        }
+                    ).encode(),
+                )
+            if self.sequence == 2:
+                return JinaHttpResponse(
+                    400,
+                    {"X-RateLimit-Remaining-Requests": "7"},
+                    b'{"detail":"fatal-response-secret"}',
+                )
+            return super().post(url, **kwargs)
+
+    result = _run_pilot(MissingThenFatalTransport(), capsys=capsys)
+    probe = result["probes"][0]
+
+    assert probe == {
+        "billing": {
+            "outcome": "returned",
+            "responses": [{"amount": 0.25, "currency": "USD"}],
+        },
+        "concurrency_attempted": 1,
+        "concurrency_observed": 1,
+        "dimensions": [],
+        "error": "deterministic_request",
+        "name": "text_normal",
+        "rate_limit_headers": {
+            "x-ratelimit-remaining-requests": [7.0, 9.0]
+        },
+        "requests": 2,
+        "response_models": ["jina-embeddings-v4-observed-a"],
+        "retries": 1,
+        "status": "rejected",
+        "status_codes": [200, 400],
+        "throttles": 0,
+        "usage": {"prompt_tokens": 5.0, "total_tokens": 5.0},
+        "vector_norms": [],
+    }
+    assert "fatal-response-secret" not in json.dumps(result)
 
 
 def test_pilot_attempts_and_measures_two_concurrent_generated_requests(
