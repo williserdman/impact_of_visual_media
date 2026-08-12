@@ -16,6 +16,7 @@ from wsj_embeddings.canonical_markdown import (
 from wsj_embeddings.catalog import EmbeddingCatalog, EmbeddingCatalogError
 from wsj_embeddings.catalog import configuration_id as profile_configuration_id
 from wsj_embeddings.config import EmbeddingPipelineConfig
+from wsj_embeddings.image_rendition import SOURCE_BYTES_TRANSFORM_ID
 from wsj_embeddings.models import (
     CanonicalArticle,
     EmbeddingModality,
@@ -105,6 +106,12 @@ def validate_embedding_outputs(
                         catalog.connection,
                         config,
                         articles,
+                        selected_configuration_id,
+                        issues,
+                    )
+                    _validate_image_input_provenance(
+                        catalog.connection,
+                        config,
                         selected_configuration_id,
                         issues,
                     )
@@ -475,7 +482,22 @@ def _validate_work_items(
                     "non-successful work retains a generating run identity",
                 )
         if work_state.is_failure:
-            if not is_missing_header and (error_code is None or attempt_count < 1):
+            local_image_terminal = (
+                modality == EmbeddingModality.HEADER_IMAGE.value
+                and work_state is WorkState.TERMINAL
+                and error_code
+                in {
+                    "corrupt_image",
+                    "derived_image_oversized",
+                    "image_encode_failure",
+                    "unsafe_image",
+                    "unsupported_image",
+                }
+                and attempt_count == 0
+            )
+            if not is_missing_header and not local_image_terminal and (
+                error_code is None or attempt_count < 1
+            ):
                 _append(
                     issues,
                     "invalid_failure_checkpoint",
@@ -689,6 +711,169 @@ def _validate_embeddings(
                 input_sha256,
                 issues,
             )
+
+
+def _validate_image_input_provenance(
+    connection: duckdb.DuckDBPyConnection,
+    config: EmbeddingPipelineConfig,
+    configuration_id: str,
+    issues: list[EmbeddingValidationIssue],
+) -> None:
+    """Resolve every image generation to the exact bytes supplied to Jina."""
+
+    generation_rows = connection.execute(
+        """
+        SELECT w.article_id, w.generation_run_id, e.input_sha256
+        FROM embedding_work_items AS w
+        JOIN embeddings AS e USING (article_id, modality, configuration_id)
+        WHERE w.configuration_id = ? AND w.modality = 'header_image'
+          AND w.state = 'succeeded' AND w.generation_run_id IS NOT NULL
+        UNION ALL
+        SELECT article_id, generation_run_id, input_sha256
+        FROM embedding_generation_history
+        WHERE configuration_id = ? AND modality = 'header_image'
+        """,
+        [configuration_id, configuration_id],
+    ).fetchall()
+    expected_generations = {
+        (str(article_id), str(generation_run_id), str(source_sha256))
+        for article_id, generation_run_id, source_sha256 in generation_rows
+    }
+    configured_transform = connection.execute(
+        """
+        SELECT image_transform FROM embedding_configurations
+        WHERE configuration_id = ?
+        """,
+        [configuration_id],
+    ).fetchone()[0]
+    rows = connection.execute(
+        """
+        SELECT article_id, generation_run_id, source_sha256, source_format,
+               source_bytes, source_width, source_height,
+               embedded_input_sha256, embedded_format, embedded_bytes,
+               embedded_width, embedded_height, transform_id,
+               rendition_relative_path
+        FROM image_input_provenance
+        WHERE configuration_id = ?
+        """,
+        [configuration_id],
+    ).fetchall()
+    observed_generations: set[tuple[str, str, str]] = set()
+    for row in rows:
+        (
+            article_id,
+            generation_run_id,
+            source_sha256,
+            source_format,
+            source_bytes,
+            source_width,
+            source_height,
+            embedded_sha256,
+            embedded_format,
+            embedded_bytes,
+            embedded_width,
+            embedded_height,
+            transform_id,
+            rendition_relative_path,
+        ) = row
+        generation = (
+            str(article_id),
+            str(generation_run_id),
+            str(source_sha256),
+        )
+        observed_generations.add(generation)
+        if generation not in expected_generations:
+            _append(
+                issues,
+                "invalid_image_input_provenance",
+                "image input provenance lacks a matching vector generation",
+            )
+        if (
+            not _is_sha256(source_sha256)
+            or not _is_sha256(embedded_sha256)
+            or source_format not in {"JPEG", "PNG", "WEBP"}
+            or embedded_format not in {"JPEG", "PNG", "WEBP"}
+            or source_bytes < 1
+            or embedded_bytes < 1
+            or source_width < 1
+            or source_height < 1
+            or embedded_width < 1
+            or embedded_height < 1
+            or embedded_bytes > 5_000_000
+            or embedded_width * embedded_height > 20_000_000
+        ):
+            _append(
+                issues,
+                "invalid_image_input_provenance",
+                "image input provenance contains invalid content-free facts",
+            )
+        if rendition_relative_path is None:
+            if (
+                transform_id != SOURCE_BYTES_TRANSFORM_ID
+                or source_sha256 != embedded_sha256
+                or source_format != embedded_format
+                or source_bytes != embedded_bytes
+                or source_width != embedded_width
+                or source_height != embedded_height
+            ):
+                _append(
+                    issues,
+                    "invalid_image_input_provenance",
+                    "source-byte image provenance does not identify exact input",
+                )
+            continue
+        transform_namespace = hashlib.sha256(str(transform_id).encode()).hexdigest()
+        if transform_id != configured_transform:
+            _append(
+                issues,
+                "invalid_image_input_provenance",
+                "image rendition transform differs from configuration identity",
+            )
+        expected_path = (
+            f"renditions/{transform_namespace}/{embedded_sha256}.jpg"
+        )
+        if rendition_relative_path != expected_path:
+            _append(
+                issues,
+                "invalid_rendition_path",
+                "image rendition path does not match its versioned identity",
+            )
+            continue
+        try:
+            rendition = read_source_image(
+                config.embedding_output_root,
+                rendition_relative_path,
+            )
+        except SourceImageError as error:
+            _append(
+                issues,
+                (
+                    "missing_image_rendition"
+                    if error.status == "missing"
+                    else "unsafe_image_rendition"
+                ),
+                (
+                    "image rendition is unavailable"
+                    if error.status == "missing"
+                    else "image rendition path is unsafe"
+                ),
+            )
+            continue
+        if (
+            len(rendition) != embedded_bytes
+            or hashlib.sha256(rendition).hexdigest() != embedded_sha256
+        ):
+            _append(
+                issues,
+                "rendition_hash_mismatch",
+                "image rendition bytes differ from embedded input provenance",
+            )
+    if expected_generations - observed_generations:
+        _append(
+            issues,
+            "missing_image_input_provenance",
+            "header-image generations lack exact input provenance",
+        )
 
 
 def _validate_multimodal_provenance(

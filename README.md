@@ -15,7 +15,7 @@ downstream.
 The repository also contains a downstream text/header-image embedding slice.
 `wsj-embeddings smoke` creates one generated canonical article in a temporary
 directory, encodes it with a deterministic fake adapter, publishes a
-2,048-dimensional normalized `article_text` vector to a separate ten-table
+2,048-dimensional normalized `article_text` vector to a separate eleven-table
 DuckDB catalog, validates it, and removes the fixture. It never reads the
 configured archive or calls a network service. `wsj-embeddings pilot` is a
 separate, explicit hosted Jina v4 measurement command: it sends only fixed
@@ -162,9 +162,18 @@ regenerated despite matching content and configuration. Independent unchanged
 header-image successes remain reusable. Reprocess never expands beyond that
 lexical limit.
 
-The run sends each selected canonical Markdown artifact in full and each
-eligible local header image as base64 of its exact source bytes, with hosted
-truncation disabled. Markdown at or below the conservative 8,000-token input
+The run sends each selected canonical Markdown artifact in full, with hosted
+truncation disabled. A static JPEG, PNG, or WebP at or below 5,000,000 bytes
+and 20,000,000 pixels is decoded safely and sent as base64 of its exact source
+bytes. An oversized but safely decodable image is EXIF-oriented, converted to
+RGB, aspect-scaled only when it exceeds the pixel ceiling, and encoded with the
+versioned Pillow 11.3.0 JPEG-85/4:2:0/Lanczos policy. The metadata-free
+rendition is staged, reopened, decoded, hashed, and atomically installed below
+the embedding output root before image work state can commit. This conservative
+transform is implementation policy pending confirmation by a credentialed
+synthetic pilot; changing it creates a new configuration identity. Unsupported,
+animated, corrupt, unsafe, or still-oversized input is terminal and publishes
+no placeholder vector. Markdown at or below the conservative 8,000-token input
 ceiling keeps the single hosted-input path, reserving 192 tokens below the
 confirmed 8,192-token model context. Longer Markdown is greedily partitioned at
 complete blank-line-delimited block boundaries; an individually oversized
@@ -289,14 +298,14 @@ references only; the pipeline never downloads them.
 
 ## Text, header-image, and multimodal embedding catalog contract
 
-The downstream catalog is a separate schema-version-9 `catalog.duckdb` below a
+The downstream catalog is a separate schema-version-10 `catalog.duckdb` below a
 root that must be disjoint from both the licensed source root and preprocessing
 output root. The generated smoke and injected-adapter coordinator exercise the
 same catalog contract as the explicitly rooted, limit-only production CLI.
-Versions 1 through 8 are refused without migration; move reproducible derived
+Versions 1 through 9 are refused without migration; move reproducible derived
 output aside or choose a fresh embedding output root.
 
-The catalog has exactly ten base tables and no indexes:
+The catalog has exactly eleven base tables and no indexes:
 
 | Table | Ordered columns | Key |
 |---|---|---|
@@ -307,6 +316,7 @@ The catalog has exactly ten base tables and no indexes:
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 | `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
+| `image_input_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_sha256 VARCHAR`, `source_format VARCHAR`, `source_bytes BIGINT`, `source_width INTEGER`, `source_height INTEGER`, `embedded_input_sha256 VARCHAR`, `embedded_format VARCHAR`, `embedded_bytes BIGINT`, `embedded_width INTEGER`, `embedded_height INTEGER`, `transform_id VARCHAR`, `rendition_relative_path VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
 | `long_text_parts` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `updated_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index)` |
 | `long_text_part_generations` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `generation_run_id VARCHAR`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index, generation_run_id)` |
 | `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
@@ -323,6 +333,11 @@ means no canonical header; header failures remain distinct and count in
 as `input_changed` and invalidate only that image plus its same-configuration
 multimodal dependent. A changed configuration uses a separate work key and
 leaves the prior configuration queryable.
+Every successful image generation has content-free `image_input_provenance`:
+source and exact embedded-input hashes, formats, byte counts, dimensions,
+transform identity, and an optional output-relative rendition path. It stores
+no image bytes. Pass-through uses `exact-source-bytes-v1`; derived rows name
+the pinned transform and exact JPEG rendition supplied to the adapter.
 The configured archive root is opened as an accessible, no-follow directory
 before the preprocessing catalog, any item, or embedding output is touched. An
 absent, non-directory, or inaccessible archive root is an operational
@@ -475,12 +490,14 @@ writable connection is opened, and a replacement between those phases is
 refused. Canonical Markdown is reopened below the preprocessing output root
 through no-follow directory descriptors; symlinked, non-regular, multiply
 linked, or replaced leaves are rejected. Local header images use the same
-containment and no-follow rules below the immutable source root and are sent to
-Jina only as base64 of those exact bytes. Embedding mutation is confined below
-its disjoint output root. The coordinator opens every output-root component
-without following links, then creates its catalog and exclusive `pipeline.lock`
-relative to that anchored directory. Lock cleanup compares file identity and
-will not remove a pathname replaced by another process.
+containment and no-follow rules below the immutable source root. Eligible
+images are sent to Jina as base64 of those exact bytes; oversized safe images
+use the staged and verified deterministic rendition below the embedding output
+root. Embedding mutation is confined below its disjoint output root. The
+coordinator opens every output-root component without following links, then
+creates its catalog and exclusive `pipeline.lock` relative to that anchored
+directory. Lock cleanup compares file identity and will not remove a pathname
+replaced by another process.
 
 ## Development checks
 

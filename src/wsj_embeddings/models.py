@@ -75,10 +75,16 @@ class EmbeddingProfile:
     context_rules: str = "markdown-block-greedy-no-overlap-truncate-false-v1"
     long_text_aggregation: str = "l2-token-count-weighted-mean-float32-v1"
     long_text_part_attempt_limit: int = 3
-    image_input_rules: str = "base64-source-bytes-no-remote-v1"
-    image_transform: str = "source-bytes-no-transform-v1"
+    image_input_rules: str = (
+        "static-jpeg-png-webp-max5000000b-max20000000px-decode-max40000000px-"
+        "exact-source-v1"
+    )
+    image_transform: str = (
+        "pillow-11.3.0-exif-transpose-alpha-white-rgb-jpeg-q85-420-lanczos-"
+        "if-over20000000px-optimize0-progressive0-metadata-none-v1"
+    )
     multimodal_formula: str = "l2-normalize-0.5-text-0.5-image-v1"
-    client_configuration_version: str = "wsj-embeddings-config-v2"
+    client_configuration_version: str = "wsj-embeddings-config-v3"
 
 
 @dataclass(frozen=True, slots=True)

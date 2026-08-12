@@ -24,6 +24,14 @@ from wsj_embeddings.canonical_markdown import (
 )
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingPipelineConfig
+from wsj_embeddings.image_rendition import (
+    ImageCodec,
+    ImageCodecError,
+    PillowImageCodec,
+    PreparedImageInput,
+    install_image_rendition,
+    prepare_image_input,
+)
 from wsj_embeddings.long_text import (
     LongTextPart,
     LongTextPlanningError,
@@ -46,6 +54,15 @@ _MULTIMODAL_ARTICLE_MODALITY = EmbeddingModality.MULTIMODAL_ARTICLE.value
 _VECTOR_DIMENSIONS = 2048
 _DETERMINISTIC_IMAGE_ATTEMPT_LIMIT = 3
 _MULTIMODAL_FORMULA = "l2-normalize-0.5-text-0.5-image-v1"
+_TERMINAL_IMAGE_PREPARATION_CODES = frozenset(
+    {
+        "corrupt_image",
+        "derived_image_oversized",
+        "image_encode_failure",
+        "unsafe_image",
+        "unsupported_image",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +70,7 @@ class _PreparedHeaderImage:
     source_relative_path: str
     input_sha256: str
     data: bytes
+    image_input: PreparedImageInput | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,11 +81,19 @@ class EmbeddingPipelineFailpoints:
         Callable[[int, int], None] | None
     ) = None
     after_long_text_terminal_transition: Callable[[int], None] | None = None
+    after_image_rendition_install: Callable[[str], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _MissingHeaderImage:
     source_relative_path: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalHeaderImage:
+    source_relative_path: str
+    source_sha256: str
+    error_code: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +258,7 @@ def run_embedding_pipeline(
     limit: int,
     reprocess: bool = False,
     failpoints: EmbeddingPipelineFailpoints | None = None,
+    image_codec: ImageCodec | None = None,
 ) -> EmbeddingRunResult:
     """Publish source and derived vectors for a bounded canonical slice."""
 
@@ -254,12 +281,33 @@ def run_embedding_pipeline(
         article.article_id: _prepare_header_image(config, article)
         for article in articles
     }
+    active_image_codec = image_codec
+    if active_image_codec is None:
+        active_image_codec = getattr(adapter, "image_codec", None)
+    if active_image_codec is None and any(
+        isinstance(image, _PreparedHeaderImage) for image in prepared_images.values()
+    ):
+        try:
+            active_image_codec = PillowImageCodec()
+        except ImageCodecError as error:
+            raise EmbeddingPipelineError(error.code, "image_preparation") from error
     configuration_identifier = configuration_id(profile)
     run_id = str(uuid4())
     with (
         embedding_pipeline_lock(config.embedding_lock_path) as output_descriptor,
         EmbeddingCatalog.open_in(output_descriptor) as catalog,
     ):
+        if active_image_codec is not None:
+            prepared_images = {
+                article_id: _prepare_image_input(
+                    prepared_image,
+                    profile,
+                    active_image_codec,
+                    output_descriptor,
+                    active_failpoints,
+                )
+                for article_id, prepared_image in prepared_images.items()
+            }
         with catalog.transaction():
             catalog.begin_run(
                 run_id, configuration_identifier, profile, len(articles)
@@ -416,6 +464,41 @@ def run_embedding_pipeline(
                                 for item in prepared_embedding.long_text_parts
                             ),
                         )
+                    elif modality == _HEADER_IMAGE_MODALITY:
+                        assert isinstance(prepared_image, _PreparedHeaderImage)
+                        assert prepared_image.image_input is not None
+                        image_input = prepared_image.image_input
+                        catalog.publish_image_success(
+                            run_id=run_id,
+                            article_id=article.article_id,
+                            configuration_identifier=configuration_identifier,
+                            source_relative_path=prepared_image.source_relative_path,
+                            published_at_utc=article.published_at_utc,
+                            publication_date_new_york=(
+                                article.publication_date_new_york
+                            ),
+                            dimensions=profile.dimensions,
+                            source_sha256=image_input.source_sha256,
+                            source_format=image_input.source_info.format,
+                            source_bytes=len(prepared_image.data),
+                            source_width=image_input.source_info.width,
+                            source_height=image_input.source_info.height,
+                            embedded_input_sha256=(
+                                image_input.embedded_input_sha256
+                            ),
+                            embedded_format=image_input.embedded_info.format,
+                            embedded_bytes=len(image_input.data),
+                            embedded_width=image_input.embedded_info.width,
+                            embedded_height=image_input.embedded_info.height,
+                            transform_id=image_input.transform_id,
+                            rendition_relative_path=(
+                                image_input.rendition_relative_path
+                            ),
+                            stored_vector_sha256=(
+                                prepared_embedding.stored_vector_sha256
+                            ),
+                            vector=prepared_embedding.vector,
+                        )
                     else:
                         catalog.publish_success(
                             run_id=run_id,
@@ -478,7 +561,9 @@ def _register_header_work(
     run_id: str,
     configuration_identifier: str,
     article: CanonicalArticle,
-    prepared_image: _PreparedHeaderImage | _MissingHeaderImage | None,
+    prepared_image: (
+        _PreparedHeaderImage | _MissingHeaderImage | _TerminalHeaderImage | None
+    ),
 ) -> WorkState:
     try:
         if prepared_image is None:
@@ -495,6 +580,31 @@ def _register_header_work(
                 configuration_identifier=configuration_identifier,
                 source_relative_path=prepared_image.source_relative_path,
             )
+        if isinstance(prepared_image, _TerminalHeaderImage):
+            state = catalog.register_work(
+                run_id=run_id,
+                article_id=article.article_id,
+                modality=_HEADER_IMAGE_MODALITY,
+                configuration_identifier=configuration_identifier,
+                source_relative_path=prepared_image.source_relative_path,
+                input_sha256=prepared_image.source_sha256,
+                published_at_utc=article.published_at_utc,
+                publication_date_new_york=article.publication_date_new_york,
+                reprocess=False,
+            )
+            if state is not WorkState.TERMINAL:
+                catalog.record_failure(
+                    run_id=run_id,
+                    article_id=article.article_id,
+                    modality=_HEADER_IMAGE_MODALITY,
+                    configuration_identifier=configuration_identifier,
+                    state=WorkState.TERMINAL,
+                    error_code=prepared_image.error_code,
+                    status_code=None,
+                    retry_after_seconds=None,
+                )
+                catalog.increment_run(run_id, "header_failed")
+            return WorkState.TERMINAL
         return catalog.register_work(
             run_id=run_id,
             article_id=article.article_id,
@@ -568,14 +678,21 @@ def _prepare_embedding(
     article: CanonicalArticle,
     *,
     modality: str,
-    prepared_image: _PreparedHeaderImage | _MissingHeaderImage | None,
+    prepared_image: (
+        _PreparedHeaderImage | _MissingHeaderImage | _TerminalHeaderImage | None
+    ),
     reprocess: bool,
     failpoints: EmbeddingPipelineFailpoints,
 ) -> _PreparedEmbedding:
     if modality == _HEADER_IMAGE_MODALITY:
         assert isinstance(prepared_image, _PreparedHeaderImage)
+        image_bytes = (
+            prepared_image.image_input.data
+            if prepared_image.image_input is not None
+            else prepared_image.data
+        )
         embedded = adapter.embed_image(
-            base64.b64encode(prepared_image.data).decode("ascii")
+            base64.b64encode(image_bytes).decode("ascii")
         )
         vector = _normalized_vector(embedded, article.article_id)
         return _PreparedEmbedding(
@@ -836,6 +953,58 @@ def _prepare_header_image(
         source_relative_path=article.header_image_path,
         input_sha256=hashlib.sha256(image_bytes).hexdigest(),
         data=image_bytes,
+    )
+
+
+def _prepare_image_input(
+    prepared_image: _PreparedHeaderImage | _MissingHeaderImage | None,
+    profile: EmbeddingProfile,
+    image_codec: ImageCodec,
+    output_descriptor: int,
+    failpoints: EmbeddingPipelineFailpoints,
+) -> _PreparedHeaderImage | _MissingHeaderImage | _TerminalHeaderImage | None:
+    if not isinstance(prepared_image, _PreparedHeaderImage):
+        return prepared_image
+    try:
+        image_input = prepare_image_input(
+            prepared_image.data,
+            codec=image_codec,
+            expected_input_rules=profile.image_input_rules,
+            expected_transform_id=profile.image_transform,
+            install_rendition=lambda data, info, derived_sha256: (
+                install_image_rendition(
+                    output_descriptor,
+                    data,
+                    info,
+                    derived_sha256,
+                    transform_id=image_codec.transform_id,
+                    codec=image_codec,
+                )
+            ),
+        )
+    except ImageCodecError as error:
+        if error.code not in _TERMINAL_IMAGE_PREPARATION_CODES:
+            raise EmbeddingPipelineError(
+                error.code,
+                "image_preparation",
+            ) from error
+        return _TerminalHeaderImage(
+            source_relative_path=prepared_image.source_relative_path,
+            source_sha256=prepared_image.input_sha256,
+            error_code=error.code,
+        )
+    if (
+        image_input.rendition_relative_path is not None
+        and failpoints.after_image_rendition_install is not None
+    ):
+        failpoints.after_image_rendition_install(
+            image_input.rendition_relative_path,
+        )
+    return _PreparedHeaderImage(
+        source_relative_path=prepared_image.source_relative_path,
+        input_sha256=prepared_image.input_sha256,
+        data=prepared_image.data,
+        image_input=image_input,
     )
 
 

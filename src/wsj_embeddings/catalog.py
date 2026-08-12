@@ -24,7 +24,7 @@ from wsj_embeddings.models import (
     WorkState,
 )
 
-EMBEDDING_CATALOG_SCHEMA_VERSION = "9"
+EMBEDDING_CATALOG_SCHEMA_VERSION = "10"
 
 _EMBEDDING_CATALOG_TABLES = {
     "article_text_aggregation_provenance",
@@ -32,6 +32,7 @@ _EMBEDDING_CATALOG_TABLES = {
     "embedding_generation_history",
     "embedding_work_items",
     "embeddings",
+    "image_input_provenance",
     "long_text_parts",
     "long_text_part_generations",
     "metadata",
@@ -128,6 +129,24 @@ _TABLE_COLUMNS = {
         ("formula_version", "VARCHAR", True, None, False),
         ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
+    "image_input_provenance": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("source_sha256", "VARCHAR", True, None, False),
+        ("source_format", "VARCHAR", True, None, False),
+        ("source_bytes", "BIGINT", True, None, False),
+        ("source_width", "INTEGER", True, None, False),
+        ("source_height", "INTEGER", True, None, False),
+        ("embedded_input_sha256", "VARCHAR", True, None, False),
+        ("embedded_format", "VARCHAR", True, None, False),
+        ("embedded_bytes", "BIGINT", True, None, False),
+        ("embedded_width", "INTEGER", True, None, False),
+        ("embedded_height", "INTEGER", True, None, False),
+        ("transform_id", "VARCHAR", True, None, False),
+        ("rendition_relative_path", "VARCHAR", False, None, False),
+        ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
     "long_text_parts": (
         ("article_id", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
@@ -204,6 +223,11 @@ _KEY_CONSTRAINTS = {
     ),
     (
         "multimodal_embedding_provenance",
+        "PRIMARY KEY",
+        ("article_id", "configuration_id", "generation_run_id"),
+    ),
+    (
+        "image_input_provenance",
         "PRIMARY KEY",
         ("article_id", "configuration_id", "generation_run_id"),
     ),
@@ -725,6 +749,31 @@ class EmbeddingCatalog:
                     header_image_generation_run_id VARCHAR NOT NULL,
                     header_image_stored_vector_sha256 VARCHAR NOT NULL,
                     formula_version VARCHAR NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    PRIMARY KEY (
+                        article_id, configuration_id, generation_run_id
+                    )
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS image_input_provenance (
+                    article_id VARCHAR NOT NULL,
+                    configuration_id VARCHAR NOT NULL,
+                    generation_run_id VARCHAR NOT NULL,
+                    source_sha256 VARCHAR NOT NULL,
+                    source_format VARCHAR NOT NULL,
+                    source_bytes BIGINT NOT NULL,
+                    source_width INTEGER NOT NULL,
+                    source_height INTEGER NOT NULL,
+                    embedded_input_sha256 VARCHAR NOT NULL,
+                    embedded_format VARCHAR NOT NULL,
+                    embedded_bytes BIGINT NOT NULL,
+                    embedded_width INTEGER NOT NULL,
+                    embedded_height INTEGER NOT NULL,
+                    transform_id VARCHAR NOT NULL,
+                    rendition_relative_path VARCHAR,
                     created_at TIMESTAMP WITH TIME ZONE NOT NULL,
                     PRIMARY KEY (
                         article_id, configuration_id, generation_run_id
@@ -2084,6 +2133,71 @@ class EmbeddingCatalog:
                     part_generation_run_id,
                     part_vector_sha256,
                 ) in parts
+            ],
+        )
+
+    def publish_image_success(
+        self,
+        *,
+        run_id: str,
+        article_id: str,
+        configuration_identifier: str,
+        source_relative_path: str,
+        published_at_utc: object,
+        publication_date_new_york: object,
+        dimensions: int,
+        source_sha256: str,
+        source_format: str,
+        source_bytes: int,
+        source_width: int,
+        source_height: int,
+        embedded_input_sha256: str,
+        embedded_format: str,
+        embedded_bytes: int,
+        embedded_width: int,
+        embedded_height: int,
+        transform_id: str,
+        rendition_relative_path: str | None,
+        stored_vector_sha256: str,
+        vector: Sequence[float],
+    ) -> None:
+        """Atomically publish an image vector and its exact input provenance."""
+
+        self.publish_success(
+            run_id=run_id,
+            article_id=article_id,
+            modality=EmbeddingModality.HEADER_IMAGE.value,
+            configuration_identifier=configuration_identifier,
+            source_relative_path=source_relative_path,
+            published_at_utc=published_at_utc,
+            publication_date_new_york=publication_date_new_york,
+            dimensions=dimensions,
+            input_sha256=source_sha256,
+            stored_vector_sha256=stored_vector_sha256,
+            vector=vector,
+        )
+        self.connection.execute(
+            """
+            INSERT INTO image_input_provenance
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    current_timestamp)
+            """,
+            [
+                article_id,
+                configuration_identifier,
+                run_id,
+                source_sha256,
+                source_format,
+                source_bytes,
+                source_width,
+                source_height,
+                embedded_input_sha256,
+                embedded_format,
+                embedded_bytes,
+                embedded_width,
+                embedded_height,
+                transform_id,
+                rendition_relative_path,
             ],
         )
 

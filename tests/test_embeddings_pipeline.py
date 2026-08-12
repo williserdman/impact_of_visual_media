@@ -32,6 +32,7 @@ from wsj_embeddings import (
 from wsj_embeddings.adapters import JinaEmbeddingAdapter, JinaHostedAdapterError
 from wsj_embeddings.catalog import EmbeddingCatalog, configuration_id
 from wsj_embeddings.config import EmbeddingConfigError
+from wsj_embeddings.image_rendition import ImageCodecError, ImageInfo
 from wsj_embeddings.pipeline import (
     EmbeddingPipelineError,
     EmbeddingPipelineLockedError,
@@ -130,6 +131,24 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("formula_version", "VARCHAR", True, None, False),
         ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
     ),
+    "image_input_provenance": (
+        ("article_id", "VARCHAR", True, None, True),
+        ("configuration_id", "VARCHAR", True, None, True),
+        ("generation_run_id", "VARCHAR", True, None, True),
+        ("source_sha256", "VARCHAR", True, None, False),
+        ("source_format", "VARCHAR", True, None, False),
+        ("source_bytes", "BIGINT", True, None, False),
+        ("source_width", "INTEGER", True, None, False),
+        ("source_height", "INTEGER", True, None, False),
+        ("embedded_input_sha256", "VARCHAR", True, None, False),
+        ("embedded_format", "VARCHAR", True, None, False),
+        ("embedded_bytes", "BIGINT", True, None, False),
+        ("embedded_width", "INTEGER", True, None, False),
+        ("embedded_height", "INTEGER", True, None, False),
+        ("transform_id", "VARCHAR", True, None, False),
+        ("rendition_relative_path", "VARCHAR", False, None, False),
+        ("created_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+    ),
     "long_text_parts": (
         ("article_id", "VARCHAR", True, None, True),
         ("configuration_id", "VARCHAR", True, None, True),
@@ -200,6 +219,10 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     ),
     (
         "multimodal_embedding_provenance",
+        ("article_id", "configuration_id", "generation_run_id"),
+    ),
+    (
+        "image_input_provenance",
         ("article_id", "configuration_id", "generation_run_id"),
     ),
     (
@@ -436,6 +459,42 @@ class RecordingMultimodalAdapter(RecordingAdapter):
         return super().embed_image(image_base64)
 
 
+class ScenarioImageCodec:
+    """Offline image-policy seam with literal, hand-checkable fixture outcomes."""
+
+    input_rules = "synthetic-static-max5000000b-max20000000px-v1"
+    transform_id = "synthetic-jpeg-rendition-v1"
+
+    def __init__(self, scenarios: dict[bytes, ImageInfo | ImageCodecError]) -> None:
+        self.scenarios = scenarios
+        self.rendered: list[tuple[bytes, int, int]] = []
+
+    def inspect(self, data: bytes, *, max_decode_pixels: int) -> ImageInfo:
+        del max_decode_pixels
+        outcome = self.scenarios[data]
+        if isinstance(outcome, ImageCodecError):
+            raise outcome
+        return outcome
+
+    def render_jpeg(
+        self,
+        data: bytes,
+        *,
+        width: int,
+        height: int,
+    ) -> bytes:
+        self.rendered.append((data, width, height))
+        return b"generated deterministic jpeg rendition"
+
+
+class ScenarioImageAdapter(RecordingMultimodalAdapter):
+    profile = replace(
+        FakeEmbeddingAdapter.profile,
+        image_input_rules=ScenarioImageCodec.input_rules,
+        image_transform=ScenarioImageCodec.transform_id,
+    )
+
+
 class InterruptingImageAdapter(RecordingMultimodalAdapter):
     def embed_image(self, image_base64: str) -> tuple[float, ...]:
         self.image_calls += 1
@@ -472,11 +531,18 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
     )
     assert (
         FakeEmbeddingAdapter.profile.image_transform
-        == "source-bytes-no-transform-v1"
+        == "pillow-11.3.0-exif-transpose-alpha-white-rgb-jpeg-q85-420-lanczos-"
+        "if-over20000000px-optimize0-progressive0-metadata-none-v1"
     )
     assert (
         JinaEmbeddingAdapter.profile.image_transform
-        == "source-bytes-no-transform-v1"
+        == "pillow-11.3.0-exif-transpose-alpha-white-rgb-jpeg-q85-420-lanczos-"
+        "if-over20000000px-optimize0-progressive0-metadata-none-v1"
+    )
+    assert (
+        JinaEmbeddingAdapter.profile.image_input_rules
+        == "static-jpeg-png-webp-max5000000b-max20000000px-decode-max40000000px-"
+        "exact-source-v1"
     )
     alternatives = {
         "model": "changed-model-alias",
@@ -1710,9 +1776,17 @@ def test_pipeline_publishes_all_three_modalities_with_source_provenance(tmp_path
     config = write_generated_preprocessing_fixture(tmp_path)
     image_bytes = b"\x89PNG\r\n\x1a\nsynthetic-header-image"
     relative_path = attach_generated_header_image(config, image_bytes)
-    adapter = RecordingMultimodalAdapter()
+    adapter = ScenarioImageAdapter()
+    image_codec = ScenarioImageCodec(
+        {image_bytes: ImageInfo("PNG", 640, 360)}
+    )
 
-    result = run_embedding_pipeline(config, adapter, limit=1)
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        image_codec=image_codec,
+    )
 
     assert result == EmbeddingRunResult(
         articles=1,
@@ -1774,6 +1848,15 @@ def test_pipeline_publishes_all_three_modalities_with_source_provenance(tmp_path
              AND composite_work.modality = 'multimodal_article'
             """
         ).fetchone()
+        image_provenance = db.execute(
+            """
+            SELECT source_sha256, source_format, source_bytes,
+                   source_width, source_height, embedded_input_sha256,
+                   embedded_format, embedded_bytes, embedded_width,
+                   embedded_height, transform_id, rendition_relative_path
+            FROM image_input_provenance
+            """
+        ).fetchone()
     assert rows[0][:4] == (
         "wsj:SYNTHETIC-EMBEDDING",
         "article_text",
@@ -1789,6 +1872,21 @@ def test_pipeline_publishes_all_three_modalities_with_source_provenance(tmp_path
     )
     assert len(rows[1][5]) == 64
     assert rows[1][6] == (0.0, 1.0) + (0.0,) * 2046
+    assert image_provenance == (
+        image_sha256,
+        "PNG",
+        len(image_bytes),
+        640,
+        360,
+        image_sha256,
+        "PNG",
+        len(image_bytes),
+        640,
+        360,
+        "exact-source-bytes-v1",
+        None,
+    )
+    assert not (config.embedding_output_root / "renditions").exists()
     assert rows[2][:5] == (
         "wsj:SYNTHETIC-EMBEDDING",
         "multimodal_article",
@@ -2328,6 +2426,363 @@ def test_retryable_header_failure_recovers_without_regenerating_text(tmp_path):
     assert unchanged.reused == 3
     assert unchanged_adapter.calls == 0
     assert unchanged_adapter.image_calls == 0
+
+
+def test_oversized_header_image_publishes_verified_versioned_rendition(tmp_path):
+    """Break caught: oversized source bytes are sent or rendition identity is lost."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    before = snapshot_fixture_inputs(config)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    adapter = ScenarioImageAdapter()
+
+    run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        image_codec=codec,
+    )
+
+    assert codec.rendered == [(source_bytes, 5477, 3651)]
+    assert adapter.encoded_images == [base64.b64encode(derived_bytes).decode("ascii")]
+    derived_sha256 = hashlib.sha256(derived_bytes).hexdigest()
+    transform_namespace = hashlib.sha256(codec.transform_id.encode()).hexdigest()
+    expected_relative_path = (
+        f"renditions/{transform_namespace}/{derived_sha256}.jpg"
+    )
+    rendition_path = config.embedding_output_root / expected_relative_path
+    assert rendition_path.read_bytes() == derived_bytes
+    assert not list(config.embedding_output_root.rglob("*.tmp"))
+    assert snapshot_fixture_inputs(config) == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT source_sha256, source_format, source_bytes,
+                   source_width, source_height, embedded_input_sha256,
+                   embedded_format, embedded_bytes, embedded_width,
+                   embedded_height, transform_id, rendition_relative_path
+            FROM image_input_provenance
+            """
+        ).fetchone() == (
+            hashlib.sha256(source_bytes).hexdigest(),
+            "PNG",
+            len(source_bytes),
+            6000,
+            4000,
+            derived_sha256,
+            "JPEG",
+            len(derived_bytes),
+            5477,
+            3651,
+            codec.transform_id,
+            expected_relative_path,
+        )
+    assert validate_embedding_outputs(config).ok
+
+
+@pytest.mark.parametrize(
+    ("source_outcome", "derived_outcome", "expected_code"),
+    (
+        (ImageInfo("TIFF", 100, 100), None, "unsupported_image"),
+        (ImageCodecError("corrupt_image"), None, "corrupt_image"),
+        (
+            ImageInfo("PNG", 6000, 4000),
+            ImageInfo("JPEG", 6000, 4000),
+            "derived_image_oversized",
+        ),
+    ),
+    ids=("unsupported", "corrupt", "still-oversized"),
+)
+def test_ineligible_header_image_is_terminal_without_placeholder(
+    tmp_path,
+    source_outcome,
+    derived_outcome,
+    expected_code,
+):
+    """Break caught: unsafe local image input escapes or publishes a zero vector."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated ineligible image"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    before = snapshot_fixture_inputs(config)
+    scenarios = {source_bytes: source_outcome}
+    if derived_outcome is not None:
+        scenarios[derived_bytes] = derived_outcome
+    codec = ScenarioImageCodec(scenarios)
+    adapter = ScenarioImageAdapter()
+
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        image_codec=codec,
+    )
+
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=1,
+        attempted=1,
+        succeeded=1,
+        terminal=1,
+        header_failed=1,
+    )
+    assert adapter.image_calls == 0
+    assert snapshot_fixture_inputs(config) == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT state, attempt_count, error_code, input_sha256
+            FROM embedding_work_items
+            WHERE modality = 'header_image'
+            """
+        ).fetchone() == (
+            "terminal",
+            0,
+            expected_code,
+            hashlib.sha256(source_bytes).hexdigest(),
+        )
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [("article_text",)]
+        assert db.execute("SELECT count(*) FROM image_input_provenance").fetchone() == (
+            0,
+        )
+    assert {issue.code for issue in validate_embedding_outputs(config).issues} == {
+        "header_image_terminal_failure"
+    }
+
+
+def test_rendition_install_interruption_precedes_embedding_state_commit(tmp_path):
+    """Break caught: image state commits before the exact rendition is durable."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated interrupted oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    before = snapshot_fixture_inputs(config)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    adapter = ScenarioImageAdapter()
+    observed_paths: list[str] = []
+
+    def interrupt(relative_path: str) -> None:
+        observed_paths.append(relative_path)
+        raise SyntheticInterruption
+
+    failpoints = EmbeddingPipelineFailpoints(
+        after_image_rendition_install=interrupt,
+    )
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            adapter,
+            limit=1,
+            image_codec=codec,
+            failpoints=failpoints,
+        )
+
+    assert len(observed_paths) == 1
+    assert (config.embedding_output_root / observed_paths[0]).read_bytes() == (
+        derived_bytes
+    )
+    assert adapter.image_calls == 0
+    assert snapshot_fixture_inputs(config) == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone() == (0,)
+        assert db.execute("SELECT count(*) FROM embedding_work_items").fetchone() == (
+            0,
+        )
+
+    replay_adapter = ScenarioImageAdapter()
+    replay = run_embedding_pipeline(
+        config,
+        replay_adapter,
+        limit=1,
+        image_codec=codec,
+    )
+
+    assert replay.embeddings == 3
+    assert replay_adapter.encoded_images == [
+        base64.b64encode(derived_bytes).decode("ascii")
+    ]
+    assert snapshot_fixture_inputs(config) == before
+
+
+def test_validator_requires_exact_image_provenance_and_rendition_bytes(tmp_path):
+    """Break caught: image generations survive missing or changed embedded input."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated validation oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    run_embedding_pipeline(
+        config,
+        ScenarioImageAdapter(),
+        limit=1,
+        image_codec=codec,
+    )
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        relative_path = db.execute(
+            "SELECT rendition_relative_path FROM image_input_provenance"
+        ).fetchone()[0]
+    rendition_path = config.embedding_output_root / relative_path
+    rendition_path.write_bytes(b"changed generated rendition")
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "rendition_hash_mismatch" in codes
+
+    rendition_path.write_bytes(derived_bytes)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DELETE FROM image_input_provenance")
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "missing_image_input_provenance" in codes
+
+
+def test_changed_image_transform_creates_distinct_vectors_and_renditions(tmp_path):
+    """Break caught: a transform change overwrites prior image-vector meaning."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated transform identity oversized png"
+    derived_bytes = b"generated deterministic jpeg rendition"
+    attach_generated_header_image(config, source_bytes)
+    first_codec = ScenarioImageCodec(
+        {
+            source_bytes: ImageInfo("PNG", 6000, 4000),
+            derived_bytes: ImageInfo("JPEG", 5477, 3651),
+        }
+    )
+    first_adapter = ScenarioImageAdapter()
+    run_embedding_pipeline(
+        config,
+        first_adapter,
+        limit=1,
+        image_codec=first_codec,
+    )
+
+    second_codec = ScenarioImageCodec(first_codec.scenarios)
+    second_codec.transform_id = "synthetic-jpeg-rendition-v2"
+
+    class SecondTransformAdapter(ScenarioImageAdapter):
+        profile = replace(
+            ScenarioImageAdapter.profile,
+            image_transform=second_codec.transform_id,
+        )
+
+    second_adapter = SecondTransformAdapter()
+    run_embedding_pipeline(
+        config,
+        second_adapter,
+        limit=1,
+        image_codec=second_codec,
+    )
+
+    first_configuration = configuration_id(first_adapter.profile)
+    second_configuration = configuration_id(second_adapter.profile)
+    assert first_configuration != second_configuration
+    derived_sha256 = hashlib.sha256(derived_bytes).hexdigest()
+    first_rendition_path = (
+        "renditions/"
+        f"{hashlib.sha256(first_codec.transform_id.encode()).hexdigest()}/"
+        f"{derived_sha256}.jpg"
+    )
+    second_rendition_path = (
+        "renditions/"
+        f"{hashlib.sha256(second_codec.transform_id.encode()).hexdigest()}/"
+        f"{derived_sha256}.jpg"
+    )
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        rows = db.execute(
+            """
+            SELECT configuration_id, transform_id, rendition_relative_path
+            FROM image_input_provenance
+            ORDER BY configuration_id
+            """
+        ).fetchall()
+        assert rows == sorted(
+            [
+                (
+                    first_configuration,
+                    first_codec.transform_id,
+                    first_rendition_path,
+                ),
+                (
+                    second_configuration,
+                    second_codec.transform_id,
+                    second_rendition_path,
+                ),
+            ]
+        )
+        assert db.execute(
+            """
+            SELECT configuration_id, count(*)
+            FROM embeddings
+            WHERE modality = 'header_image'
+            GROUP BY configuration_id
+            ORDER BY configuration_id
+            """
+        ).fetchall() == sorted(
+            [(first_configuration, 1), (second_configuration, 1)]
+        )
+    assert len({row[2] for row in rows}) == 2
+    assert all((config.embedding_output_root / row[2]).is_file() for row in rows)
+    assert validate_embedding_outputs(
+        config,
+        configuration_id=first_configuration,
+    ).ok
+    assert validate_embedding_outputs(
+        config,
+        configuration_id=second_configuration,
+    ).ok
+
+
+def test_image_codec_profile_mismatch_fails_before_state_or_hosted_request(tmp_path):
+    """Break caught: bytes are transformed under a different declared profile."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated ambiguous image profile"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec({source_bytes: ImageInfo("PNG", 640, 360)})
+    codec.transform_id = "undeclared-transform"
+    adapter = ScenarioImageAdapter()
+
+    with pytest.raises(EmbeddingPipelineError) as raised:
+        run_embedding_pipeline(
+            config,
+            adapter,
+            limit=1,
+            image_codec=codec,
+        )
+
+    assert raised.value.code == "ambiguous_image_configuration"
+    assert adapter.calls == 0
+    assert adapter.image_calls == 0
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone() == (0,)
+        assert db.execute("SELECT count(*) FROM embedding_work_items").fetchone() == (
+            0,
+        )
 
 
 def test_deterministic_header_rejection_becomes_terminal_after_three_attempts(
@@ -3601,7 +4056,7 @@ def test_limited_run_does_not_remove_embedding_for_an_unselected_article(tmp_pat
     ]
 
 
-def test_embedding_catalog_has_exact_version_nine_long_text_schema(
+def test_embedding_catalog_has_exact_version_ten_image_rendition_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -3673,6 +4128,7 @@ def test_embedding_catalog_has_exact_version_nine_long_text_schema(
         "article_text_aggregation_provenance": "BASE TABLE",
         "embedding_configurations": "BASE TABLE",
         "embedding_generation_history": "BASE TABLE",
+        "image_input_provenance": "BASE TABLE",
         "embedding_work_items": "BASE TABLE",
         "embeddings": "BASE TABLE",
         "long_text_part_generations": "BASE TABLE",
@@ -3684,7 +4140,7 @@ def test_embedding_catalog_has_exact_version_nine_long_text_schema(
     assert table_columns == EXPECTED_EMBEDDING_TABLE_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "9")]
+    assert metadata == [("schema_version", "10")]
 
 
 def test_pipeline_refuses_version_one_embedding_catalog_without_migration(tmp_path):
@@ -3873,6 +4329,7 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
     with EmbeddingCatalog.open(config.embedding_catalog):
         pass
     with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP TABLE image_input_provenance")
         db.execute("DROP TABLE long_text_part_generations")
         for column in ("char_start", "char_end", "byte_start", "byte_end"):
             db.execute(f"ALTER TABLE long_text_parts DROP COLUMN {column}")
@@ -3883,7 +4340,8 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
         expected_v8_columns = {
             table: columns
             for table, columns in EXPECTED_EMBEDDING_TABLE_COLUMNS.items()
-            if table != "long_text_part_generations"
+            if table
+            not in {"image_input_provenance", "long_text_part_generations"}
         }
         expected_v8_columns["embedding_configurations"] = tuple(
             column
@@ -3956,6 +4414,10 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             EXPECTED_EMBEDDING_PRIMARY_KEYS
             - {
                 (
+                    "image_input_provenance",
+                    ("article_id", "configuration_id", "generation_run_id"),
+                ),
+                (
                     "long_text_part_generations",
                     (
                         "article_id",
@@ -4011,6 +4473,9 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
         assert "long_text_part_generations" not in {
             row[0] for row in db.execute("SHOW TABLES").fetchall()
         }
+        assert "image_input_provenance" not in {
+            row[0] for row in db.execute("SHOW TABLES").fetchall()
+        }
         assert {
             row[1]
             for row in db.execute("PRAGMA table_info('long_text_parts')").fetchall()
@@ -4021,6 +4486,31 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
                 "PRAGMA table_info('embedding_configurations')"
             ).fetchall()
         }.isdisjoint({"tokenizer_engine", "long_text_part_attempt_limit"})
+
+
+def test_pipeline_refuses_exact_version_nine_catalog_without_migration(tmp_path):
+    """Break caught: image provenance is silently added to prior derived output."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP TABLE image_input_provenance")
+        db.execute("UPDATE metadata SET value = '9' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("9",)
+        assert "image_input_provenance" not in {
+            row[0] for row in db.execute("SHOW TABLES").fetchall()
+        }
 
 
 def test_pipeline_refuses_malformed_current_schema_with_version_eight_label(

@@ -124,7 +124,8 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/long_text.py` | exact token accounting, deterministic Markdown block packing, and reversible oversized-block partitioning | API calls or checkpoint mutation |
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
-| `wsj_embeddings/catalog.py` | separate schema version 9, exact read-only inspection, bounded lifecycle/generation/part transactions | preprocessing catalog mutation |
+| `wsj_embeddings/image_rendition.py` | bounded image decode, exact-byte eligibility, deterministic Pillow rendition, and atomic derived-file installation | source-image mutation or hosted requests |
+| `wsj_embeddings/catalog.py` | separate schema version 10, exact read-only inspection, bounded lifecycle/generation/part/provenance transactions | preprocessing catalog mutation |
 | `wsj_embeddings/pipeline.py` | read-only eligibility inventory, authorization gate, bounded lexical selection, text/image encoding, composite derivation, hashes, and publication | hosted credential loading |
 | `wsj_embeddings/validate.py` | read-only schema, run coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
@@ -254,8 +255,8 @@ ORDER BY published_at_utc, article_id;
 
 The fixture tracer writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 9 has exactly ten base tables, no views,
-and no indexes. Versions 1 through 8 and malformed output are refused without
+catalog. Embedding schema version 10 has exactly eleven base tables, no views,
+and no indexes. Versions 1 through 9 and malformed output are refused without
 migration.
 
 | Table | Ordered columns and DuckDB types | Primary key |
@@ -267,6 +268,7 @@ migration.
 | `embeddings` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `source_relative_path VARCHAR`, `published_at_utc TIMESTAMPTZ`, `publication_date_new_york DATE`, `dimensions INTEGER`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]` | `(article_id, modality, configuration_id)` |
 | `embedding_generation_history` | `article_id VARCHAR`, `modality VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_relative_path VARCHAR`, `input_sha256 VARCHAR`, `stored_vector_sha256 VARCHAR`, `superseded_run_id VARCHAR`, `superseded_reason VARCHAR`, `superseded_at TIMESTAMPTZ` | `(article_id, modality, configuration_id, generation_run_id)` |
 | `multimodal_embedding_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `text_generation_run_id VARCHAR`, `text_stored_vector_sha256 VARCHAR`, `header_image_generation_run_id VARCHAR`, `header_image_stored_vector_sha256 VARCHAR`, `formula_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
+| `image_input_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `source_sha256 VARCHAR`, `source_format VARCHAR`, `source_bytes BIGINT`, `source_width INTEGER`, `source_height INTEGER`, `embedded_input_sha256 VARCHAR`, `embedded_format VARCHAR`, `embedded_bytes BIGINT`, `embedded_width INTEGER`, `embedded_height INTEGER`, `transform_id VARCHAR`, `rendition_relative_path VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id)` |
 | `long_text_parts` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `state VARCHAR`, `attempt_count INTEGER`, `error_code VARCHAR`, `status_code INTEGER`, `retry_after_seconds DOUBLE`, `last_run_id VARCHAR`, `generation_run_id VARCHAR`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `updated_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index)` |
 | `long_text_part_generations` | `article_id VARCHAR`, `configuration_id VARCHAR`, `article_input_sha256 VARCHAR`, `part_index INTEGER`, `generation_run_id VARCHAR`, `part_count INTEGER`, `char_start BIGINT`, `char_end BIGINT`, `byte_start BIGINT`, `byte_end BIGINT`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `stored_vector_sha256 VARCHAR`, `vector FLOAT[2048]`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, article_input_sha256, part_index, generation_run_id)` |
 | `article_text_aggregation_provenance` | `article_id VARCHAR`, `configuration_id VARCHAR`, `generation_run_id VARCHAR`, `part_index INTEGER`, `article_input_sha256 VARCHAR`, `part_count INTEGER`, `part_generation_run_id VARCHAR`, `part_input_sha256 VARCHAR`, `token_count INTEGER`, `part_stored_vector_sha256 VARCHAR`, `aggregation_version VARCHAR`, `created_at TIMESTAMPTZ` | `(article_id, configuration_id, generation_run_id, part_index)` |
@@ -325,6 +327,25 @@ disposition: it retains a safe canonical relative path and
 `missing_header_image`, has zero adapter attempts, and has no active vector or
 generation. Content-free `header_absent` and `header_failed` run counters keep
 that distinction visible in public summaries.
+
+A static JPEG, PNG, or WebP at or below 5,000,000 bytes and 20,000,000 pixels
+is fully decoded and sent as its exact immutable source bytes. An oversized
+input is accepted for decoding only through 40,000,000 pixels, EXIF-oriented,
+converted to metadata-free RGB on white, aspect-scaled only when above the
+hosted pixel ceiling, and encoded as JPEG by exactly Pillow 11.3.0 with quality
+85, 4:2:0 subsampling, Lanczos resize, and progressive/optimize disabled. This
+conservative transform is implementation policy pending a credentialed
+synthetic pilot that confirms the live image contract. Both the input rules and
+transform ID participate in `configuration_id`.
+
+The rendition is staged below `renditions/<transform-hash>/`, fsynced, reopened,
+decoded, byte-compared, hashed, and atomically installed before the run or work
+state can commit. `image_input_provenance` stores source and exact embedded
+input hashes, formats, byte counts, dimensions, transform identity, and the
+optional output-relative rendition path; it never stores bytes. Pass-through
+rows use `exact-source-bytes-v1` and no rendition path. Unsupported, animated,
+corrupt, unsafe, encode-failed, or still-oversized input becomes a terminal
+zero-attempt image checkpoint with no adapter call or placeholder vector.
 The archive root itself is opened first as a no-follow accessible directory;
 root or ancestor failure is operational and cannot become an optional
 missing-leaf disposition.
@@ -583,14 +604,15 @@ reported; a catalogued path that is a symlink is still reported as unsafe by
 the catalog-file checks.
 
 `wsj_embeddings/validate.py` is a second read-only validator for article text
-and local header-image embeddings. It checks the exact ten-table embedding
+and local header-image embeddings. It checks the exact eleven-table embedding
 schema first, opens the
 preprocessing catalog through its public exact-schema contract, and reports
 stable sorted issues for configuration identity/reference failures, malformed
 work lifecycle/failure checkpoints, malformed generation provenance, missing
 vectors claimed by successful work,
 unsupported modality/dimension, orphaned canonical identities, publication
-mismatch, unsafe or missing canonical Markdown/header images, input-hash
+mismatch, unsafe or missing canonical Markdown/header images, rendition and
+image-input-provenance mismatches, input-hash
 mismatch, non-finite/zero/non-unit vectors, and float32 vector-hash mismatch.
 It also checks bounded long-text lifecycle/vector state and resolves complete
 active and archived aggregate provenance to immutable part generations. It
@@ -677,10 +699,12 @@ orphan cleanup, and full-only missing-source reconciliation.
   no-header articles without failing successful text. `--reprocess` regenerates only that selected limit and retains
   superseded-generation provenance. Full reconciliation remains a later
   boundary.
-- Local header images are opened read-only without following symlinks, hashed,
-  and base64-encoded from the same bytes for Jina. Remote `inline_image_urls`
-  are never fetched, decoded, queued, or embedded. The bounded coordinator
-  combines independently published text and header-image vectors locally.
+- Local header images are opened read-only without following symlinks and
+  hashed. Eligible images are base64-encoded from those same bytes; oversized
+  safe images use the verified deterministic rendition below the embedding
+  output root. Remote `inline_image_urls` are never fetched, decoded, queued,
+  or embedded. The bounded coordinator combines independently published text
+  and header-image vectors locally.
 - A temporal graph uses `published_at_utc` as the event instant and
   `publication_date_new_york` for trading-day/calendar joins.
 - Market data, labels, models, summaries, graphs, and backtests get their own
@@ -696,7 +720,8 @@ helpers in `pipeline.py`. Finish with `validate.py`, `cli.py`, and the matching
 test files. This order follows one source from discovery to research query.
 
 For the tracer slice, read `wsj_embeddings/config.py`, `models.py`, and
-`adapters.py`; then `canonical_markdown.py`, `catalog.py`, and `pipeline.py`;
+`adapters.py`; then `canonical_markdown.py`, `source_image.py`,
+`image_rendition.py`, `catalog.py`, and `pipeline.py`;
 finish with `validate.py`, `smoke.py`, `pilot.py`, `cli.py`, and the embedding
 test files. This follows one generated canonical article into the separate
 catalog and the separate generated hosted probe.

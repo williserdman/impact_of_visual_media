@@ -14,6 +14,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from wsj_embeddings.image_rendition import (
+    PRODUCTION_IMAGE_INPUT_RULES,
+    PRODUCTION_IMAGE_TRANSFORM_ID,
+    FixturePassthroughImageCodec,
+)
 from wsj_embeddings.long_text import TextOffsetTokenizer
 from wsj_embeddings.models import EmbeddingProfile
 from wsj_embeddings.tokenizer import (
@@ -211,10 +216,10 @@ class JinaEmbeddingAdapter:
         context_token_limit=_CONSERVATIVE_CONTEXT_TOKEN_LIMIT,
         context_rules="markdown-block-greedy-no-overlap-truncate-false-v1",
         long_text_aggregation="l2-token-count-weighted-mean-float32-v1",
-        image_input_rules="base64-source-bytes-no-remote-v1",
-        image_transform="source-bytes-no-transform-v1",
+        image_input_rules=PRODUCTION_IMAGE_INPUT_RULES,
+        image_transform=PRODUCTION_IMAGE_TRANSFORM_ID,
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
-        client_configuration_version="wsj-embeddings-config-v2",
+        client_configuration_version="wsj-embeddings-config-v3",
     )
 
     def __init__(
@@ -470,11 +475,12 @@ class FakeEmbeddingAdapter:
         context_token_limit=8_000,
         context_rules="markdown-block-greedy-no-overlap-truncate-false-v1",
         long_text_aggregation="l2-token-count-weighted-mean-float32-v1",
-        image_input_rules="base64-source-bytes-no-remote-v1",
-        image_transform="source-bytes-no-transform-v1",
+        image_input_rules=PRODUCTION_IMAGE_INPUT_RULES,
+        image_transform=PRODUCTION_IMAGE_TRANSFORM_ID,
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
-        client_configuration_version="wsj-embeddings-config-v2",
+        client_configuration_version="wsj-embeddings-config-v3",
     )
+    image_codec = FixturePassthroughImageCodec()
 
     def embed_text(self, text: str) -> tuple[float, ...]:
         if not text:
