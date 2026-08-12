@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from wsj_embeddings.validate import _rows_with_canonical_articles
 from wsj_embeddings.validation_stream import (
     OrderIndependentDigest,
     RowKind,
@@ -72,3 +73,22 @@ def test_artifact_digest_is_order_independent_and_duplicate_sensitive() -> None:
 
     assert forward.hexdigest() == reverse.hexdigest()
     assert duplicated.hexdigest() != forward.hexdigest()
+
+
+def test_canonical_metadata_lookup_uses_one_query_per_bounded_page() -> None:
+    class CanonicalLookup:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, ...]] = []
+
+        def get_many(self, article_ids):
+            identifiers = tuple(str(value) for value in article_ids)
+            self.requests.append(identifiers)
+            return {identifier: identifier for identifier in identifiers}
+
+    lookup = CanonicalLookup()
+    rows = [(f"wsj:GENERATED-{index:04d}",) for index in range(513)]
+
+    attached = list(_rows_with_canonical_articles(rows, lookup))  # type: ignore[arg-type]
+
+    assert len(attached) == 513
+    assert [len(request) for request in lookup.requests] == [256, 256, 1]

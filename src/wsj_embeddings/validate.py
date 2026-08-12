@@ -9,8 +9,10 @@ import os
 import sqlite3
 import stat
 import struct
-from collections.abc import Callable
+import tempfile
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from itertools import chain, groupby
 from tempfile import TemporaryDirectory
 from typing import Protocol
 
@@ -102,20 +104,51 @@ class _CanonicalArticles:
         ):
             yield str(row[0]), CanonicalArticle(*row)
 
-    def get(self, article_id: object) -> CanonicalArticle | None:
-        row = self._connection.execute(
-            """
+    def get_many(self, article_ids: Iterable[object]) -> dict[str, CanonicalArticle]:
+        identifiers = tuple(dict.fromkeys(str(value) for value in article_ids))
+        if not identifiers:
+            return {}
+        placeholders = ", ".join("?" for _value in identifiers)
+        rows = stream_rows(
+            self._connection,
+            f"""
             SELECT article_id, cleaned_markdown_path, published_at_utc,
                    publication_date_new_york, cleaned_markdown_sha256,
                    header_image_path
-            FROM articles WHERE article_id = ?
+            FROM articles WHERE article_id IN ({placeholders})
+            ORDER BY article_id
             """,
-            [article_id],
-        ).fetchone()
-        return None if row is None else CanonicalArticle(*row)
+            list(identifiers),
+        )
+        return {str(row[0]): CanonicalArticle(*row) for row in rows}
 
-    def __contains__(self, article_id: object) -> bool:
-        return self.get(article_id) is not None
+
+def _row_pages(
+    rows: Iterable[tuple[object, ...]],
+    page_size: int,
+) -> Iterator[tuple[tuple[object, ...], ...]]:
+    page: list[tuple[object, ...]] = []
+    for row in rows:
+        page.append(row)
+        if len(page) == page_size:
+            yield tuple(page)
+            page.clear()
+    if page:
+        yield tuple(page)
+
+
+def _rows_with_canonical_articles(
+    rows: Iterable[tuple[object, ...]],
+    articles: _CanonicalArticles,
+    *,
+    page_size: int = RowKind.METADATA.page_size,
+) -> Iterator[tuple[tuple[object, ...], CanonicalArticle | None]]:
+    """Attach canonical metadata with one preprocessing query per bounded page."""
+
+    for page in _row_pages(rows, page_size):
+        canonical = articles.get_many(row[0] for row in page)
+        for row in page:
+            yield row, canonical.get(str(row[0]))
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +220,7 @@ class EmbeddingValidationFailpoints:
     """Generated-fixture seam while independent catalog snapshots are held."""
 
     after_state_snapshot: Callable[[], None] | None = None
+    scratch_parent_candidates: tuple[os.PathLike[str] | str, ...] | None = None
 
 
 def validate_embedding_corpus(
@@ -272,6 +306,7 @@ def _validate_embedding_state(
                             requested_configuration_id=configuration_id,
                             image_codec=image_codec,
                             include_coverage=include_coverage,
+                            failpoints=failpoints,
                             issues=issues,
                         )
                         if _artifact_state_token(
@@ -329,6 +364,7 @@ def _validate_stable_state(
     requested_configuration_id: str | None,
     image_codec: ImageCodec | None,
     include_coverage: bool,
+    failpoints: EmbeddingValidationFailpoints,
     issues: list[EmbeddingValidationIssue],
 ) -> tuple[str | None, EmbeddingCoverage | None]:
     """Validate pinned catalog states and their observed generated artifacts."""
@@ -340,7 +376,12 @@ def _validate_stable_state(
     _validate_global_public_embedding_checkpoints(embedding, issues)
     _validate_global_generation_history_references(embedding, issues)
     _validate_global_image_provenance_references(embedding, issues)
-    orphan_artifacts = _scan_rendition_artifacts(embedding, config, issues)
+    orphan_artifacts = _scan_rendition_artifacts(
+        embedding,
+        config,
+        issues,
+        scratch_parent_candidates=failpoints.scratch_parent_candidates,
+    )
     selected_configuration_id = _select_configuration_id(
         embedding,
         requested_configuration_id,
@@ -987,6 +1028,124 @@ def _validate_reconciliation_actions(
                 "invalid_reconciliation_vector",
                 "hidden reconciliation vectors have invalid shape or provenance",
             )
+    hidden_multimodal = stream_rows(
+        connection,
+        """
+        SELECT composite.article_id, composite.vector,
+               composite.stored_vector_sha256,
+               provenance.text_generation_run_id,
+               provenance.text_stored_vector_sha256,
+               text_work.generation_run_id, text.stored_vector_sha256, text.vector,
+               provenance.header_image_generation_run_id,
+               provenance.header_image_stored_vector_sha256,
+               image_work.generation_run_id, image.stored_vector_sha256, image.vector,
+               provenance.formula_version, configuration.multimodal_formula
+        FROM reconciliation_actions AS action
+        JOIN runs ON runs.run_id = action.run_id
+        JOIN embedding_storage AS composite
+          ON composite.article_id = action.article_id
+         AND composite.modality = action.modality
+         AND composite.configuration_id = action.configuration_id
+        JOIN embedding_configurations AS configuration
+          ON configuration.configuration_id = composite.configuration_id
+        LEFT JOIN multimodal_embedding_provenance AS provenance
+          ON provenance.article_id = composite.article_id
+         AND provenance.configuration_id = composite.configuration_id
+         AND provenance.generation_run_id = action.expected_generation_run_id
+        LEFT JOIN embedding_work_storage AS text_work
+          ON text_work.article_id = composite.article_id
+         AND text_work.configuration_id = composite.configuration_id
+         AND text_work.modality = 'article_text'
+         AND text_work.generation_run_id = provenance.text_generation_run_id
+        LEFT JOIN embedding_storage AS text
+          ON text.article_id = text_work.article_id
+         AND text.configuration_id = text_work.configuration_id
+         AND text.modality = text_work.modality
+         AND text.stored_vector_sha256 = provenance.text_stored_vector_sha256
+        LEFT JOIN embedding_work_storage AS image_work
+          ON image_work.article_id = composite.article_id
+         AND image_work.configuration_id = composite.configuration_id
+         AND image_work.modality = 'header_image'
+         AND image_work.generation_run_id =
+             provenance.header_image_generation_run_id
+        LEFT JOIN embedding_storage AS image
+          ON image.article_id = image_work.article_id
+         AND image.configuration_id = image_work.configuration_id
+         AND image.modality = image_work.modality
+         AND image.stored_vector_sha256 =
+             provenance.header_image_stored_vector_sha256
+        WHERE runs.reconciliation_complete
+          AND action.modality = 'multimodal_article'
+        ORDER BY composite.article_id, composite.configuration_id
+        """,
+        kind=RowKind.TRIPLE_VECTOR,
+    )
+    for row in hidden_multimodal:
+        (
+            article_id,
+            composite_values,
+            composite_hash,
+            provenance_text_run,
+            provenance_text_hash,
+            text_run,
+            text_hash,
+            text_values,
+            provenance_image_run,
+            provenance_image_hash,
+            image_run,
+            image_hash,
+            image_values,
+            provenance_formula,
+            configuration_formula,
+        ) = row
+        if (
+            None
+            in (
+                provenance_text_run,
+                provenance_text_hash,
+                text_run,
+                text_hash,
+                text_values,
+                provenance_image_run,
+                provenance_image_hash,
+                image_run,
+                image_hash,
+                image_values,
+                provenance_formula,
+            )
+            or provenance_text_run != text_run
+            or provenance_text_hash != text_hash
+            or provenance_image_run != image_run
+            or provenance_image_hash != image_hash
+            or provenance_formula != configuration_formula
+            or configuration_formula != _MULTIMODAL_FORMULA
+        ):
+            _append(
+                issues,
+                "invalid_reconciliation_vector",
+                "hidden reconciliation vectors have invalid shape or provenance",
+            )
+            continue
+        try:
+            text_vector = _verified_source_vector(
+                text_values, str(text_hash), str(article_id)
+            )
+            image_vector = _verified_source_vector(
+                image_values, str(image_hash), str(article_id)
+            )
+            expected = _multimodal_vector(text_vector, image_vector, str(article_id))
+        except EmbeddingPipelineError:
+            expected = None
+        if (
+            expected is None
+            or tuple(composite_values) != expected
+            or composite_hash != _vector_hash(expected)
+        ):
+            _append(
+                issues,
+                "invalid_reconciliation_vector",
+                "hidden reconciliation vectors have invalid shape or provenance",
+            )
 
 
 def _select_configuration_id(
@@ -1035,18 +1194,20 @@ def _coverage_for_configuration(
     )
     text_success = header_success = multimodal_success = 0
     stale_work = unresolved_retryable_work = 0
-    for article_id, modality, state in stream_rows(
+    rows = stream_rows(
         connection,
         """
         SELECT article_id, modality, state FROM embedding_work_items
         WHERE configuration_id = ? ORDER BY article_id, modality
         """,
         [configuration_id],
+    )
+    for (_article_id, modality, state), article in _rows_with_canonical_articles(
+        rows, articles
     ):
         state = str(state)
         stale_work += state == WorkState.STALE_INPUT.value
         unresolved_retryable_work += state == WorkState.RETRYABLE.value
-        article = articles.get(article_id)
         if article is None or state != WorkState.SUCCEEDED.value:
             continue
         text_success += modality == EmbeddingModality.ARTICLE_TEXT.value
@@ -1234,9 +1395,9 @@ def _validate_work_items(
         """,
         [configuration_id],
     )
-    for row in rows:
+    for row, article in _rows_with_canonical_articles(rows, articles):
         (
-            article_id,
+            _article_id,
             modality,
             _configuration_identifier,
             source_relative_path,
@@ -1296,7 +1457,6 @@ def _validate_work_items(
                     "invalid_not_applicable_checkpoint",
                     "not-applicable image work retains generation metadata",
                 )
-            article = articles.get(article_id)
             if article is not None and article.header_image_path is not None:
                 _append(
                     issues,
@@ -1310,7 +1470,6 @@ def _validate_work_items(
                     "embedding rows lack a matching successful work checkpoint",
                 )
         elif work_state is WorkState.STALE_INPUT:
-            article = articles.get(article_id)
             if (
                 input_sha256 is not None
                 or attempt_count != 0
@@ -1346,7 +1505,6 @@ def _validate_work_items(
                     "stale input work retains generation or unsafe path metadata",
                 )
         elif is_missing_header:
-            article = articles.get(article_id)
             if (
                 not is_safe_source_relative_path(source_relative_path)
                 or article is None
@@ -1465,7 +1623,7 @@ def _validate_header_disposition_coverage(
     """Require one header disposition per selected article and honest run claims."""
 
     missing_header_disposition = False
-    for (article_id,) in stream_rows(
+    missing_rows = stream_rows(
         connection,
         """
         SELECT text.article_id FROM embedding_work_items AS text
@@ -1478,8 +1636,9 @@ def _validate_header_disposition_coverage(
         ORDER BY text.article_id
         """,
         [configuration_id],
-    ):
-        if articles.get(article_id) is not None:
+    )
+    for _row, article in _rows_with_canonical_articles(missing_rows, articles):
+        if article is not None:
             missing_header_disposition = True
             break
     if missing_header_disposition:
@@ -1502,22 +1661,27 @@ def _validate_header_disposition_coverage(
     if run is None:
         return
     run_id, claimed_absent, claimed_failed = run
-    raw_states = stream_rows(
-        connection,
+    observed_absent, observed_failed, invalid_states = connection.execute(
         """
-        SELECT state
+        SELECT count(*) FILTER (WHERE state = 'not_applicable'),
+               count(*) FILTER (
+                   WHERE state IN ('retryable', 'terminal')
+               ),
+               count(*) FILTER (
+                   WHERE state NOT IN (
+                       'queued', 'in_progress', 'succeeded',
+                       'retryable', 'terminal', 'interrupted',
+                       'not_applicable', 'stale_input'
+                   )
+               )
         FROM embedding_work_items
         WHERE configuration_id = ? AND modality = 'header_image'
           AND last_run_id = ?
         """,
         [configuration_id, run_id],
-    )
-    try:
-        states = [WorkState(row[0]) for row in raw_states]
-    except ValueError:
+    ).fetchone()
+    if invalid_states:
         return
-    observed_absent = sum(state is WorkState.NOT_APPLICABLE for state in states)
-    observed_failed = sum(state.is_failure for state in states)
     if (claimed_absent, claimed_failed) != (observed_absent, observed_failed):
         _append(
             issues,
@@ -1550,7 +1714,7 @@ def _validate_embeddings(
                      AND p.generation_run_id = w.generation_run_id
                ) AS has_aggregation_provenance
         FROM embeddings AS e
-        JOIN embedding_work_items AS w
+        LEFT JOIN embedding_work_items AS w
           USING (article_id, modality, configuration_id)
         WHERE e.configuration_id = ?
         ORDER BY e.article_id, e.modality, e.configuration_id
@@ -1558,9 +1722,13 @@ def _validate_embeddings(
         [selected_configuration_id],
         kind=RowKind.SINGLE_VECTOR,
     )
-    for row in rows:
+    for row, article in _rows_with_canonical_articles(
+        rows,
+        articles,
+        page_size=RowKind.SINGLE_VECTOR.page_size,
+    ):
         (
-            article_id,
+            _article_id,
             modality,
             _configuration_identifier,
             published_at_utc,
@@ -1575,12 +1743,12 @@ def _validate_embeddings(
             vector,
             has_aggregation_provenance,
         ) = row
-        article = articles.get(article_id)
-        if modality not in {
+        supported_modality = modality in {
             EmbeddingModality.ARTICLE_TEXT.value,
             EmbeddingModality.HEADER_IMAGE.value,
             EmbeddingModality.MULTIMODAL_ARTICLE.value,
-        }:
+        }
+        if not supported_modality:
             _append(
                 issues,
                 "invalid_modality",
@@ -1606,7 +1774,7 @@ def _validate_embeddings(
                 "embedding rows use an unsupported dimension",
             )
         _validate_vector(vector, stored_vector_sha256, issues)
-        if not _valid_vector_provenance(
+        if supported_modality and not _valid_vector_provenance(
             modality,
             derivation_kind,
             raw_response_sha256,
@@ -1752,9 +1920,9 @@ def _validate_image_input_provenance(
         """,
         [configuration_id, configuration_id, configuration_id, configuration_id],
     )
-    for row in rows:
+    for row, article in _rows_with_canonical_articles(rows, articles):
         (
-            article_id,
+            _article_id,
             _generation_run_id,
             source_sha256,
             source_format,
@@ -1813,7 +1981,6 @@ def _validate_image_input_provenance(
             image_codec is not None
             and is_active
         ):
-            article = articles.get(str(article_id))
             try:
                 if article is None or article.header_image_path is None:
                     raise SourceImageError("missing")
@@ -2069,6 +2236,8 @@ def _scan_rendition_artifacts(
     connection: duckdb.DuckDBPyConnection,
     config: EmbeddingPipelineConfig,
     issues: list[EmbeddingValidationIssue],
+    *,
+    scratch_parent_candidates: tuple[os.PathLike[str] | str, ...] | None,
 ) -> int:
     def unsafe_entry() -> None:
         _append(
@@ -2077,34 +2246,104 @@ def _scan_rendition_artifacts(
             "rendition namespace contains an unsafe entry",
         )
 
-    with TemporaryDirectory(prefix="wsj-embedding-validation-") as scratch:
-        reference_index = sqlite3.connect(os.path.join(scratch, "references.sqlite3"))
-        try:
-            reference_index.execute(
-                "CREATE TABLE referenced_paths (path TEXT PRIMARY KEY)"
+    scratch_parent = _safe_scratch_parent(config, scratch_parent_candidates)
+    if scratch_parent is None:
+        _append(
+            issues,
+            "validation_scratch_unavailable",
+            "no safe writable validation scratch parent is available",
+        )
+        return 0
+    try:
+        with TemporaryDirectory(
+            prefix="wsj-embedding-validation-",
+            dir=scratch_parent,
+        ) as scratch:
+            reference_index = sqlite3.connect(
+                os.path.join(scratch, "references.sqlite3")
             )
-            for (relative_path,) in stream_rows(
-                connection,
-                """
-                SELECT DISTINCT rendition_relative_path
-                FROM image_input_provenance
-                WHERE rendition_relative_path IS NOT NULL
-                ORDER BY rendition_relative_path
-                """,
-            ):
+            try:
                 reference_index.execute(
-                    "INSERT INTO referenced_paths VALUES (?)",
-                    [str(relative_path)],
+                    "CREATE TABLE referenced_paths (path TEXT PRIMARY KEY)"
                 )
-            reference_index.commit()
-            return _scan_rendition_artifacts_with_index(
-                reference_index,
-                config,
-                issues,
-                unsafe_entry,
+                for (relative_path,) in stream_rows(
+                    connection,
+                    """
+                    SELECT DISTINCT rendition_relative_path
+                    FROM image_input_provenance
+                    WHERE rendition_relative_path IS NOT NULL
+                    ORDER BY rendition_relative_path
+                    """,
+                ):
+                    reference_index.execute(
+                        "INSERT INTO referenced_paths VALUES (?)",
+                        [str(relative_path)],
+                    )
+                reference_index.commit()
+                return _scan_rendition_artifacts_with_index(
+                    reference_index,
+                    config,
+                    issues,
+                    unsafe_entry,
+                )
+            finally:
+                reference_index.close()
+    except (OSError, sqlite3.Error):
+        _append(
+            issues,
+            "validation_scratch_unavailable",
+            "no safe writable validation scratch parent is available",
+        )
+        return 0
+
+
+def _safe_scratch_parent(
+    config: EmbeddingPipelineConfig,
+    candidates: tuple[os.PathLike[str] | str, ...] | None,
+) -> str | None:
+    configured = tuple(
+        path.resolve(strict=False)
+        for path in (
+            config.source_root,
+            config.preprocessing_output_root,
+            config.embedding_output_root,
+        )
+    )
+    candidate_values = (
+        candidates
+        if candidates is not None
+        else (tempfile.gettempdir(), "/var/tmp", "/dev/shm")
+    )
+    for raw_candidate in candidate_values:
+        candidate = os.path.realpath(os.fspath(raw_candidate))
+        descriptor: int | None = None
+        try:
+            candidate_path = type(config.source_root)(candidate).resolve(strict=True)
+            if not candidate_path.is_dir():
+                continue
+            if any(
+                candidate_path == root
+                or candidate_path in root.parents
+                or root in candidate_path.parents
+                for root in configured
+            ):
+                continue
+            descriptor = os.open(candidate_path, _DIRECTORY_FLAGS)
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                continue
+            probe = tempfile.mkdtemp(
+                prefix="wsj-embedding-validation-probe-",
+                dir=candidate_path,
             )
+        except OSError:
+            continue
+        else:
+            os.rmdir(probe)
+            return str(candidate_path)
         finally:
-            reference_index.close()
+            if descriptor is not None:
+                os.close(descriptor)
+    return None
 
 
 def _scan_rendition_artifacts_with_index(
@@ -2757,44 +2996,9 @@ def _validate_long_text_parts(
             "long-text part checkpoints are incomplete or inconsistent",
         )
 
-    aggregate_key: tuple[str, str, str, int] | None = None
-    while aggregate := _next_long_text_aggregate(
+    aggregate_rows = stream_rows(
         connection,
-        configuration_id,
-        aggregate_key,
-    ):
-        aggregate_key = (
-            str(aggregate[0]),
-            str(aggregate[1]),
-            str(aggregate[4]),
-            int(aggregate[5]),
-        )
-        _validate_long_text_aggregate(
-            connection,
-            config,
-            articles,
-            configuration_id,
-            configured_aggregation,
-            aggregate,
-            issues,
-        )
-
-
-def _next_long_text_aggregate(
-    connection: duckdb.DuckDBPyConnection,
-    configuration_id: str,
-    key: tuple[str, str, str, int] | None,
-) -> tuple[object, ...] | None:
-    predicate = ""
-    parameters: list[object] = [configuration_id] * 3
-    if key is not None:
-        predicate = (
-            "WHERE (article_id, input_sha256, generation_run_id, active) "
-            "> (?, ?, ?, ?)"
-        )
-        parameters.extend(key)
-    return connection.execute(
-        f"""
+        """
         WITH aggregates AS (
             SELECT e.article_id, e.input_sha256, e.vector,
                    e.stored_vector_sha256, w.generation_run_id, 1 AS active
@@ -2818,24 +3022,74 @@ def _next_long_text_aggregate(
               AND runs.reconciliation_complete
               AND action.expected_generation_run_id IS NOT NULL
         )
-        SELECT * FROM aggregates {predicate}
-        ORDER BY article_id, input_sha256, generation_run_id, active LIMIT 1
+        SELECT aggregate.article_id, aggregate.input_sha256, aggregate.vector,
+               aggregate.stored_vector_sha256, aggregate.generation_run_id,
+               aggregate.active,
+               provenance.part_index, provenance.article_input_sha256,
+               provenance.part_count, provenance.part_input_sha256,
+               provenance.token_count, provenance.part_stored_vector_sha256,
+               provenance.aggregation_version, part.part_count,
+               part.char_start, part.char_end, part.byte_start, part.byte_end,
+               part.part_input_sha256, part.token_count,
+               part.stored_vector_sha256, part.vector,
+               EXISTS (
+                   SELECT 1 FROM long_text_part_generations AS candidate
+                   WHERE candidate.article_id = aggregate.article_id
+                     AND candidate.configuration_id = ?
+                     AND candidate.article_input_sha256 = aggregate.input_sha256
+               ) AS has_parts
+        FROM aggregates AS aggregate
+        LEFT JOIN article_text_aggregation_provenance AS provenance
+          ON provenance.article_id = aggregate.article_id
+         AND provenance.configuration_id = ?
+         AND provenance.generation_run_id = aggregate.generation_run_id
+        LEFT JOIN long_text_part_generations AS part
+          ON part.article_id = provenance.article_id
+         AND part.configuration_id = provenance.configuration_id
+         AND part.article_input_sha256 = provenance.article_input_sha256
+         AND part.part_index = provenance.part_index
+         AND part.generation_run_id = provenance.part_generation_run_id
+        ORDER BY aggregate.article_id, aggregate.input_sha256,
+                 aggregate.generation_run_id, aggregate.active,
+                 provenance.part_index
         """,
-        parameters,
-    ).fetchone()
+        [configuration_id] * 5,
+        kind=RowKind.SINGLE_VECTOR,
+    )
+    canonical_rows = iter(articles.items())
+    canonical_pair = next(canonical_rows, None)
+
+    def key_fields(row: tuple[object, ...]) -> tuple[str, str, str, int]:
+        return str(row[0]), str(row[1]), str(row[4]), int(row[5])
+
+    for aggregate_key, grouped_rows in groupby(aggregate_rows, key=key_fields):
+        article_id = aggregate_key[0]
+        while canonical_pair is not None and canonical_pair[0] < article_id:
+            canonical_pair = next(canonical_rows, None)
+        article = (
+            canonical_pair[1]
+            if canonical_pair is not None and canonical_pair[0] == article_id
+            else None
+        )
+        _validate_long_text_aggregate(
+            config,
+            article,
+            configured_aggregation,
+            grouped_rows,
+            issues,
+        )
 
 
 def _validate_long_text_aggregate(
-    connection: duckdb.DuckDBPyConnection,
     config: EmbeddingPipelineConfig,
-    articles: _CanonicalArticles,
-    configuration_id: str,
+    article: CanonicalArticle | None,
     configured_aggregation: str,
-    aggregate: tuple[object, ...],
+    rows: Iterable[tuple[object, ...]],
     issues: list[EmbeddingValidationIssue],
 ) -> None:
-    article_id, article_hash, active_vector, vector_hash, run_id, active = aggregate
-    article = articles.get(article_id)
+    iterator = iter(rows)
+    first = next(iterator)
+    _article_id, article_hash, active_vector, vector_hash, _run_id, active = first[:6]
     canonical: tuple[str, bytes] | None = None
     if article is not None and article.cleaned_markdown_sha256 == article_hash:
         try:
@@ -2849,36 +3103,13 @@ def _validate_long_text_aggregate(
             )
         except (CanonicalMarkdownError, UnicodeDecodeError):
             pass
-    rows = stream_rows(
-        connection,
-        """
-        SELECT provenance.part_index, provenance.article_input_sha256,
-               provenance.part_count, provenance.part_input_sha256,
-               provenance.token_count, provenance.part_stored_vector_sha256,
-               provenance.aggregation_version, part.part_count,
-               part.char_start, part.char_end, part.byte_start, part.byte_end,
-               part.part_input_sha256, part.token_count,
-               part.stored_vector_sha256, part.vector
-        FROM article_text_aggregation_provenance AS provenance
-        LEFT JOIN long_text_part_generations AS part
-          ON part.article_id = provenance.article_id
-         AND part.configuration_id = provenance.configuration_id
-         AND part.article_input_sha256 = provenance.article_input_sha256
-         AND part.part_index = provenance.part_index
-         AND part.generation_run_id = provenance.part_generation_run_id
-        WHERE provenance.article_id = ? AND provenance.configuration_id = ?
-          AND provenance.generation_run_id = ?
-        ORDER BY provenance.part_index
-        """,
-        [article_id, configuration_id, run_id],
-        kind=RowKind.SINGLE_VECTOR,
-    )
     accumulator = [0.0] * _VECTOR_DIMENSIONS
     total_tokens = count = 0
     expected_count: int | None = None
     char_position = byte_position = 0
     linkage_valid = coverage_valid = True
-    for row in rows:
+    has_parts = bool(first[22])
+    for row in chain((first,), iterator):
         (
             part_index,
             provenance_article_hash,
@@ -2896,7 +3127,9 @@ def _validate_long_text_aggregate(
             stored_tokens,
             stored_vector_hash,
             vector,
-        ) = row
+        ) = row[6:22]
+        if part_index is None:
+            continue
         expected_count = provenance_count if expected_count is None else expected_count
         valid = (
             part_index == count
@@ -2929,15 +3162,7 @@ def _validate_long_text_aggregate(
             )
         count += 1
     if count == 0:
-        has_parts = connection.execute(
-            """
-            SELECT 1 FROM long_text_part_generations
-            WHERE article_id = ? AND configuration_id = ?
-              AND article_input_sha256 = ? LIMIT 1
-            """,
-            [article_id, configuration_id, article_hash],
-        ).fetchone()
-        if has_parts is not None:
+        if has_parts:
             _append(
                 issues,
                 "missing_long_text_provenance",

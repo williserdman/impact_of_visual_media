@@ -2705,6 +2705,40 @@ def test_long_text_reprocess_preserves_every_provenance_linked_part_generation(
     assert validate_embedding_outputs(config).ok
 
 
+def test_validator_streams_many_historical_aggregates_with_one_join_query(
+    monkeypatch, tmp_path
+):
+    """Break caught: validation repeats the aggregate UNION for every generation."""
+
+    import wsj_embeddings.validate as validation_module
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    replace_generated_embedding_markdown(config, "AAAA\n\nBBBB\n\nCCCC")
+    run_embedding_pipeline(config, StablePartVectorAdapter(), limit=1)
+    for _index in range(4):
+        run_embedding_pipeline(
+            config,
+            StablePartVectorAdapter(),
+            limit=1,
+            reprocess=True,
+        )
+    original_stream_rows = validation_module.stream_rows
+    aggregate_queries = 0
+
+    def counting_stream_rows(connection, sql, parameters=None, **kwargs):
+        nonlocal aggregate_queries
+        if "WITH aggregates AS" in sql:
+            aggregate_queries += 1
+        return original_stream_rows(connection, sql, parameters, **kwargs)
+
+    monkeypatch.setattr(validation_module, "stream_rows", counting_stream_rows)
+
+    result = validate_embedding_outputs(config)
+
+    assert result.ok
+    assert aggregate_queries == 1
+
+
 def test_validator_resolves_archived_aggregate_part_generations(tmp_path):
     """Break caught: archived aggregate provenance points to a missing part."""
 
@@ -5806,6 +5840,75 @@ def test_public_validator_reports_tampered_vector(tmp_path):
     }
 
 
+def test_public_validator_refuses_unsafe_validation_scratch_candidates(tmp_path):
+    """Break caught: a scratch index is created within a configured data tree."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    def tree_hashes(root: Path) -> dict[str, str]:
+        return {
+            path.relative_to(root).as_posix(): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    roots = (
+        config.source_root,
+        config.preprocessing_output_root,
+        config.embedding_output_root,
+    )
+    before = {str(root): tree_hashes(root) for root in roots}
+    result = validate_embedding_corpus(
+        config,
+        failpoints=EmbeddingValidationFailpoints(
+            scratch_parent_candidates=(*roots, tmp_path),
+        ),
+    )
+
+    assert "validation_scratch_unavailable" in {
+        issue.code for issue in result.issues
+    }
+    assert before == {str(root): tree_hashes(root) for root in roots}
+
+
+def test_default_temp_equal_to_source_root_is_rejected(monkeypatch, tmp_path):
+    """Break caught: the OS default temp directory aliases licensed input."""
+
+    import wsj_embeddings.validate as validation_module
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+    original_mkdtemp = validation_module.tempfile.mkdtemp
+    selected_parents: list[Path] = []
+    scratch_directories: list[Path] = []
+
+    def record_mkdtemp(*args, **kwargs):
+        directory = kwargs.get("dir", args[2] if len(args) > 2 else None)
+        selected_parents.append(Path(directory).resolve())
+        created = Path(original_mkdtemp(*args, **kwargs))
+        scratch_directories.append(created)
+        return str(created)
+
+    monkeypatch.setattr(
+        validation_module.tempfile,
+        "gettempdir",
+        lambda: str(config.source_root),
+    )
+    monkeypatch.setattr(validation_module.tempfile, "mkdtemp", record_mkdtemp)
+
+    result = validate_embedding_corpus(config)
+
+    assert "validation_scratch_unavailable" not in {
+        issue.code for issue in result.issues
+    }
+    assert selected_parents
+    assert config.source_root.resolve() not in selected_parents
+    assert all(not path.exists() for path in scratch_directories)
+
+
 def test_public_validator_streams_to_a_corrupt_vector_after_the_first_page(tmp_path):
     """Break caught: bounded validation silently stops after its first vector page."""
 
@@ -8239,6 +8342,69 @@ def test_validator_checks_hidden_reconciliation_vector_even_when_action_matches(
     codes = {issue.code for issue in validate_embedding_outputs(config).issues}
 
     assert codes & {"invalid_reconciliation_vector", "invalid_vector_hash"}
+
+
+def test_validator_recomputes_hidden_reconciliation_multimodal_vector(
+    monkeypatch, tmp_path
+):
+    """Break caught: a self-consistent hidden composite is not source-derived."""
+
+    import wsj_embeddings.validate as validation_module
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated hidden composite header")
+    run_embedding_pipeline(config, FakeEmbeddingAdapter(), full=True, page_size=1)
+    with Catalog.open(config.preprocessing_catalog) as catalog, catalog.transaction():
+        catalog.connection.execute("DELETE FROM articles")
+    with pytest.raises(SyntheticInterruption):
+        run_embedding_pipeline(
+            config,
+            FakeEmbeddingAdapter(),
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_full_reconciliation_visibility=lambda: (_ for _ in ()).throw(
+                    SyntheticInterruption()
+                ),
+            ),
+        )
+    vector = [0.0] * 2048
+    vector[1] = 1.0
+    vector_sha256 = hashlib.sha256(
+        b"".join(struct.pack("<f", value) for value in vector)
+    ).hexdigest()
+    with duckdb.connect(str(config.embedding_catalog)) as connection:
+        connection.execute(
+            """
+            UPDATE embedding_storage
+            SET vector = ?, stored_vector_sha256 = ?
+            WHERE modality = 'multimodal_article'
+            """,
+            [vector, vector_sha256],
+        )
+        connection.execute(
+            """
+            UPDATE reconciliation_actions
+            SET expected_stored_vector_sha256 = ?
+            WHERE modality = 'multimodal_article'
+            """,
+            [vector_sha256],
+        )
+    original_stream_rows = validation_module.stream_rows
+    hidden_multimodal_queries = 0
+
+    def counting_stream_rows(connection, sql, parameters=None, **kwargs):
+        nonlocal hidden_multimodal_queries
+        if "JOIN embedding_storage AS composite" in sql:
+            hidden_multimodal_queries += 1
+        return original_stream_rows(connection, sql, parameters, **kwargs)
+
+    monkeypatch.setattr(validation_module, "stream_rows", counting_stream_rows)
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_reconciliation_vector" in codes
+    assert hidden_multimodal_queries == 1
 
 
 def test_validator_accepts_pending_visible_multimodal_reconciliation(tmp_path):

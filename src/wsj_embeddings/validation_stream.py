@@ -68,24 +68,3 @@ def stream_rows(
         if not page:
             return
         yield from page
-
-
-def stream_keyset_rows(
-    connection: Any,
-    sql: str,
-    initial_key: tuple[object, ...],
-    *,
-    kind: RowKind = RowKind.METADATA,
-) -> Iterator[tuple[object, ...]]:
-    """Yield rows from a query whose final parameters and columns are its key."""
-
-    key = initial_key
-    while True:
-        page = list(stream_rows(connection, sql, key, kind=kind))
-        if not page:
-            return
-        next_key = tuple(page[-1][-len(key) :])
-        if next_key <= key:
-            raise RuntimeError("validation keyset query did not make progress")
-        yield from page
-        key = next_key

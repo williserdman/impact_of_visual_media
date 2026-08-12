@@ -572,7 +572,10 @@ provenance, or vector relations into Python. The largest vector page contains
 32 vectors, or eight rows for three-vector multimodal recomputation. Long-text
 aggregation retains one fixed 2,048-value accumulator and one current Markdown
 artifact. Rendition orphan checks use a content-free temporary SQLite reference
-index outside configured roots and remove it on return.
+index. Validation probes a writable scratch parent only after proving it is
+neither inside nor an ancestor of the source, preprocessing, or embedding root.
+If no safe candidate exists, it reports `validation_scratch_unavailable`
+without writing a fallback index. The scratch directory is removed on return.
 It also validates part identities, limits, bounded attempts,
 lifecycle/vector checkpoints, and aggregate linkage. Every active and archived
 long-text aggregate must resolve all of its immutable part generations and

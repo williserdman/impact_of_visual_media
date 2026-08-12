@@ -710,9 +710,12 @@ single-vector rows, or eight three-vector recomputation rows. Long-text
 validation retains one 2,048-value accumulator and one current Markdown body;
 historical part counts do not enlarge its Python working set. Relational checks
 run in DuckDB rather than Python corpus dictionaries. Rendition references are
-streamed into a content-free temporary SQLite primary-key index outside
-configured roots, then the no-follow walk probes it one leaf at a time. The
-index is removed when validation returns. A duplicate-sensitive,
+streamed into a content-free temporary SQLite primary-key index. The validator
+probes only scratch parents proven to be neither inside nor ancestors of any
+configured root; with no safe writable candidate it emits
+`validation_scratch_unavailable` and creates no fallback index. The no-follow
+walk probes the selected index one leaf at a time, and the scratch directory is
+removed when validation returns. A duplicate-sensitive,
 order-independent rendition-tree digest avoids a corpus-sized directory sort.
 
 ## 11. Test map

@@ -1,5 +1,36 @@
 # Task 14 implementation report: operator handoff and final integration gate
 
+## Corpus-scale validation correction
+
+The read-only validator now streams every corpus-sized relation through fixed
+cursor ceilings and performs canonical metadata joins once per bounded page.
+Long-text aggregate validation uses one ordered join across active, historical,
+and reconciliation-visible descriptors and their immutable part generations;
+it no longer repeats the descriptor UNION or issues one query per aggregate.
+Hidden reconciliation-visible multimodal vectors are recomputed from the exact
+physical text and image generations named by their provenance, even when a
+tampered vector and action agree on a valid unit-vector hash.
+
+Rendition orphan validation no longer trusts the process default temporary
+directory. It resolves and probes an explicit sequence of scratch parents,
+rejects any candidate inside or above a configured source or output root, and
+fails closed with `validation_scratch_unavailable` when none is safe and
+writable. The content-free SQLite reference index is always removed on return.
+Generated tests cover a default-temp/source collision, an injected no-safe
+candidate set with byte-identical configured trees, scratch cleanup, a corrupt
+vector beyond two pages, one canonical query per page, one long-aggregate join
+for several historical generations, and hidden midpoint tampering.
+
+Focused correction evidence passed: all four stream-module tests and five
+public validator regressions covering the scratch, multi-page, aggregate-query,
+and hidden-multimodal boundaries. A broader validator selection reached 106
+passes before its final orphan-vector fixture exposed an inner-join regression;
+the left-join correction and its four directly affected public-vector fixtures
+then passed. Changed-file Ruff and whitespace checks, both generated smokes,
+and the live embedding parent/validate help surfaces also passed. The embedding
+console script was exercised via its installed module entry point because this
+existing development environment did not contain the `wsj-embeddings` wrapper.
+
 ## Delivered
 
 The operator handoff now covers clean installation, explicit disjoint roots,
