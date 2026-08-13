@@ -56,6 +56,7 @@ from wsj_embeddings.pipeline import (
     _vector_hash,
     _verified_source_vector,
 )
+from wsj_embeddings.quota import hosted_quota_policy_is_valid
 from wsj_embeddings.run_metrics import safe_usage_is_valid
 from wsj_embeddings.source_image import (
     SourceImageError,
@@ -740,6 +741,7 @@ def _validate_configurations(
     issues: list[EmbeddingValidationIssue],
 ) -> None:
     invalid = False
+    invalid_quota_policy = False
     rows = stream_rows(
         connection,
         """
@@ -797,11 +799,20 @@ def _validate_configurations(
             or not _is_safe_response_model(row[2])
         ):
             invalid = True
+        if not hosted_quota_policy_is_valid(profile):
+            invalid_quota_policy = True
     if invalid:
         issues.append(
             EmbeddingValidationIssue(
                 "invalid_configuration_id",
                 "embedding configurations do not match their profile identity",
+            )
+        )
+    if invalid_quota_policy:
+        issues.append(
+            EmbeddingValidationIssue(
+                "invalid_hosted_quota_policy",
+                "embedding configurations contain an invalid hosted quota policy",
             )
         )
     if connection.execute(

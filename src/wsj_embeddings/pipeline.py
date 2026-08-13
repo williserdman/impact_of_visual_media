@@ -62,6 +62,10 @@ from wsj_embeddings.models import (
     VectorDerivationKind,
     WorkState,
 )
+from wsj_embeddings.quota import (
+    hosted_quota_policy_is_valid,
+    safe_observed_input_tokens,
+)
 from wsj_embeddings.source_image import SourceImageError, read_source_image
 from wsj_pipeline.catalog import Catalog, CatalogError
 
@@ -1315,6 +1319,8 @@ def _validate_batch_profile(profile: EmbeddingProfile) -> None:
         )
     except (TypeError, ValueError) as error:
         raise ValueError("adapter batch profile is invalid") from error
+    if not hosted_quota_policy_is_valid(profile):
+        raise ValueError("adapter batch profile is invalid")
 
 
 def _is_bound_observed_model(value: object) -> bool:
@@ -1703,19 +1709,13 @@ def _run_rate_aware_work(
         for reservation_id, usage in zip(
             reservation_ids, observations, strict=True
         ):
-            observed = usage.get("input_tokens", usage.get("prompt_tokens"))
-            if (
-                isinstance(observed, bool)
-                or not isinstance(observed, (int, float))
-                or not math.isfinite(float(observed))
-                or float(observed) < 0
-                or not float(observed).is_integer()
-            ):
+            observed = safe_observed_input_tokens(usage)
+            if observed is None:
                 continue
             with catalog.transaction():
                 catalog.reconcile_hosted_request_usage(
                     reservation_ids=(reservation_id,),
-                    observed_input_tokens=int(observed),
+                    observed_input_tokens=observed,
                 )
 
     execution_kwargs["after_wave"] = reconcile_wave_usage

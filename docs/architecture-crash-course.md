@@ -488,17 +488,28 @@ policy allows at most 90 reservations and 90,000 effective input tokens in a
 rolling 60-second window, at most 45,000 estimated tokens per request, and two
 concurrent requests. Text estimates use the pinned tokenizer; image estimates
 use `ceil(width / 28) * ceil(height / 28) * 10`. Safe returned input usage may
-increase an associated reservation but never lower its estimate. An
-inadmissible wave is reduced or waits until the earliest relevant reservation
-expires, always after the reservation transaction closes.
+increase an associated reservation but never lower its estimate; malformed or
+implausibly large usage is ignored for quota accounting. Policy validation
+requires positive request, token, and window limits and ensures one configured
+request/concurrency wave can fit. An input that cannot fit the request ceiling
+becomes an item-local terminal outcome without preventing valid siblings.
+
+An inadmissible wave waits until the earliest point at which enough request and
+token debt has expired. The reservation transaction closes before sleeping;
+after admission, attempt checkpoints commit immediately before transport.
+Expired reservations are removed in bounded pages during later admissions, so
+they remain minimal operational state rather than permanent request history.
 
 Every transport retry reserves again. A committed reservation is deliberately
 not refunded after a transport/fatal outcome or crash before transmission; a
 replay may therefore wait for at most the 60-second window. This conservative
 state survives coordinator restarts and full-run page boundaries. It
 coordinates only processes sharing this catalog/output and cannot see another
-client using the same account. The generated pilot applies the same policy in
-memory across all probes, retaining its no-catalog/no-output contract.
+client using the same account. The generated pilot applies the same pure
+earliest-safe calculation in memory across all probes. It authenticates with
+the generated 1x1 PNG before loading the pinned tokenizer, then counts normal,
+boundary, and concurrency text before reservation and transport. It retains
+its no-catalog/no-output contract.
 
 Durable prior attempts reduce each item's remaining budget. Retryable request
 or indexed-item failures use bounded exponential backoff plus production jitter
@@ -751,6 +762,7 @@ access and is not migrated, repaired, or overwritten.
 | after `eligible` or `queued` commits | durable attemptable work with no unproven success | rerun admits or resumes it without discarding provenance |
 | after `in_progress`, before a classified outcome | attempt start and count remain; recovered abandoned work becomes `interrupted` | rerun admits the interruption subject to its remaining budget |
 | after hosted quota reservation, before transport | content-free request/token debt remains, with no claimed vector outcome | rerun waits for any remaining portion of the 60-second window, then resumes |
+| one item exceeds the immutable request token/byte ceiling | that item becomes content-free `terminal` without a hosted attempt; valid siblings remain schedulable | ordinary replay preserves the terminal item and reuses completed siblings |
 | retryable provider, transport, or indexed-item result | `retryable` with safe status/retry metadata and committed attempt count | later admission retries only that item |
 | deterministic indexed image rejection before its limit | retryable image checkpoint; successful sibling text remains current | later admission spends only the image's remaining attempt budget |
 | deterministic item rejection at its limit, unsafe local image, or request-wide deterministic rejection | `terminal`, no placeholder vector; a request-wide rejection first terminalizes every unresolved indexed item | ordinary replay reuses the terminal disposition and does not repurchase it |

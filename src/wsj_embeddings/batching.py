@@ -181,18 +181,30 @@ def execute_rate_aware_batches(
     concurrency = policy.max_concurrency
     observed_concurrency = 0
     while pending:
-        batches = _pack(pending, policy)
+        batches, rejected = _pack(pending, policy)
+        for item in rejected:
+            outcome = JinaBatchItemOutcome(
+                item.index,
+                None,
+                "deterministic_request",
+                retryable=False,
+            )
+            final[item.index] = outcome
+            if on_outcome is not None:
+                on_outcome(item.index, item.attempt, outcome, True)
+        if not batches:
+            break
         wave = batches[:concurrency]
         deferred = [item for batch in batches[concurrency:] for item in batch]
         observed_concurrency = max(observed_concurrency, len(wave))
-        if before_attempt is not None:
-            for batch in wave:
-                for item in batch:
-                    before_attempt(item.index, item.attempt)
         if before_wave is not None:
             before_wave(
                 tuple(tuple(item.value for item in batch) for batch in wave)
             )
+        if before_attempt is not None:
+            for batch in wave:
+                for item in batch:
+                    before_attempt(item.index, item.attempt)
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [
                 executor.submit(
@@ -409,8 +421,9 @@ def execute_rate_aware_batches(
 
 def _pack(
     pending: Sequence[_PendingItem], policy: BatchPolicy
-) -> list[list[_PendingItem]]:
+) -> tuple[list[list[_PendingItem]], list[_PendingItem]]:
     batches: list[list[_PendingItem]] = []
+    rejected: list[_PendingItem] = []
     current: list[_PendingItem] = []
     tokens = 0
     encoded_bytes = 0
@@ -421,7 +434,8 @@ def _pack(
             item_tokens > policy.max_estimated_tokens
             or item_encoded_bytes > policy.max_encoded_bytes
         ):
-            raise JinaHostedAdapterError("deterministic_request", retryable=False)
+            rejected.append(item)
+            continue
         exceeds = current and (
             len(current) + 1 > policy.max_items
             or tokens + item_tokens > policy.max_estimated_tokens
@@ -437,7 +451,7 @@ def _pack(
         encoded_bytes += item_encoded_bytes
     if current:
         batches.append(current)
-    return batches
+    return batches, rejected
 
 
 def _retry_delay(

@@ -120,8 +120,11 @@ artifact.
 Every hosted pilot attempt also passes through one shared, process-local
 rolling quota window: at most 90 requests and 90,000 estimated input tokens in
 60 seconds, with at most two concurrent requests and 45,000 estimated tokens
-per request. The pilot remains state-free; this pacing disappears when that
-pilot process exits.
+per request. It authenticates first with the generated 1x1 PNG probe, uses the
+pinned tokenizer before every generated text probe,
+waits once until enough request and token debt has expired for the whole next
+wave. The pilot remains state-free; this pacing disappears when that pilot
+process exits.
 
 Run a successful credentialed pilot before authorizing a real-corpus embedding
 run. Automated tests never call the hosted API: they inject simulated HTTP
@@ -352,7 +355,10 @@ any 60-second window. A request is limited to 45,000 estimated tokens and
 concurrency remains two. Text and long-text parts use the pinned tokenizer;
 header images use the documented patch-token estimate. Every retry consumes a
 new reservation. Safe provider input usage may increase later quota debt but
-can never reduce the conservative estimate.
+can never reduce the conservative estimate; malformed, non-integral, or
+implausibly large usage metadata is ignored for quota accounting. Expired
+reservations are deleted in bounded pages during later admissions, so this
+operational table does not become permanent request history.
 
 Quota waits occur outside DuckDB transactions. A reservation commits
 immediately before transport and is not refunded after failure or process
@@ -361,6 +367,9 @@ most 60 seconds. Existing 429, `Retry-After`, rate-reset, jitter, and bounded
 retry behavior remains active because the 10% margin is not a guarantee.
 Reservations coordinate only runs sharing this embedding catalog/output; they
 cannot observe another program or machine using the same Jina account.
+An individual input that cannot fit the immutable 45,000-token or encoded-byte
+request ceiling becomes a content-free terminal item without preventing a
+valid sibling from completing.
 
 Then validate the generated catalog offline. Validation is read-only and makes
 no hosted request. When more than one configuration exists, provide its

@@ -1249,7 +1249,7 @@ def test_bounded_text_run_waits_for_durable_request_quota(tmp_path):
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
             "SELECT count(*) FROM hosted_request_reservations"
-        ).fetchone() == (2,)
+        ).fetchone() == (1,)
 
 
 def test_quota_reservation_survives_interruption_before_transport_and_replay(
@@ -1361,7 +1361,7 @@ def test_full_run_shares_durable_quota_across_processing_pages(tmp_path):
         ).fetchone() == ("succeeded", True, True, 2)
         assert db.execute(
             "SELECT count(*) FROM hosted_request_reservations"
-        ).fetchone() == (2,)
+        ).fetchone() == (1,)
 
 
 def test_hosted_source_hashes_and_response_model_survive_active_and_history(
@@ -2266,6 +2266,7 @@ def test_provider_input_usage_increases_quota_debt_before_next_wave(tmp_path):
         profile = replace(
             RecordingBatchAdapter.profile,
             batch_max_items=1,
+            batch_max_estimated_tokens=50,
             batch_max_concurrency=1,
             quota_max_requests=90,
             quota_max_estimated_tokens=50,
@@ -2302,7 +2303,34 @@ def test_provider_input_usage_increases_quota_debt_before_next_wave(tmp_path):
             FROM hosted_request_reservations
             ORDER BY reserved_at, reservation_id
             """
-        ).fetchall() == [(50,), (50,)]
+        ).fetchall() == [(50,)]
+
+
+def test_unsafe_provider_input_usage_is_ignored_without_losing_success(tmp_path):
+    """Break caught: absurd provider usage aborts after a successful exchange."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class UnsafeObservedUsageAdapter(RecordingBatchAdapter):
+        def embed_batch(self, inputs, *, limits):
+            response = super().embed_batch(inputs, limits=limits)
+            return replace(
+                response,
+                usage={"input_tokens": 1_000_000_001, "total_tokens": 1},
+            )
+
+    result = run_embedding_pipeline(
+        config,
+        UnsafeObservedUsageAdapter(),
+        limit=1,
+    )
+
+    assert result.embeddings == 1
+    assert result.succeeded == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT observed_input_tokens FROM hosted_request_reservations"
+        ).fetchall() == [(None,)]
 
 
 def test_indexed_deterministic_image_retries_alone_to_durable_limit(tmp_path):
@@ -2353,6 +2381,54 @@ def test_indexed_deterministic_image_retries_alone_to_durable_limit(tmp_path):
     assert replay.calls == []
     assert replay_result.reused == 1
     assert replay_result.terminal == 1
+
+
+def test_over_token_budget_header_is_terminal_without_losing_text_sibling(
+    tmp_path,
+):
+    """Break caught: a valid 2,000px image aborts the whole hosted scheduler."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated large but valid image"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {source_bytes: ImageInfo("PNG", 2_000, 2_000)}
+    )
+
+    class LargeImageBatchAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            image_input_rules=ScenarioImageCodec.input_rules,
+            image_transform=ScenarioImageCodec.transform_id,
+            client_configuration_version="synthetic-large-image-budget-v1",
+        )
+
+    adapter = LargeImageBatchAdapter()
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        image_codec=codec,
+    )
+
+    assert [[item.kind for item in call] for call in adapter.calls] == [["text"]]
+    assert result.succeeded == 1
+    assert result.terminal == 1
+    assert result.header_failed == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, state, attempt_count, error_code
+            FROM embedding_work_items
+            ORDER BY modality
+            """
+        ).fetchall() == [
+            ("article_text", "succeeded", 1, None),
+            ("header_image", "terminal", 0, "deterministic_request"),
+        ]
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [("article_text",)]
 
 
 @pytest.mark.parametrize("code", ("authentication", "authorization"))
@@ -8029,6 +8105,9 @@ def test_catalog_reserves_dual_rolling_quota_and_expires_old_capacity(tmp_path):
             """,
             [admitted.reservation_ids[0]],
         ).fetchone() == (45_000, 45_001)
+        assert catalog.connection.execute(
+            "SELECT count(*) FROM hosted_request_reservations"
+        ).fetchone() == (1,)
         assert len(reservation_ids) == 90
 
 
@@ -8075,6 +8154,42 @@ def test_validator_rejects_malformed_hosted_quota_reservation(tmp_path):
     codes = {issue.code for issue in validate_embedding_outputs(config).issues}
 
     assert "invalid_hosted_quota_reservation" in codes
+
+
+@pytest.mark.parametrize(
+    "profile_changes",
+    (
+        {"quota_max_requests": 0},
+        {"quota_max_estimated_tokens": -1},
+        {"quota_window_seconds": 0},
+        {"quota_max_requests": 1, "batch_max_concurrency": 2},
+        {
+            "quota_max_estimated_tokens": 1_999,
+            "batch_max_estimated_tokens": 1_000,
+            "batch_max_concurrency": 2,
+        },
+    ),
+)
+def test_validator_rejects_malformed_hosted_quota_policy(
+    tmp_path, profile_changes
+):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    profile = replace(
+        FakeEmbeddingAdapter.profile,
+        **profile_changes,
+        client_configuration_version="synthetic-invalid-quota-policy-v1",
+    )
+    identifier = configuration_id(profile)
+    with (
+        EmbeddingCatalog.open(config.embedding_catalog) as catalog,
+        catalog.transaction(),
+    ):
+        catalog.begin_run("invalid-quota-run", identifier, profile, 0)
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_hosted_quota_policy" in codes
 
 
 def test_pipeline_refuses_exact_version_sixteen_catalog_without_migration(tmp_path):

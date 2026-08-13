@@ -106,6 +106,63 @@ def test_scheduler_packs_item_token_and_encoded_byte_limits_independently():
     assert result.elapsed_seconds == 2.5
 
 
+def test_scheduler_terminalizes_one_over_budget_item_without_losing_sibling():
+    """Break caught: one valid large image aborts its text sibling's request."""
+
+    adapter = ScenarioBatchAdapter([_response(1)])
+    inputs = (
+        JinaEmbeddingInput.text("generated bounded sibling", estimated_tokens=3),
+        JinaEmbeddingInput.image_base64(
+            "aW1hZ2U=", estimated_tokens=51_840
+        ),
+    )
+    outcomes: list[tuple[int, int, str | None, bool]] = []
+
+    result = execute_rate_aware_batches(
+        adapter,
+        inputs,
+        policy=BatchPolicy(2, 45_000, 100, 1, 3, 0.0, 0.0),
+        on_outcome=lambda index, attempt, outcome, final: outcomes.append(
+            (index, attempt, outcome.error_code, final)
+        ),
+        monotonic=iter((1.0, 2.0)).__next__,
+    )
+
+    assert adapter.calls == [inputs[:1]]
+    assert result.items[0].vector is not None
+    assert result.items[1] == JinaBatchItemOutcome(
+        1, None, "deterministic_request", retryable=False
+    )
+    assert outcomes == [
+        (1, 1, "deterministic_request", True),
+        (0, 1, None, True),
+    ]
+
+
+def test_scheduler_reserves_quota_before_checkpointing_a_hosted_attempt():
+    """Break caught: waiting for quota consumes an attempt before transport."""
+
+    events: list[str] = []
+
+    class OrderedAdapter(ScenarioBatchAdapter):
+        def embed_batch(self, inputs, *, limits):
+            events.append("request")
+            return super().embed_batch(inputs, limits=limits)
+
+    adapter = OrderedAdapter([_response(1)])
+
+    execute_rate_aware_batches(
+        adapter,
+        (JinaEmbeddingInput.text("generated ordering fixture"),),
+        policy=BatchPolicy(1, 100, 100, 1, 1, 0.0, 0.0),
+        before_wave=lambda _wave: events.append("reservation"),
+        before_attempt=lambda _index, _attempt: events.append("attempt"),
+        monotonic=iter((1.0, 2.0)).__next__,
+    )
+
+    assert events == ["reservation", "attempt", "request"]
+
+
 def test_scheduler_honors_retry_after_backoff_jitter_usage_and_partial_retry():
     """Break caught: throttle delay is ignored or a partial success is repurchased."""
 

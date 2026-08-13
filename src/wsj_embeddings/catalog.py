@@ -26,9 +26,14 @@ from wsj_embeddings.models import (
     VectorDerivationKind,
     WorkState,
 )
+from wsj_embeddings.quota import (
+    MAX_SAFE_OBSERVED_INPUT_TOKENS,
+    rolling_quota_retry_after,
+)
 from wsj_embeddings.run_metrics import normalize_safe_usage
 
 EMBEDDING_CATALOG_SCHEMA_VERSION = "17"
+_HOSTED_RESERVATION_CLEANUP_PAGE_SIZE = 1_000
 
 _EMBEDDING_CATALOG_TYPES = {
     "article_text_aggregation_provenance",
@@ -1315,27 +1320,14 @@ class EmbeddingCatalog:
         """Atomically reserve one bounded hosted wave or return its safe delay."""
 
         costs = tuple(estimated_tokens)
-        if (
-            not costs
-            or len(costs) > profile.batch_max_concurrency
-            or any(
-                isinstance(cost, bool)
-                or not isinstance(cost, int)
-                or cost < 0
-                or cost > profile.batch_max_estimated_tokens
-                for cost in costs
+        try:
+            rolling_quota_retry_after(
+                (), costs, now=reserved_at, profile=profile
             )
-            or profile.quota_max_requests < 1
-            or profile.quota_max_estimated_tokens < 1
-            or profile.quota_window_seconds < 1
-            or profile.batch_max_concurrency < 1
-            or profile.batch_max_estimated_tokens < 1
-        ):
-            raise ValueError("hosted quota reservation is invalid")
+        except ValueError as error:
+            raise ValueError("hosted quota reservation is invalid") from error
         if configuration_identifier != configuration_id(profile):
             raise ValueError("hosted quota configuration does not match profile")
-        if reserved_at.tzinfo is None or reserved_at.utcoffset() is None:
-            raise ValueError("hosted quota timestamp must be timezone-aware")
         run = self.connection.execute(
             "SELECT configuration_id FROM runs WHERE run_id = ?",
             [run_id],
@@ -1345,6 +1337,19 @@ class EmbeddingCatalog:
 
         window_start = reserved_at - timedelta(
             seconds=profile.quota_window_seconds
+        )
+        self.connection.execute(
+            """
+            DELETE FROM hosted_request_reservations
+            WHERE reservation_id IN (
+                SELECT reservation_id
+                FROM hosted_request_reservations
+                WHERE reserved_at <= ?
+                ORDER BY reserved_at, reservation_id
+                LIMIT ?
+            )
+            """,
+            [window_start, _HOSTED_RESERVATION_CLEANUP_PAGE_SIZE],
         )
         rows = self.connection.execute(
             """
@@ -1363,20 +1368,18 @@ class EmbeddingCatalog:
         ):
             raise EmbeddingCatalogError("invalid hosted quota reservation state")
 
-        proposed_requests = len(costs)
-        proposed_tokens = sum(costs)
-        active_requests = len(rows)
-        active_tokens = sum(int(row[2]) for row in rows)
-        if (
-            proposed_requests > profile.quota_max_requests
-            or proposed_tokens > profile.quota_max_estimated_tokens
-        ):
-            raise ValueError("hosted wave exceeds quota policy")
-        if (
-            active_requests + proposed_requests <= profile.quota_max_requests
-            and active_tokens + proposed_tokens
-            <= profile.quota_max_estimated_tokens
-        ):
+        try:
+            retry_after_seconds = rolling_quota_retry_after(
+                tuple((row[1], int(row[2])) for row in rows),
+                costs,
+                now=reserved_at,
+                profile=profile,
+            )
+        except ValueError as error:
+            raise EmbeddingCatalogError(
+                "invalid hosted quota reservation state"
+            ) from error
+        if retry_after_seconds == 0.0:
             reservation_ids = tuple(uuid4().hex for _ in costs)
             self.connection.executemany(
                 """
@@ -1399,25 +1402,7 @@ class EmbeddingCatalog:
                 ],
             )
             return QuotaReservationDecision(reservation_ids, 0.0)
-
-        remaining_requests = active_requests
-        remaining_tokens = active_tokens
-        for _reservation_id, row_reserved_at, effective_tokens in rows:
-            remaining_requests -= 1
-            remaining_tokens -= int(effective_tokens)
-            if (
-                remaining_requests + proposed_requests
-                <= profile.quota_max_requests
-                and remaining_tokens + proposed_tokens
-                <= profile.quota_max_estimated_tokens
-            ):
-                retry_at = row_reserved_at + timedelta(
-                    seconds=profile.quota_window_seconds
-                )
-                return QuotaReservationDecision(
-                    (), max(0.0, (retry_at - reserved_at).total_seconds())
-                )
-        raise EmbeddingCatalogError("invalid hosted quota reservation state")
+        return QuotaReservationDecision((), retry_after_seconds)
 
     def reconcile_hosted_request_usage(
         self,
@@ -1434,7 +1419,7 @@ class EmbeddingCatalog:
             or isinstance(observed_input_tokens, bool)
             or not isinstance(observed_input_tokens, int)
             or observed_input_tokens < 0
-            or observed_input_tokens > 1_000_000_000
+            or observed_input_tokens > MAX_SAFE_OBSERVED_INPUT_TOKENS
         ):
             raise ValueError("hosted quota usage observation is invalid")
         rows = self.connection.execute(
