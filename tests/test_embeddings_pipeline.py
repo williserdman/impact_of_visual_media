@@ -1937,8 +1937,8 @@ def test_malformed_later_batch_persists_all_completed_hosted_telemetry(
         ]
 
 
-def test_pre_exchange_hosted_error_records_zero_hosted_telemetry(tmp_path):
-    """Break caught: a no-request packing failure invents hosted observations."""
+def test_pre_exchange_over_budget_item_records_zero_hosted_telemetry(tmp_path):
+    """Break caught: a local item rejection invents a request or fails the run."""
 
     config = write_generated_preprocessing_fixture(tmp_path)
 
@@ -1950,16 +1950,21 @@ def test_pre_exchange_hosted_error_records_zero_hosted_telemetry(tmp_path):
         )
 
     adapter = LocallyOversizedBatchAdapter()
-    with pytest.raises(JinaHostedAdapterError) as caught:
-        run_embedding_pipeline(
-            config,
-            adapter,
-            limit=1,
-            monotonic=iter((20.0, 23.0)).__next__,
-        )
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        monotonic=iter((20.0, 23.0)).__next__,
+    )
 
-    assert caught.value.code == "deterministic_request"
     assert adapter.calls == []
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        terminal=1,
+        header_absent=1,
+        elapsed_seconds=3.0,
+    )
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
             """
@@ -1967,7 +1972,16 @@ def test_pre_exchange_hosted_error_records_zero_hosted_telemetry(tmp_path):
                    elapsed_seconds, finished_at IS NOT NULL
             FROM runs
             """
-        ).fetchone() == ("failed", 0, 0, "{}", 0, 3.0, True)
+        ).fetchone() == ("succeeded", 0, 0, "{}", 0, 3.0, True)
+        assert db.execute(
+            """
+            SELECT modality, state, attempt_count, error_code
+            FROM embedding_work_items ORDER BY modality
+            """
+        ).fetchall() == [
+            ("article_text", "terminal", 0, "deterministic_request"),
+            ("header_image", "not_applicable", 0, None),
+        ]
 
 
 def test_batched_replay_enters_attempt_two_and_terminalizes_at_durable_ceiling(
