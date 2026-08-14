@@ -507,7 +507,7 @@ state survives coordinator restarts and full-run page boundaries. It
 coordinates only processes sharing this catalog/output and cannot see another
 client using the same account. The generated pilot applies the same pure
 earliest-safe calculation in memory across all probes. It authenticates with
-the generated 1x1 PNG before loading the pinned tokenizer, then counts normal,
+the generated 224x224 PNG before loading the pinned tokenizer, then counts normal,
 boundary, and concurrency text before reservation and transport. It retains
 its no-catalog/no-output contract.
 

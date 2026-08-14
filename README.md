@@ -120,7 +120,7 @@ artifact.
 Every hosted pilot attempt also passes through one shared, process-local
 rolling quota window: at most 90 requests and 90,000 estimated input tokens in
 60 seconds, with at most two concurrent requests and 45,000 estimated tokens
-per request. It authenticates first with the generated 1x1 PNG probe, uses the
+per request. It authenticates first with the generated 224x224 PNG probe, uses the
 pinned tokenizer before every generated text probe,
 waits once until enough request and token debt has expired for the whole next
 wave. The pilot remains state-free; this pacing disappears when that pilot
