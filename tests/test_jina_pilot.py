@@ -1030,6 +1030,14 @@ def test_pilot_stops_on_invalid_credential_without_creating_state(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_normal_generated_png_has_realistic_static_dimensions() -> None:
+    """Break caught: the normal hosted probe uses an unusable 1x1 image."""
+
+    image = base64.b64decode(_encoded_png(), validate=True)
+
+    _assert_valid_png(image, padded=False)
+
+
 def test_near_limit_generated_pngs_are_structurally_valid() -> None:
     """Break caught: padded image probes are base64 but not valid PNG streams."""
 
@@ -1037,7 +1045,7 @@ def test_near_limit_generated_pngs_are_structurally_valid() -> None:
         image = base64.b64decode(_encoded_png(target_size), validate=True)
 
         assert len(image) == target_size
-        _assert_valid_png(image)
+        _assert_valid_png(image, padded=True)
 
 
 @pytest.mark.parametrize(
@@ -1070,8 +1078,8 @@ def test_pilot_parse_errors_redact_rejected_values(
     assert rejected_value not in captured.err
 
 
-def _assert_valid_png(image: bytes) -> None:
-    """Validate PNG framing, CRCs, text grammar, and decompressed 1x1 pixels."""
+def _assert_valid_png(image: bytes, *, padded: bool) -> None:
+    """Validate framing, CRCs, optional padding, and 224x224 RGB pixels."""
 
     assert image.startswith(b"\x89PNG\r\n\x1a\n")
     position = 8
@@ -1088,9 +1096,15 @@ def _assert_valid_png(image: bytes) -> None:
         position = data_end + 4
 
     assert position == len(image)
-    assert [kind for kind, _ in chunks] == [b"IHDR", b"IDAT", b"tEXt", b"IEND"]
-    assert chunks[0][1] == struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
-    keyword, text = chunks[2][1].split(b"\x00", 1)
-    assert keyword == b"p"
-    assert text
-    assert zlib.decompress(chunks[1][1]) == b"\x00\x00\x00\x00"
+    expected_kinds = [b"IHDR", b"IDAT", *([b"tEXt"] if padded else []), b"IEND"]
+    assert [kind for kind, _ in chunks] == expected_kinds
+    assert chunks[0][1] == struct.pack(">IIBBBBB", 224, 224, 8, 2, 0, 0, 0)
+    if padded:
+        keyword, text = chunks[2][1].split(b"\x00", 1)
+        assert keyword == b"p"
+        assert text
+    pixels = zlib.decompress(chunks[1][1])
+    row_size = 1 + 224 * 3
+    assert len(pixels) == 224 * row_size
+    assert all(pixels[row * row_size] == 0 for row in range(224))
+    assert len(set(pixels)) > 2

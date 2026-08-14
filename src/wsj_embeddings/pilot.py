@@ -727,10 +727,22 @@ def _generated_text(units: int) -> str:
 
 
 def _encoded_png(target_size: int | None = None) -> str:
-    """Return an in-memory valid 1x1 PNG, optionally padded to an exact size."""
+    """Return a generated 224x224 RGB PNG, optionally padded to an exact size."""
 
-    png = _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
-    png += _png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+    width = height = 224
+    dark = b"\x1e\x5a\xb4"
+    light = b"\xdc\xb4\x28"
+    rows: list[bytes] = []
+    for y in range(height):
+        row = bytearray(b"\x00")
+        for x in range(width):
+            row.extend(dark if ((x // 16) + (y // 16)) % 2 == 0 else light)
+        rows.append(bytes(row))
+    pixels = b"".join(rows)
+    png = _png_chunk(
+        b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    )
+    png += _png_chunk(b"IDAT", zlib.compress(pixels))
     png += _png_chunk(b"IEND", b"")
     png = b"\x89PNG\r\n\x1a\n" + png
     if target_size is not None:
