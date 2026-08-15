@@ -428,6 +428,11 @@ def _pack(
     tokens = 0
     encoded_bytes = 0
     for item in pending:
+        try:
+            item.value.as_request_item()
+        except JinaHostedAdapterError:
+            rejected.append(item)
+            continue
         item_tokens = item.value.estimated_tokens
         item_encoded_bytes = item.value.encoded_bytes
         if (

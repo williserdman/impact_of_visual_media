@@ -1357,11 +1357,11 @@ class EmbeddingCatalog:
                    greatest(estimated_tokens,
                             coalesce(observed_input_tokens, estimated_tokens))
             FROM hosted_request_reservations
-            WHERE reserved_at > ? AND reserved_at <= ?
+            WHERE reserved_at > ?
             ORDER BY reserved_at, reservation_id
             LIMIT ?
             """,
-            [window_start, reserved_at, profile.quota_max_requests + 1],
+            [window_start, profile.quota_max_requests + 1],
         ).fetchall()
         if len(rows) > profile.quota_max_requests or any(
             int(row[2]) < 0 for row in rows

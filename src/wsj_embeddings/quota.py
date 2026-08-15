@@ -102,6 +102,7 @@ def rolling_quota_retry_after(
         or tokens > MAX_SAFE_OBSERVED_INPUT_TOKENS
         or reserved_at.tzinfo is None
         or reserved_at.utcoffset() is None
+        or reserved_at > now
         for reserved_at, tokens in ordered
     ):
         raise ValueError("hosted quota reservation state is invalid")

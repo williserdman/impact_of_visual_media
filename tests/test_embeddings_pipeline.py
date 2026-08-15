@@ -1364,6 +1364,159 @@ def test_full_run_shares_durable_quota_across_processing_pages(tmp_path):
         ).fetchone() == (1,)
 
 
+def test_full_run_quota_reservation_survives_pretransport_crash_and_replay(
+    tmp_path,
+):
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class OnePerMinuteAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_concurrency=1,
+            quota_max_requests=1,
+            client_configuration_version="synthetic-full-quota-crash-v1",
+        )
+
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    interrupted_adapter = OnePerMinuteAdapter()
+
+    def interrupt_after_reservation(_reservation_ids: tuple[str, ...]) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_embedding_pipeline(
+            config,
+            interrupted_adapter,
+            full=True,
+            page_size=1,
+            quota_clock=lambda: now[0],
+            failpoints=EmbeddingPipelineFailpoints(
+                after_quota_reservation=interrupt_after_reservation
+            ),
+        )
+
+    assert interrupted_adapter.calls == []
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    resumed_adapter = OnePerMinuteAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        full=True,
+        page_size=1,
+        quota_clock=lambda: now[0],
+        batch_sleep=advance,
+    )
+
+    assert sleeps == [60.0]
+    assert len(resumed_adapter.calls) == 1
+    assert resumed.succeeded == 1
+
+
+def test_full_run_replay_reuses_page_committed_before_interruption(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-FULL-QUOTA-REPLAY",
+        markdown="# Full quota replay page\n",
+    )
+    interrupted_adapter = RecordingBatchAdapter()
+    processed_pages = 0
+
+    def interrupt_between_pages(_page_size: int) -> None:
+        nonlocal processed_pages
+        processed_pages += 1
+        if processed_pages == 1:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_embedding_pipeline(
+            config,
+            interrupted_adapter,
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_full_processing_page=interrupt_between_pages
+            ),
+        )
+
+    assert len(interrupted_adapter.calls) == 1
+    resumed_adapter = RecordingBatchAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        full=True,
+        page_size=1,
+    )
+
+    assert [[item.value for item in call] for call in resumed_adapter.calls] == [
+        ["# Full quota replay page\n"]
+    ]
+    assert resumed.reused == 1
+    assert resumed.succeeded == 1
+
+
+def test_full_run_fatal_exchange_stops_later_pages_and_replay_resumes(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-FULL-QUOTA-FATAL",
+        markdown="# Full quota fatal page\n",
+    )
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-FULL-QUOTA-LATER",
+        markdown="# Full quota later page\n",
+    )
+    fatal = JinaHostedAdapterError(
+        "authentication", retryable=False, status_code=401
+    )
+
+    class ReplayableFatalAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_attempts=2,
+            client_configuration_version="synthetic-full-fatal-replay-v1",
+        )
+
+    adapter = ReplayableFatalAdapter([{}, fatal])
+
+    with pytest.raises(JinaHostedAdapterError, match="authentication"):
+        run_embedding_pipeline(config, adapter, full=True, page_size=1)
+
+    assert len(adapter.calls) == 2
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT status, hosted_requests, finished_at IS NOT NULL
+            FROM runs ORDER BY started_at DESC LIMIT 1
+            """
+        ).fetchone() == ("failed", 2, True)
+        assert db.execute(
+            "SELECT count(*) FROM embeddings WHERE modality = 'article_text'"
+        ).fetchone() == (1,)
+
+    resumed_adapter = ReplayableFatalAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        full=True,
+        page_size=1,
+    )
+
+    assert [[item.value for item in call] for call in resumed_adapter.calls] == [
+        ["# Full quota fatal page\n"],
+        ["# Full quota later page\n"],
+    ]
+    assert resumed.reused == 1
+    assert resumed.succeeded == 2
+
+
 def test_hosted_source_hashes_and_response_model_survive_active_and_history(
     tmp_path,
 ):
@@ -8154,6 +8307,41 @@ def test_catalog_admits_two_maximum_requests_but_blocks_a_third(tmp_path):
     assert blocked == embedding_catalog_module.QuotaReservationDecision((), 60.0)
 
 
+def test_catalog_fails_closed_on_future_dated_quota_reservation(tmp_path):
+    database_path = tmp_path / "catalog.duckdb"
+    profile = FakeEmbeddingAdapter.profile
+    configuration_identifier = configuration_id(profile)
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+
+    with EmbeddingCatalog.open(database_path) as catalog:
+        with catalog.transaction():
+            catalog.begin_run("run-future-quota", configuration_identifier, profile, 1)
+            catalog.connection.execute(
+                """
+                INSERT INTO hosted_request_reservations
+                    (reservation_id, run_id, configuration_id, reserved_at,
+                     estimated_tokens, observed_input_tokens)
+                VALUES ('future', 'run-future-quota', ?, ?, 1, NULL)
+                """,
+                [configuration_identifier, now + timedelta(seconds=1)],
+            )
+
+        with (
+            pytest.raises(
+                EmbeddingCatalogError,
+                match="invalid hosted quota reservation state",
+            ),
+            catalog.transaction(),
+        ):
+            catalog.reserve_hosted_requests(
+                run_id="run-future-quota",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(1,),
+                reserved_at=now,
+                profile=profile,
+            )
+
+
 def test_validator_rejects_malformed_hosted_quota_reservation(tmp_path):
     config = write_generated_preprocessing_fixture(tmp_path)
     run_embedding_pipeline(config, RecordingBatchAdapter(), limit=1)
@@ -8162,6 +8350,22 @@ def test_validator_rejects_malformed_hosted_quota_reservation(tmp_path):
             """
             UPDATE hosted_request_reservations
             SET observed_input_tokens = estimated_tokens - 1
+            """
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_hosted_quota_reservation" in codes
+
+
+def test_validator_rejects_future_dated_hosted_quota_reservation(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, RecordingBatchAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            UPDATE hosted_request_reservations
+            SET reserved_at = current_timestamp + INTERVAL 1 DAY
             """
         )
 

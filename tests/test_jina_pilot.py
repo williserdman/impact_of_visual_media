@@ -17,7 +17,12 @@ import pytest
 
 from wsj_embeddings.adapters import JinaEmbeddingAdapter, JinaHttpResponse
 from wsj_embeddings.cli import build_parser, main
-from wsj_embeddings.pilot import _encoded_png, run_jina_pilot
+from wsj_embeddings.pilot import (
+    _boundary_probes,
+    _encoded_png,
+    _normal_image_probe,
+    run_jina_pilot,
+)
 from wsj_embeddings.tokenizer import PinnedJinaV4Tokenizer, PinnedTokenizerError
 
 
@@ -158,7 +163,7 @@ def test_live_pilot_uses_pinned_counts_for_normal_text_quota():
     class WeightedPilotTokenizer(PilotTokenizer):
         def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
             if text == "generated pilot text":
-                return ((0, 1),) * 44_990
+                return ((0, 1),) * 44_360
             return super().token_offsets(text)
 
     class ZeroUsageTransport(PilotTransport):
@@ -1036,6 +1041,26 @@ def test_normal_generated_png_has_realistic_static_dimensions() -> None:
     image = base64.b64decode(_encoded_png(), validate=True)
 
     _assert_valid_png(image, padded=False)
+
+
+def test_generated_image_probes_use_their_patch_token_estimate() -> None:
+    """Break caught: 224x224 probes retain the former 1x1 token estimate."""
+
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=PilotTransport(),
+        tokenizer=PilotTokenizer(),
+    )
+    image_inputs = (
+        _normal_image_probe().inputs[0],
+        *(
+            probe.inputs[0]
+            for probe in _boundary_probes(adapter)
+            if "image" in probe.name
+        ),
+    )
+
+    assert {item.estimated_tokens for item in image_inputs} == {640}
 
 
 def test_near_limit_generated_pngs_are_structurally_valid() -> None:

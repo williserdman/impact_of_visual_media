@@ -51,7 +51,7 @@ After the minimal generator correction:
 1. run the focused pilot tests and hosted-adapter tests;
 2. run Ruff and diff hygiene;
 3. rerun the live generated-only pilot using the configured API key; and
-4. require `readiness.outcome == "ready"` before proposing a licensed one-article
-   canary.
+4. require `readiness.outcome == "ready_for_operator_review"` before proposing
+   a licensed one-article canary.
 
 No real article canary or full-corpus run is authorized by this design.

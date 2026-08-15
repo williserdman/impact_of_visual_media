@@ -123,8 +123,8 @@ PYTHONPATH=src /home/willis/projects/finance_wsj/.venv/bin/wsj-embeddings pilot 
 Parse and report only readiness, probe status, returned safe model labels,
 dimensions, request/retry counts, and safe HTTP classifications. Expected:
 `text_normal`, `image_normal`, and `mixed_normal` succeed at 2,048 dimensions,
-and `readiness.outcome` is `ready`. If not, stop and diagnose rather than
-starting a corpus canary.
+and `readiness.outcome` is `ready_for_operator_review`. If not, stop and
+diagnose rather than starting a corpus canary.
 
 - [ ] **Step 6: Commit the pilot correction**
 

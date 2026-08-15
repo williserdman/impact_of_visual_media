@@ -838,6 +838,7 @@ def _validate_configurations(
         WHERE runs.run_id IS NULL
            OR configuration.configuration_id IS NULL
            OR runs.configuration_id != reservation.configuration_id
+           OR reservation.reserved_at > current_timestamp
            OR reservation.estimated_tokens < 0
            OR reservation.estimated_tokens
                 > configuration.batch_max_estimated_tokens

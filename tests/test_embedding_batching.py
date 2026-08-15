@@ -139,6 +139,25 @@ def test_scheduler_terminalizes_one_over_budget_item_without_losing_sibling():
     ]
 
 
+def test_scheduler_rejects_invalid_payload_before_quota_reservation():
+    """Break caught: local request validation happens after quota admission."""
+
+    adapter = ScenarioBatchAdapter([])
+    reserved_waves: list[tuple[tuple[JinaEmbeddingInput, ...], ...]] = []
+
+    result = execute_rate_aware_batches(
+        adapter,
+        (JinaEmbeddingInput.image_base64("not-base64", estimated_tokens=10),),
+        policy=BatchPolicy(8, 45_000, 1_000, 1, 1, 0.0, 0.0),
+        before_wave=reserved_waves.append,
+    )
+
+    assert reserved_waves == []
+    assert adapter.calls == []
+    assert result.requests == 0
+    assert result.items[0].error_code == "deterministic_request"
+
+
 def test_scheduler_reserves_quota_before_checkpointing_a_hosted_attempt():
     """Break caught: waiting for quota consumes an attempt before transport."""
 

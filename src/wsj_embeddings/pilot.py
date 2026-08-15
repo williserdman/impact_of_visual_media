@@ -63,6 +63,13 @@ _SAFE_PRICING_FIELDS = frozenset(
 )
 _TEXT_PROBE_UNITS = (8_192, 32_768)
 _IMAGE_PROBE_BYTES = (5_000_000, 8_000_000)
+_GENERATED_IMAGE_WIDTH = 224
+_GENERATED_IMAGE_HEIGHT = 224
+_GENERATED_IMAGE_ESTIMATED_TOKENS = (
+    math.ceil(_GENERATED_IMAGE_WIDTH / 28)
+    * math.ceil(_GENERATED_IMAGE_HEIGHT / 28)
+    * 10
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -644,7 +651,12 @@ def _safe_nonnegative_number(value: object) -> int | float | None:
 def _normal_image_probe() -> _PilotProbe:
     return _PilotProbe(
         "image_normal",
-        (JinaEmbeddingInput.image_base64(_encoded_png(), estimated_tokens=10),),
+        (
+            JinaEmbeddingInput.image_base64(
+                _encoded_png(),
+                estimated_tokens=_GENERATED_IMAGE_ESTIMATED_TOKENS,
+            ),
+        ),
     )
 
 
@@ -679,7 +691,8 @@ def _boundary_probes(adapter: JinaEmbeddingAdapter) -> tuple[_PilotProbe, ...]:
                 f"image_nominal_{size}_bytes",
                 (
                     JinaEmbeddingInput.image_base64(
-                        _encoded_png(size), estimated_tokens=10
+                        _encoded_png(size),
+                        estimated_tokens=_GENERATED_IMAGE_ESTIMATED_TOKENS,
                     ),
                 ),
             )
@@ -729,7 +742,8 @@ def _generated_text(units: int) -> str:
 def _encoded_png(target_size: int | None = None) -> str:
     """Return a generated 224x224 RGB PNG, optionally padded to an exact size."""
 
-    width = height = 224
+    width = _GENERATED_IMAGE_WIDTH
+    height = _GENERATED_IMAGE_HEIGHT
     dark = b"\x1e\x5a\xb4"
     light = b"\xdc\xb4\x28"
     rows: list[bytes] = []
