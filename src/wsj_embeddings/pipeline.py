@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -60,6 +61,10 @@ from wsj_embeddings.models import (
     EmbeddingRunResult,
     VectorDerivationKind,
     WorkState,
+)
+from wsj_embeddings.quota import (
+    hosted_quota_policy_is_valid,
+    safe_observed_input_tokens,
 )
 from wsj_embeddings.source_image import SourceImageError, read_source_image
 from wsj_pipeline.catalog import Catalog, CatalogError
@@ -112,6 +117,7 @@ class EmbeddingPipelineFailpoints:
     after_long_text_terminal_transition: Callable[[int], None] | None = None
     after_image_rendition_install: Callable[[str], None] | None = None
     after_batched_item_outcome_commit: Callable[[int, bool], None] | None = None
+    after_quota_reservation: Callable[[tuple[str, ...]], None] | None = None
     after_full_discovery_page: Callable[[int], None] | None = None
     after_full_processing_page: Callable[[int], None] | None = None
     during_full_reconciliation_page: Callable[[int], None] | None = None
@@ -316,6 +322,7 @@ def run_embedding_pipeline(
     batch_sleep: Callable[[float], None] | None = None,
     batch_jitter: Callable[[int], float] | None = None,
     monotonic: Callable[[], float] | None = None,
+    quota_clock: Callable[[], datetime] | None = None,
     page_size: int = 100,
 ) -> EmbeddingRunResult:
     """Publish source and derived vectors for a bounded canonical slice."""
@@ -351,6 +358,7 @@ def run_embedding_pipeline(
             batch_sleep=batch_sleep,
             batch_jitter=batch_jitter,
             monotonic=monotonic,
+            quota_clock=quota_clock,
             page_size=page_size,
         )
     assert limit is not None
@@ -492,6 +500,7 @@ def run_embedding_pipeline(
                     batch_sleep=batch_sleep,
                     batch_jitter=batch_jitter,
                     monotonic=monotonic,
+                    quota_clock=quota_clock,
                 )
             except BatchExecutionFatal as error:
                 with catalog.transaction():
@@ -766,6 +775,7 @@ def _run_full_embedding_pipeline(
     batch_sleep: Callable[[float], None] | None,
     batch_jitter: Callable[[int], float] | None,
     monotonic: Callable[[], float] | None,
+    quota_clock: Callable[[], datetime] | None,
     page_size: int,
 ) -> EmbeddingRunResult:
     """Traverse, process, and reconcile one explicit full run in bounded pages."""
@@ -883,6 +893,7 @@ def _run_full_embedding_pipeline(
                         batch_sleep=batch_sleep,
                         batch_jitter=batch_jitter,
                         monotonic=monotonic,
+                        quota_clock=quota_clock,
                     )
                     if metrics is not None:
                         totals["requests"] += metrics.requests
@@ -996,6 +1007,7 @@ def _process_full_article_page(
     batch_sleep: Callable[[float], None] | None,
     batch_jitter: Callable[[int], float] | None,
     monotonic: Callable[[], float] | None,
+    quota_clock: Callable[[], datetime] | None,
 ) -> BatchExecutionResult | None:
     """Process one already-inventoried bounded page under the full-run lock."""
 
@@ -1081,6 +1093,7 @@ def _process_full_article_page(
             batch_sleep=batch_sleep,
             batch_jitter=batch_jitter,
             monotonic=monotonic,
+            quota_clock=quota_clock,
         )
         for article in articles:
             with catalog.transaction():
@@ -1306,6 +1319,8 @@ def _validate_batch_profile(profile: EmbeddingProfile) -> None:
         )
     except (TypeError, ValueError) as error:
         raise ValueError("adapter batch profile is invalid") from error
+    if not hosted_quota_policy_is_valid(profile):
+        raise ValueError("adapter batch profile is invalid")
 
 
 def _is_bound_observed_model(value: object) -> bool:
@@ -1344,6 +1359,7 @@ def _run_rate_aware_work(
     batch_sleep: Callable[[float], None] | None,
     batch_jitter: Callable[[int], float] | None,
     monotonic: Callable[[], float] | None,
+    quota_clock: Callable[[], datetime] | None,
 ) -> BatchExecutionResult:
     """Stage hosted-only work, then serialize each durable item transition."""
 
@@ -1658,6 +1674,51 @@ def _run_rate_aware_work(
         "prior_attempt_counts": tuple(prior_attempt_counts),
         "attempt_limits": tuple(attempt_limits),
     }
+    active_sleep = time.sleep if batch_sleep is None else batch_sleep
+    active_quota_clock = (
+        (lambda: datetime.now(UTC)) if quota_clock is None else quota_clock
+    )
+    reserved_wave: list[tuple[str, ...]] = []
+
+    def reserve_wave(
+        wave: tuple[tuple[JinaEmbeddingInput, ...], ...],
+    ) -> None:
+        costs = tuple(sum(item.estimated_tokens for item in batch) for batch in wave)
+        while True:
+            with catalog.transaction():
+                decision = catalog.reserve_hosted_requests(
+                    run_id=run_id,
+                    configuration_identifier=configuration_identifier,
+                    estimated_tokens=costs,
+                    reserved_at=active_quota_clock(),
+                    profile=profile,
+                )
+            if decision.reservation_ids:
+                reserved_wave.append(decision.reservation_ids)
+                if failpoints.after_quota_reservation is not None:
+                    failpoints.after_quota_reservation(decision.reservation_ids)
+                return
+            active_sleep(decision.retry_after_seconds)
+
+    execution_kwargs["before_wave"] = reserve_wave
+
+    def reconcile_wave_usage(
+        observations: tuple[dict[str, int | float], ...],
+    ) -> None:
+        reservation_ids = reserved_wave.pop(0)
+        for reservation_id, usage in zip(
+            reservation_ids, observations, strict=True
+        ):
+            observed = safe_observed_input_tokens(usage)
+            if observed is None:
+                continue
+            with catalog.transaction():
+                catalog.reconcile_hosted_request_usage(
+                    reservation_ids=(reservation_id,),
+                    observed_input_tokens=observed,
+                )
+
+    execution_kwargs["after_wave"] = reconcile_wave_usage
     if batch_sleep is not None:
         execution_kwargs["sleep"] = batch_sleep
     if batch_jitter is not None:

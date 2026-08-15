@@ -5,16 +5,24 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import struct
 import threading
 import zlib
 from collections.abc import Mapping
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from wsj_embeddings.adapters import JinaHttpResponse
+from wsj_embeddings.adapters import JinaEmbeddingAdapter, JinaHttpResponse
 from wsj_embeddings.cli import build_parser, main
-from wsj_embeddings.pilot import _encoded_png
+from wsj_embeddings.pilot import (
+    _boundary_probes,
+    _encoded_png,
+    _normal_image_probe,
+    run_jina_pilot,
+)
 from wsj_embeddings.tokenizer import PinnedJinaV4Tokenizer, PinnedTokenizerError
 
 
@@ -116,6 +124,127 @@ def _run_pilot(transport, *, capsys) -> dict[str, object]:
         == 0
     )
     return json.loads(capsys.readouterr().out)
+
+
+def test_all_live_pilot_probes_share_one_state_free_quota_window(tmp_path):
+    transport = PilotTransport()
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=transport,
+        tokenizer=PilotTokenizer(),
+    )
+    adapter.profile = replace(
+        adapter.profile,
+        quota_max_requests=2,
+        quota_max_estimated_tokens=90_000,
+        quota_window_seconds=60,
+    )
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    result = run_jina_pilot(
+        adapter,
+        quota_clock=lambda: now[0],
+        quota_sleep=advance,
+    )
+
+    assert result["readiness"]["outcome"] == "ready_for_operator_review"
+    assert len(transport.requests) > 2
+    assert len(sleeps) == math.ceil(len(transport.requests) / 2) - 1
+    assert set(sleeps) == {60.0}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_live_pilot_uses_pinned_counts_for_normal_text_quota():
+    class WeightedPilotTokenizer(PilotTokenizer):
+        def token_offsets(self, text: str) -> tuple[tuple[int, int], ...]:
+            if text == "generated pilot text":
+                return ((0, 1),) * 44_360
+            return super().token_offsets(text)
+
+    class ZeroUsageTransport(PilotTransport):
+        def post(self, *args, **kwargs):
+            response = super().post(*args, **kwargs)
+            payload = json.loads(response.body)
+            payload["usage"] = {"prompt_tokens": 0, "total_tokens": 0}
+            return JinaHttpResponse(
+                response.status_code, response.headers, json.dumps(payload).encode()
+            )
+
+    transport = ZeroUsageTransport()
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=transport,
+        tokenizer=WeightedPilotTokenizer(),
+    )
+    adapter.profile = replace(
+        adapter.profile,
+        quota_max_requests=90,
+        quota_max_estimated_tokens=90_000,
+        batch_max_estimated_tokens=45_000,
+    )
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    request_counts_at_sleep: list[int] = []
+
+    def advance(seconds: float) -> None:
+        request_counts_at_sleep.append(len(transport.requests))
+        now[0] += timedelta(seconds=seconds)
+
+    run_jina_pilot(
+        adapter,
+        quota_clock=lambda: now[0],
+        quota_sleep=advance,
+    )
+
+    assert request_counts_at_sleep[0] == 3
+
+
+def test_live_pilot_sleeps_once_until_enough_token_debt_expires():
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    observed_usage = iter((1_000, 90_000, 1_000))
+
+    class StaggeredUsageTransport(PilotTransport):
+        def post(self, *args, **kwargs):
+            response = super().post(*args, **kwargs)
+            payload = json.loads(response.body)
+            tokens = next(observed_usage, 1)
+            payload["usage"] = {
+                "prompt_tokens": tokens,
+                "total_tokens": tokens,
+            }
+            now[0] += timedelta(seconds=10)
+            return JinaHttpResponse(
+                response.status_code, response.headers, json.dumps(payload).encode()
+            )
+
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=StaggeredUsageTransport(),
+        tokenizer=PilotTokenizer(),
+    )
+    adapter.profile = replace(
+        adapter.profile,
+        quota_max_requests=90,
+        quota_max_estimated_tokens=90_000,
+        batch_max_estimated_tokens=45_000,
+    )
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    run_jina_pilot(
+        adapter,
+        quota_clock=lambda: now[0],
+        quota_sleep=advance,
+    )
+
+    assert sleeps[0] == 50.0
 
 
 @pytest.mark.parametrize(
@@ -517,12 +646,12 @@ def test_pilot_reports_natural_retry_from_production_scheduler(capsys) -> None:
     )
     result = json.loads(capsys.readouterr().out)
 
-    text_probe = next(
-        probe for probe in result["probes"] if probe["name"] == "text_normal"
+    authentication_probe = next(
+        probe for probe in result["probes"] if probe["name"] == "image_normal"
     )
-    assert text_probe["requests"] == 2
-    assert text_probe["retries"] == 1
-    assert text_probe["rate_limit_headers"]["retry-after"] == [0.0]
+    assert authentication_probe["requests"] == 2
+    assert authentication_probe["retries"] == 1
+    assert authentication_probe["rate_limit_headers"]["retry-after"] == [0.0]
     assert result["retry_behavior"] == {"outcome": "observed", "retries": 1}
 
 
@@ -560,7 +689,7 @@ def test_pilot_preserves_prior_observations_when_retry_becomes_fatal(
             return super().post(url, **kwargs)
 
     result = _run_pilot(MissingThenFatalTransport(), capsys=capsys)
-    probe = result["probes"][0]
+    probe = result["probes"][1]
 
     assert probe == {
         "billing": {
@@ -571,7 +700,7 @@ def test_pilot_preserves_prior_observations_when_retry_becomes_fatal(
         "concurrency_observed": 1,
         "dimensions": [],
         "error": "deterministic_request",
-        "name": "text_normal",
+        "name": "image_normal",
         "rate_limit_headers": {
             "x-ratelimit-remaining-requests": [7.0, 9.0]
         },
@@ -824,8 +953,8 @@ def test_pilot_reports_generated_text_image_mixed_and_boundary_observations(
     assert [
         sorted(item) for request in transport.requests for item in request["input"]
     ] == [
-        ["text"],
         ["image"],
+        ["text"],
         ["text"],
         ["image"],
         ["text"],
@@ -906,6 +1035,34 @@ def test_pilot_stops_on_invalid_credential_without_creating_state(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_normal_generated_png_has_realistic_static_dimensions() -> None:
+    """Break caught: the normal hosted probe uses an unusable 1x1 image."""
+
+    image = base64.b64decode(_encoded_png(), validate=True)
+
+    _assert_valid_png(image, padded=False)
+
+
+def test_generated_image_probes_use_their_patch_token_estimate() -> None:
+    """Break caught: 224x224 probes retain the former 1x1 token estimate."""
+
+    adapter = JinaEmbeddingAdapter(
+        environment={"JINA_API_KEY": "synthetic-secret"},
+        transport=PilotTransport(),
+        tokenizer=PilotTokenizer(),
+    )
+    image_inputs = (
+        _normal_image_probe().inputs[0],
+        *(
+            probe.inputs[0]
+            for probe in _boundary_probes(adapter)
+            if "image" in probe.name
+        ),
+    )
+
+    assert {item.estimated_tokens for item in image_inputs} == {640}
+
+
 def test_near_limit_generated_pngs_are_structurally_valid() -> None:
     """Break caught: padded image probes are base64 but not valid PNG streams."""
 
@@ -913,7 +1070,7 @@ def test_near_limit_generated_pngs_are_structurally_valid() -> None:
         image = base64.b64decode(_encoded_png(target_size), validate=True)
 
         assert len(image) == target_size
-        _assert_valid_png(image)
+        _assert_valid_png(image, padded=True)
 
 
 @pytest.mark.parametrize(
@@ -946,8 +1103,8 @@ def test_pilot_parse_errors_redact_rejected_values(
     assert rejected_value not in captured.err
 
 
-def _assert_valid_png(image: bytes) -> None:
-    """Validate PNG framing, CRCs, text grammar, and decompressed 1x1 pixels."""
+def _assert_valid_png(image: bytes, *, padded: bool) -> None:
+    """Validate framing, CRCs, optional padding, and 224x224 RGB pixels."""
 
     assert image.startswith(b"\x89PNG\r\n\x1a\n")
     position = 8
@@ -964,9 +1121,15 @@ def _assert_valid_png(image: bytes) -> None:
         position = data_end + 4
 
     assert position == len(image)
-    assert [kind for kind, _ in chunks] == [b"IHDR", b"IDAT", b"tEXt", b"IEND"]
-    assert chunks[0][1] == struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
-    keyword, text = chunks[2][1].split(b"\x00", 1)
-    assert keyword == b"p"
-    assert text
-    assert zlib.decompress(chunks[1][1]) == b"\x00\x00\x00\x00"
+    expected_kinds = [b"IHDR", b"IDAT", *([b"tEXt"] if padded else []), b"IEND"]
+    assert [kind for kind, _ in chunks] == expected_kinds
+    assert chunks[0][1] == struct.pack(">IIBBBBB", 224, 224, 8, 2, 0, 0, 0)
+    if padded:
+        keyword, text = chunks[2][1].split(b"\x00", 1)
+        assert keyword == b"p"
+        assert text
+    pixels = zlib.decompress(chunks[1][1])
+    row_size = 1 + 224 * 3
+    assert len(pixels) == 224 * row_size
+    assert all(pixels[row * row_size] == 0 for row in range(224))
+    assert len(set(pixels)) > 2

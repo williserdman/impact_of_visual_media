@@ -8,9 +8,11 @@ import math
 import re
 import struct
 import threading
+import time
 import zlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from wsj_embeddings.adapters import (
     JinaEmbeddingAdapter,
@@ -22,6 +24,10 @@ from wsj_embeddings.batching import (
     BatchExecutionFatal,
     BatchPolicy,
     execute_rate_aware_batches,
+)
+from wsj_embeddings.quota import (
+    rolling_quota_retry_after,
+    safe_observed_input_tokens,
 )
 
 _SAFE_METADATA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -57,6 +63,13 @@ _SAFE_PRICING_FIELDS = frozenset(
 )
 _TEXT_PROBE_UNITS = (8_192, 32_768)
 _IMAGE_PROBE_BYTES = (5_000_000, 8_000_000)
+_GENERATED_IMAGE_WIDTH = 224
+_GENERATED_IMAGE_HEIGHT = 224
+_GENERATED_IMAGE_ESTIMATED_TOKENS = (
+    math.ceil(_GENERATED_IMAGE_WIDTH / 28)
+    * math.ceil(_GENERATED_IMAGE_HEIGHT / 28)
+    * 10
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,18 +110,119 @@ class _ObservingAdapter:
                 self._active -= 1
 
 
-def run_jina_pilot(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
+@dataclass(slots=True)
+class _PilotQuotaReservation:
+    reserved_at: datetime
+    estimated_tokens: int
+    observed_input_tokens: int | None = None
+
+    @property
+    def effective_tokens(self) -> int:
+        return max(
+            self.estimated_tokens,
+            self.observed_input_tokens or self.estimated_tokens,
+        )
+
+
+class _PilotQuotaLimiter:
+    """State-free rolling limiter shared by all probes in one invocation."""
+
+    def __init__(
+        self,
+        adapter: JinaEmbeddingAdapter,
+        *,
+        clock: Callable[[], datetime],
+        sleep: Callable[[float], None],
+    ) -> None:
+        self._profile = adapter.profile
+        self._clock = clock
+        self._sleep = sleep
+        self._reservations: list[_PilotQuotaReservation] = []
+        self._pending_waves: list[list[_PilotQuotaReservation]] = []
+
+    def reserve_wave(
+        self, wave: tuple[tuple[JinaEmbeddingInput, ...], ...]
+    ) -> None:
+        costs = tuple(sum(item.estimated_tokens for item in batch) for batch in wave)
+        if (
+            not costs
+            or len(costs) > self._profile.quota_max_requests
+            or sum(costs) > self._profile.quota_max_estimated_tokens
+            or any(cost > self._profile.batch_max_estimated_tokens for cost in costs)
+        ):
+            raise JinaHostedAdapterError("deterministic_request", retryable=False)
+        while True:
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("pilot quota clock must be timezone-aware")
+            window_start = now - timedelta(
+                seconds=self._profile.quota_window_seconds
+            )
+            self._reservations = [
+                reservation
+                for reservation in self._reservations
+                if reservation.reserved_at > window_start
+            ]
+            try:
+                retry_after_seconds = rolling_quota_retry_after(
+                    tuple(
+                        (reservation.reserved_at, reservation.effective_tokens)
+                        for reservation in self._reservations
+                    ),
+                    costs,
+                    now=now,
+                    profile=self._profile,
+                )
+            except ValueError as error:
+                raise JinaHostedAdapterError(
+                    "deterministic_request", retryable=False
+                ) from error
+            if retry_after_seconds == 0.0:
+                reservations = [
+                    _PilotQuotaReservation(now, cost) for cost in costs
+                ]
+                self._reservations.extend(reservations)
+                self._pending_waves.append(reservations)
+                return
+            self._sleep(retry_after_seconds)
+
+    def reconcile_wave(
+        self, observations: tuple[dict[str, int | float], ...]
+    ) -> None:
+        reservations = self._pending_waves.pop(0)
+        for reservation, usage in zip(reservations, observations, strict=True):
+            observed = safe_observed_input_tokens(usage)
+            if observed is None:
+                continue
+            reservation.observed_input_tokens = max(
+                reservation.estimated_tokens, observed
+            )
+
+def run_jina_pilot(
+    adapter: JinaEmbeddingAdapter,
+    *,
+    quota_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    quota_sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
     """Measure fixed synthetic hosted requests without reading or writing state."""
 
-    normal_probes = _normal_probes()
-    first_result = _run_probe(adapter, normal_probes[0])
+    limiter = _PilotQuotaLimiter(
+        adapter,
+        clock=quota_clock,
+        sleep=quota_sleep,
+    )
+    image_probe = _normal_image_probe()
+    image_result = _run_probe(adapter, image_probe, limiter)
+    normal_probes = _normal_probes(adapter, image_probe)
+    text_result = _run_probe(adapter, normal_probes[0], limiter)
     boundary_probes = _boundary_probes(adapter)
     results = (
-        first_result,
-        *(_run_probe(adapter, probe) for probe in normal_probes[1:]),
-        *(_run_probe(adapter, probe) for probe in boundary_probes),
+        text_result,
+        image_result,
+        _run_probe(adapter, normal_probes[2], limiter),
+        *(_run_probe(adapter, probe, limiter) for probe in boundary_probes),
     )
-    concurrency_result = _run_concurrency_probe(adapter)
+    concurrency_result = _run_concurrency_probe(adapter, limiter)
     openapi_observation = _observe_openapi(adapter)
     model_catalogue_observation = _observe_model_catalogue(adapter)
     total_retries = sum(
@@ -154,7 +268,9 @@ def run_jina_pilot(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
 
 
 def _run_probe(
-    adapter: JinaEmbeddingAdapter, probe: _PilotProbe
+    adapter: JinaEmbeddingAdapter,
+    probe: _PilotProbe,
+    limiter: _PilotQuotaLimiter,
 ) -> dict[str, object]:
     observer = _ObservingAdapter(adapter)
     text_token_count = sum(
@@ -166,6 +282,8 @@ def _run_probe(
             probe.inputs,
             policy=_pilot_policy(adapter, probe.inputs, max_concurrency=1),
             jitter=lambda _attempt: 0.0,
+            before_wave=limiter.reserve_wave,
+            after_wave=limiter.reconcile_wave,
         )
     except BatchExecutionFatal as error:
         if error.code in {"authentication", "authorization"}:
@@ -253,10 +371,15 @@ def _run_probe(
     return result
 
 
-def _run_concurrency_probe(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
-    inputs = (
-        JinaEmbeddingInput.text("generated concurrency probe one"),
-        JinaEmbeddingInput.text("generated concurrency probe two"),
+def _run_concurrency_probe(
+    adapter: JinaEmbeddingAdapter, limiter: _PilotQuotaLimiter
+) -> dict[str, object]:
+    inputs = tuple(
+        _token_counted_text(adapter, text)
+        for text in (
+            "generated concurrency probe one",
+            "generated concurrency probe two",
+        )
     )
     observer = _ObservingAdapter(adapter)
     try:
@@ -270,6 +393,8 @@ def _run_concurrency_probe(adapter: JinaEmbeddingAdapter) -> dict[str, object]:
                 max_items=1,
             ),
             jitter=lambda _attempt: 0.0,
+            before_wave=limiter.reserve_wave,
+            after_wave=limiter.reconcile_wave,
         )
     except BatchExecutionFatal as error:
         if error.code in {"authentication", "authorization"}:
@@ -523,13 +648,36 @@ def _safe_nonnegative_number(value: object) -> int | float | None:
     return value
 
 
-def _normal_probes() -> tuple[_PilotProbe, ...]:
-    normal_text = JinaEmbeddingInput.text("generated pilot text")
-    normal_image = JinaEmbeddingInput.image_base64(_encoded_png())
+def _normal_image_probe() -> _PilotProbe:
+    return _PilotProbe(
+        "image_normal",
+        (
+            JinaEmbeddingInput.image_base64(
+                _encoded_png(),
+                estimated_tokens=_GENERATED_IMAGE_ESTIMATED_TOKENS,
+            ),
+        ),
+    )
+
+
+def _normal_probes(
+    adapter: JinaEmbeddingAdapter,
+    image_probe: _PilotProbe,
+) -> tuple[_PilotProbe, ...]:
+    normal_text = _token_counted_text(adapter, "generated pilot text")
+    normal_image = image_probe.inputs[0]
     return (
         _PilotProbe("text_normal", (normal_text,)),
         _PilotProbe("image_normal", (normal_image,)),
         _PilotProbe("mixed_normal", (normal_text, normal_image)),
+    )
+
+
+def _token_counted_text(
+    adapter: JinaEmbeddingAdapter, text: str
+) -> JinaEmbeddingInput:
+    return JinaEmbeddingInput.text(
+        text, estimated_tokens=len(adapter.token_offsets(text))
     )
 
 
@@ -541,7 +689,12 @@ def _boundary_probes(adapter: JinaEmbeddingAdapter) -> tuple[_PilotProbe, ...]:
         *(
             _PilotProbe(
                 f"image_nominal_{size}_bytes",
-                (JinaEmbeddingInput.image_base64(_encoded_png(size)),),
+                (
+                    JinaEmbeddingInput.image_base64(
+                        _encoded_png(size),
+                        estimated_tokens=_GENERATED_IMAGE_ESTIMATED_TOKENS,
+                    ),
+                ),
             )
             for size in _IMAGE_PROBE_BYTES
         ),
@@ -587,10 +740,23 @@ def _generated_text(units: int) -> str:
 
 
 def _encoded_png(target_size: int | None = None) -> str:
-    """Return an in-memory valid 1x1 PNG, optionally padded to an exact size."""
+    """Return a generated 224x224 RGB PNG, optionally padded to an exact size."""
 
-    png = _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
-    png += _png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00"))
+    width = _GENERATED_IMAGE_WIDTH
+    height = _GENERATED_IMAGE_HEIGHT
+    dark = b"\x1e\x5a\xb4"
+    light = b"\xdc\xb4\x28"
+    rows: list[bytes] = []
+    for y in range(height):
+        row = bytearray(b"\x00")
+        for x in range(width):
+            row.extend(dark if ((x // 16) + (y // 16)) % 2 == 0 else light)
+        rows.append(bytes(row))
+    pixels = b"".join(rows)
+    png = _png_chunk(
+        b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    )
+    png += _png_chunk(b"IDAT", zlib.compress(pixels))
     png += _png_chunk(b"IEND", b"")
     png = b"\x89PNG\r\n\x1a\n" + png
     if target_size is not None:

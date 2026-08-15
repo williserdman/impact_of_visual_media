@@ -117,6 +117,15 @@ catalogue or OpenAPI document names it. Missing or rejected credentials return
 only a classified content-free error and create no catalog, output, or log
 artifact.
 
+Every hosted pilot attempt also passes through one shared, process-local
+rolling quota window: at most 90 requests and 90,000 estimated input tokens in
+60 seconds, with at most two concurrent requests and 45,000 estimated tokens
+per request. It authenticates first with the generated 224x224 PNG probe, uses the
+pinned tokenizer before every generated text probe,
+waits once until enough request and token debt has expired for the whole next
+wave. The pilot remains state-free; this pacing disappears when that pilot
+process exits.
+
 Run a successful credentialed pilot before authorizing a real-corpus embedding
 run. Automated tests never call the hosted API: they inject simulated HTTP
 responses or a fake adapter at the same public seams.
@@ -294,7 +303,16 @@ wsj-embeddings smoke
 Smoke also snapshots its generated preprocessing inputs and fails if the
 downstream coordinator changes them.
 
-After setting `JINA_API_KEY`, run the pilot manually and review its
+Set the key only in the shell that will run the hosted command. This prompt
+does not echo the value or place it in shell history:
+
+```bash
+read -rsp "Jina API key: " JINA_API_KEY; echo
+export JINA_API_KEY
+```
+
+Do not paste the value into a command argument, repository file, issue, log,
+or generated output. After exporting it, run the pilot manually and review its
 content-free result before authorizing any archive scope:
 
 ```bash
@@ -331,6 +349,28 @@ production stops with `pilot_observation_required` before output mutation; a
 later response-model mismatch records content-free `configuration_drift` and
 publishes no vector under the old configuration.
 
+Production requests use a durable rolling quota recorded in the embedding
+catalog: no more than 90 hosted attempts or 90,000 estimated input tokens in
+any 60-second window. A request is limited to 45,000 estimated tokens and
+concurrency remains two. Text and long-text parts use the pinned tokenizer;
+header images use the documented patch-token estimate. Every retry consumes a
+new reservation. Safe provider input usage may increase later quota debt but
+can never reduce the conservative estimate; malformed, non-integral, or
+implausibly large usage metadata is ignored for quota accounting. Expired
+reservations are deleted in bounded pages during later admissions, so this
+operational table does not become permanent request history.
+
+Quota waits occur outside DuckDB transactions. A reservation commits
+immediately before transport and is not refunded after failure or process
+loss, so a crash before transmission can conservatively delay replay for at
+most 60 seconds. Existing 429, `Retry-After`, rate-reset, jitter, and bounded
+retry behavior remains active because the 10% margin is not a guarantee.
+Reservations coordinate only runs sharing this embedding catalog/output; they
+cannot observe another program or machine using the same Jina account.
+An individual input that cannot fit the immutable 45,000-token or encoded-byte
+request ceiling becomes a content-free terminal item without preventing a
+valid sibling from completing.
+
 Then validate the generated catalog offline. Validation is read-only and makes
 no hosted request. When more than one configuration exists, provide its
 explicit ID rather than allowing configurations to be mixed:
@@ -360,13 +400,13 @@ For the detailed contracts behind this reference, see the crash course's
 [downstream boundary](docs/architecture-crash-course.md#13-downstream-boundaries),
 and [glossary](docs/architecture-crash-course.md#15-glossary).
 
-### Schema-v16 catalog reference
+### Schema-v17 catalog reference
 
-The downstream catalog is a separate schema-version-16 `catalog.duckdb` below
+The downstream catalog is a separate schema-version-17 `catalog.duckdb` below
 an embedding output root that must be disjoint from both the licensed source
-root and preprocessing output root. Versions 1 through 15 are refused without
+root and preprocessing output root. Versions 1 through 16 are refused without
 migration: move reproducible derived output aside or choose a fresh embedding
-output root. The catalog has exactly thirteen base tables, two canonical views,
+output root. The catalog has exactly fourteen base tables, two canonical views,
 and no indexes. `full_run_articles` stores only run/article identity and an
 optional source-relative header association, never Markdown or image bytes.
 
@@ -375,9 +415,10 @@ The operational table and view inventory is:
 | Table | Ordered columns | Key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
-| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `client_api_contract_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_response_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
+| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `client_api_contract_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_response_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `quota_max_requests INTEGER`, `quota_max_estimated_tokens INTEGER`, `quota_window_seconds INTEGER`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `scope VARCHAR`, `status VARCHAR`, `discovery_complete BOOLEAN`, `reconciliation_complete BOOLEAN`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `hosted_requests INTEGER`, `hosted_retries INTEGER`, `usage_json VARCHAR`, `throttles INTEGER`, `elapsed_seconds DOUBLE`, `started_at TIMESTAMPTZ`, `finished_at TIMESTAMPTZ` | `run_id` |
 | `full_run_articles` | `run_id VARCHAR`, `article_id VARCHAR`, `header_image_path VARCHAR` | `(run_id, article_id)` |
+| `hosted_request_reservations` | `reservation_id VARCHAR`, `run_id VARCHAR`, `configuration_id VARCHAR`, `reserved_at TIMESTAMPTZ`, `estimated_tokens INTEGER`, `observed_input_tokens INTEGER` | `reservation_id` |
 | `embedding_work_storage` | physical columns exposed by `embedding_work_items` | `(article_id, modality, configuration_id)` |
 | `embedding_storage` | physical columns exposed by `embeddings` | `(article_id, modality, configuration_id)` |
 | `reconciliation_actions` | exact run/article/modality/configuration target disposition plus expected source/input/state/generation/vector identity and `staged_at` | `(run_id, article_id, modality, configuration_id)` |

@@ -88,13 +88,16 @@ class EmbeddingProfile:
     long_text_aggregation: str = "l2-token-count-weighted-mean-float32-v1"
     long_text_part_attempt_limit: int = 3
     batch_max_items: int = 16
-    batch_max_estimated_tokens: int = 300_000
+    batch_max_estimated_tokens: int = 45_000
     batch_max_encoded_bytes: int = 8_000_000
     batch_max_response_bytes: int = 2_000_000
     batch_max_concurrency: int = 2
     batch_max_attempts: int = 3
     batch_initial_backoff_seconds: float = 1.0
     batch_max_backoff_seconds: float = 30.0
+    quota_max_requests: int = 90
+    quota_max_estimated_tokens: int = 90_000
+    quota_window_seconds: int = 60
     image_input_rules: str = (
         "static-jpeg-png-webp-max5000000b-max20000000px-decode-max40000000px-"
         "exact-source-v1"
@@ -104,7 +107,7 @@ class EmbeddingProfile:
         "if-over20000000px-optimize0-progressive0-metadata-none-v1"
     )
     multimodal_formula: str = "l2-normalize-0.5-text-0.5-image-v1"
-    client_configuration_version: str = "wsj-embeddings-config-v5"
+    client_configuration_version: str = "wsj-embeddings-config-v6"
 
 
 @dataclass(frozen=True, slots=True)

@@ -133,6 +133,10 @@ def execute_rate_aware_batches(
     jitter: Callable[[int], float] = _production_jitter,
     monotonic: Callable[[], float] = time.monotonic,
     before_attempt: Callable[[int, int], None] | None = None,
+    before_wave: (
+        Callable[[tuple[tuple[JinaEmbeddingInput, ...], ...]], None] | None
+    ) = None,
+    after_wave: Callable[[tuple[dict[str, int | float], ...]], None] | None = None,
     on_outcome: Callable[[int, int, JinaBatchItemOutcome, bool], None] | None = None,
     prior_attempt_counts: Sequence[int] | None = None,
     attempt_limits: Sequence[int] | None = None,
@@ -177,10 +181,26 @@ def execute_rate_aware_batches(
     concurrency = policy.max_concurrency
     observed_concurrency = 0
     while pending:
-        batches = _pack(pending, policy)
+        batches, rejected = _pack(pending, policy)
+        for item in rejected:
+            outcome = JinaBatchItemOutcome(
+                item.index,
+                None,
+                "deterministic_request",
+                retryable=False,
+            )
+            final[item.index] = outcome
+            if on_outcome is not None:
+                on_outcome(item.index, item.attempt, outcome, True)
+        if not batches:
+            break
         wave = batches[:concurrency]
         deferred = [item for batch in batches[concurrency:] for item in batch]
         observed_concurrency = max(observed_concurrency, len(wave))
+        if before_wave is not None:
+            before_wave(
+                tuple(tuple(item.value for item in batch) for batch in wave)
+            )
         if before_attempt is not None:
             for batch in wave:
                 for item in batch:
@@ -206,6 +226,15 @@ def execute_rate_aware_batches(
                 except JinaHostedAdapterError as error:
                     exchange = error
                 exchanges.append((batch, exchange))
+        if after_wave is not None:
+            after_wave(
+                tuple(
+                    dict(exchange.usage)
+                    if isinstance(exchange, JinaEmbeddingBatchResponse)
+                    else {}
+                    for _batch, exchange in exchanges
+                )
+            )
         requests += len(wave)
         retry_delays: list[float] = []
         next_pending = list(deferred)
@@ -392,19 +421,26 @@ def execute_rate_aware_batches(
 
 def _pack(
     pending: Sequence[_PendingItem], policy: BatchPolicy
-) -> list[list[_PendingItem]]:
+) -> tuple[list[list[_PendingItem]], list[_PendingItem]]:
     batches: list[list[_PendingItem]] = []
+    rejected: list[_PendingItem] = []
     current: list[_PendingItem] = []
     tokens = 0
     encoded_bytes = 0
     for item in pending:
+        try:
+            item.value.as_request_item()
+        except JinaHostedAdapterError:
+            rejected.append(item)
+            continue
         item_tokens = item.value.estimated_tokens
         item_encoded_bytes = item.value.encoded_bytes
         if (
             item_tokens > policy.max_estimated_tokens
             or item_encoded_bytes > policy.max_encoded_bytes
         ):
-            raise JinaHostedAdapterError("deterministic_request", retryable=False)
+            rejected.append(item)
+            continue
         exceeds = current and (
             len(current) + 1 > policy.max_items
             or tokens + item_tokens > policy.max_estimated_tokens
@@ -420,7 +456,7 @@ def _pack(
         encoded_bytes += item_encoded_bytes
     if current:
         batches.append(current)
-    return batches
+    return batches, rejected
 
 
 def _retry_delay(

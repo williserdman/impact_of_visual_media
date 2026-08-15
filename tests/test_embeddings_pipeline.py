@@ -12,7 +12,7 @@ import warnings
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import duckdb
@@ -88,6 +88,9 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("batch_max_attempts", "INTEGER", True, None, False),
         ("batch_initial_backoff_seconds", "DOUBLE", True, None, False),
         ("batch_max_backoff_seconds", "DOUBLE", True, None, False),
+        ("quota_max_requests", "INTEGER", True, None, False),
+        ("quota_max_estimated_tokens", "INTEGER", True, None, False),
+        ("quota_window_seconds", "INTEGER", True, None, False),
         ("image_input_rules", "VARCHAR", True, None, False),
         ("image_transform", "VARCHAR", True, None, False),
         ("multimodal_formula", "VARCHAR", True, None, False),
@@ -117,6 +120,14 @@ EXPECTED_EMBEDDING_TABLE_COLUMNS = {
         ("elapsed_seconds", "DOUBLE", True, None, False),
         ("started_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
         ("finished_at", "TIMESTAMP WITH TIME ZONE", False, None, False),
+    ),
+    "hosted_request_reservations": (
+        ("reservation_id", "VARCHAR", True, None, True),
+        ("run_id", "VARCHAR", True, None, False),
+        ("configuration_id", "VARCHAR", True, None, False),
+        ("reserved_at", "TIMESTAMP WITH TIME ZONE", True, None, False),
+        ("estimated_tokens", "INTEGER", True, None, False),
+        ("observed_input_tokens", "INTEGER", False, None, False),
     ),
     "full_run_articles": (
         ("run_id", "VARCHAR", True, None, True),
@@ -283,6 +294,7 @@ EXPECTED_EMBEDDING_PRIMARY_KEYS = {
     ("metadata", ("key",)),
     ("embedding_configurations", ("configuration_id",)),
     ("runs", ("run_id",)),
+    ("hosted_request_reservations", ("reservation_id",)),
     ("full_run_articles", ("run_id", "article_id")),
     (
         "embedding_work_storage",
@@ -824,6 +836,9 @@ def test_configuration_identity_covers_every_meaning_bearing_profile_field():
         "batch_max_attempts": 4,
         "batch_initial_backoff_seconds": 2.0,
         "batch_max_backoff_seconds": 60.0,
+        "quota_max_requests": 89,
+        "quota_max_estimated_tokens": 89_000,
+        "quota_window_seconds": 61,
         "image_input_rules": "changed-image-rules",
         "image_transform": "changed-image-transform",
         "multimodal_formula": "changed-multimodal-formula",
@@ -1190,6 +1205,316 @@ def test_rate_aware_coordinator_batches_mixed_items_and_summarizes_hosted_usage(
             ("header_image",),
             ("multimodal_article",),
         ]
+
+
+def test_bounded_text_run_waits_for_durable_request_quota(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:SYNTHETIC-SECOND-QUOTA",
+        markdown="# Second quota article\n",
+    )
+
+    class OnePerMinuteAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_concurrency=1,
+            batch_max_attempts=2,
+            quota_max_requests=1,
+            quota_max_estimated_tokens=90_000,
+            client_configuration_version="synthetic-one-request-minute-v1",
+        )
+
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    adapter = OnePerMinuteAdapter()
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=2,
+        batch_sleep=advance,
+        batch_jitter=lambda _attempt: 0.0,
+        quota_clock=lambda: now[0],
+    )
+
+    assert [len(call) for call in adapter.calls] == [1, 1]
+    assert sleeps == [60.0]
+    assert result.embeddings == 2
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT count(*) FROM hosted_request_reservations"
+        ).fetchone() == (1,)
+
+
+def test_quota_reservation_survives_interruption_before_transport_and_replay(
+    tmp_path,
+):
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class OnePerMinuteAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_concurrency=1,
+            batch_max_attempts=2,
+            quota_max_requests=1,
+            quota_max_estimated_tokens=90_000,
+            client_configuration_version="synthetic-quota-crash-v1",
+        )
+
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    interrupted_adapter = OnePerMinuteAdapter()
+
+    def interrupt(_reservation_ids: tuple[str, ...]) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_embedding_pipeline(
+            config,
+            interrupted_adapter,
+            limit=1,
+            quota_clock=lambda: now[0],
+            failpoints=EmbeddingPipelineFailpoints(
+                after_quota_reservation=interrupt
+            ),
+        )
+
+    assert interrupted_adapter.calls == []
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT count(*) FROM hosted_request_reservations"
+        ).fetchone() == (1,)
+
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    resumed_adapter = OnePerMinuteAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        limit=1,
+        quota_clock=lambda: now[0],
+        batch_sleep=advance,
+    )
+
+    assert sleeps == [60.0]
+    assert len(resumed_adapter.calls) == 1
+    assert resumed.succeeded == 1
+
+
+def test_full_run_shares_durable_quota_across_processing_pages(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:SYNTHETIC-FULL-QUOTA",
+        markdown="# Full quota page\n",
+    )
+
+    class OnePerMinuteAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_concurrency=1,
+            batch_max_attempts=2,
+            quota_max_requests=1,
+            quota_max_estimated_tokens=90_000,
+            client_configuration_version="synthetic-full-quota-v1",
+        )
+
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    adapter = OnePerMinuteAdapter()
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        full=True,
+        page_size=1,
+        quota_clock=lambda: now[0],
+        batch_sleep=advance,
+    )
+
+    assert [len(call) for call in adapter.calls] == [1, 1]
+    assert sleeps == [60.0]
+    assert result.articles == 2
+    assert result.embeddings == 2
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT status, discovery_complete, reconciliation_complete,
+                   hosted_requests
+            FROM runs ORDER BY started_at DESC LIMIT 1
+            """
+        ).fetchone() == ("succeeded", True, True, 2)
+        assert db.execute(
+            "SELECT count(*) FROM hosted_request_reservations"
+        ).fetchone() == (1,)
+
+
+def test_full_run_quota_reservation_survives_pretransport_crash_and_replay(
+    tmp_path,
+):
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class OnePerMinuteAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_concurrency=1,
+            quota_max_requests=1,
+            client_configuration_version="synthetic-full-quota-crash-v1",
+        )
+
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    interrupted_adapter = OnePerMinuteAdapter()
+
+    def interrupt_after_reservation(_reservation_ids: tuple[str, ...]) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_embedding_pipeline(
+            config,
+            interrupted_adapter,
+            full=True,
+            page_size=1,
+            quota_clock=lambda: now[0],
+            failpoints=EmbeddingPipelineFailpoints(
+                after_quota_reservation=interrupt_after_reservation
+            ),
+        )
+
+    assert interrupted_adapter.calls == []
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    resumed_adapter = OnePerMinuteAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        full=True,
+        page_size=1,
+        quota_clock=lambda: now[0],
+        batch_sleep=advance,
+    )
+
+    assert sleeps == [60.0]
+    assert len(resumed_adapter.calls) == 1
+    assert resumed.succeeded == 1
+
+
+def test_full_run_replay_reuses_page_committed_before_interruption(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-FULL-QUOTA-REPLAY",
+        markdown="# Full quota replay page\n",
+    )
+    interrupted_adapter = RecordingBatchAdapter()
+    processed_pages = 0
+
+    def interrupt_between_pages(_page_size: int) -> None:
+        nonlocal processed_pages
+        processed_pages += 1
+        if processed_pages == 1:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_embedding_pipeline(
+            config,
+            interrupted_adapter,
+            full=True,
+            page_size=1,
+            failpoints=EmbeddingPipelineFailpoints(
+                after_full_processing_page=interrupt_between_pages
+            ),
+        )
+
+    assert len(interrupted_adapter.calls) == 1
+    resumed_adapter = RecordingBatchAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        full=True,
+        page_size=1,
+    )
+
+    assert [[item.value for item in call] for call in resumed_adapter.calls] == [
+        ["# Full quota replay page\n"]
+    ]
+    assert resumed.reused == 1
+    assert resumed.succeeded == 1
+
+
+def test_full_run_fatal_exchange_stops_later_pages_and_replay_resumes(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-FULL-QUOTA-FATAL",
+        markdown="# Full quota fatal page\n",
+    )
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:ZZZ-FULL-QUOTA-LATER",
+        markdown="# Full quota later page\n",
+    )
+    fatal = JinaHostedAdapterError(
+        "authentication", retryable=False, status_code=401
+    )
+
+    class ReplayableFatalAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_attempts=2,
+            client_configuration_version="synthetic-full-fatal-replay-v1",
+        )
+
+    adapter = ReplayableFatalAdapter([{}, fatal])
+
+    with pytest.raises(JinaHostedAdapterError, match="authentication"):
+        run_embedding_pipeline(config, adapter, full=True, page_size=1)
+
+    assert len(adapter.calls) == 2
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT status, hosted_requests, finished_at IS NOT NULL
+            FROM runs ORDER BY started_at DESC LIMIT 1
+            """
+        ).fetchone() == ("failed", 2, True)
+        assert db.execute(
+            "SELECT count(*) FROM embeddings WHERE modality = 'article_text'"
+        ).fetchone() == (1,)
+
+    resumed_adapter = ReplayableFatalAdapter()
+    resumed = run_embedding_pipeline(
+        config,
+        resumed_adapter,
+        full=True,
+        page_size=1,
+    )
+
+    assert [[item.value for item in call] for call in resumed_adapter.calls] == [
+        ["# Full quota fatal page\n"],
+        ["# Full quota later page\n"],
+    ]
+    assert resumed.reused == 1
+    assert resumed.succeeded == 2
 
 
 def test_hosted_source_hashes_and_response_model_survive_active_and_history(
@@ -1765,8 +2090,8 @@ def test_malformed_later_batch_persists_all_completed_hosted_telemetry(
         ]
 
 
-def test_pre_exchange_hosted_error_records_zero_hosted_telemetry(tmp_path):
-    """Break caught: a no-request packing failure invents hosted observations."""
+def test_pre_exchange_over_budget_item_records_zero_hosted_telemetry(tmp_path):
+    """Break caught: a local item rejection invents a request or fails the run."""
 
     config = write_generated_preprocessing_fixture(tmp_path)
 
@@ -1778,16 +2103,21 @@ def test_pre_exchange_hosted_error_records_zero_hosted_telemetry(tmp_path):
         )
 
     adapter = LocallyOversizedBatchAdapter()
-    with pytest.raises(JinaHostedAdapterError) as caught:
-        run_embedding_pipeline(
-            config,
-            adapter,
-            limit=1,
-            monotonic=iter((20.0, 23.0)).__next__,
-        )
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        monotonic=iter((20.0, 23.0)).__next__,
+    )
 
-    assert caught.value.code == "deterministic_request"
     assert adapter.calls == []
+    assert result == EmbeddingRunResult(
+        articles=1,
+        embeddings=0,
+        terminal=1,
+        header_absent=1,
+        elapsed_seconds=3.0,
+    )
     with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
         assert db.execute(
             """
@@ -1795,7 +2125,16 @@ def test_pre_exchange_hosted_error_records_zero_hosted_telemetry(tmp_path):
                    elapsed_seconds, finished_at IS NOT NULL
             FROM runs
             """
-        ).fetchone() == ("failed", 0, 0, "{}", 0, 3.0, True)
+        ).fetchone() == ("succeeded", 0, 0, "{}", 0, 3.0, True)
+        assert db.execute(
+            """
+            SELECT modality, state, attempt_count, error_code
+            FROM embedding_work_items ORDER BY modality
+            """
+        ).fetchall() == [
+            ("article_text", "terminal", 0, "deterministic_request"),
+            ("header_image", "not_applicable", 0, None),
+        ]
 
 
 def test_batched_replay_enters_attempt_two_and_terminalizes_at_durable_ceiling(
@@ -2053,12 +2392,112 @@ def test_rate_limited_batch_retries_in_run_and_reports_throttle(tmp_path):
     )
 
     assert [len(call) for call in adapter.calls] == [2, 2]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT count(*) FROM hosted_request_reservations"
+        ).fetchone() == (2,)
     assert sleeps == [2.5]
     assert result.embeddings == 3
     assert result.retryable == 0
     assert result.hosted_requests == 2
     assert result.retries == 2
     assert result.throttles == 1
+
+
+def test_mixed_batch_reserves_combined_text_and_image_token_estimate(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    attach_generated_header_image(config, b"generated quota image")
+    adapter = RecordingBatchAdapter()
+
+    run_embedding_pipeline(config, adapter, limit=1)
+
+    expected = sum(item.estimated_tokens for item in adapter.calls[0])
+    assert {item.kind for item in adapter.calls[0]} == {"text", "image"}
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT estimated_tokens FROM hosted_request_reservations
+            """
+        ).fetchall() == [(expected,)]
+
+
+def test_provider_input_usage_increases_quota_debt_before_next_wave(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    add_generated_embedding_article(
+        config,
+        article_id="wsj:SYNTHETIC-USAGE-QUOTA",
+        markdown="# Usage quota\n",
+    )
+
+    class ObservedUsageAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            batch_max_items=1,
+            batch_max_estimated_tokens=50,
+            batch_max_concurrency=1,
+            quota_max_requests=90,
+            quota_max_estimated_tokens=50,
+            client_configuration_version="synthetic-observed-usage-v1",
+        )
+
+        def embed_batch(self, inputs, *, limits):
+            response = super().embed_batch(inputs, limits=limits)
+            return replace(
+                response,
+                usage={"input_tokens": 50, "total_tokens": 50},
+            )
+
+    now = [datetime(2026, 8, 13, 12, 0, tzinfo=UTC)]
+    sleeps: list[float] = []
+
+    def advance(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += timedelta(seconds=seconds)
+
+    run_embedding_pipeline(
+        config,
+        ObservedUsageAdapter(),
+        limit=2,
+        quota_clock=lambda: now[0],
+        batch_sleep=advance,
+    )
+
+    assert sleeps == [60.0]
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT observed_input_tokens
+            FROM hosted_request_reservations
+            ORDER BY reserved_at, reservation_id
+            """
+        ).fetchall() == [(50,)]
+
+
+def test_unsafe_provider_input_usage_is_ignored_without_losing_success(tmp_path):
+    """Break caught: absurd provider usage aborts after a successful exchange."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+
+    class UnsafeObservedUsageAdapter(RecordingBatchAdapter):
+        def embed_batch(self, inputs, *, limits):
+            response = super().embed_batch(inputs, limits=limits)
+            return replace(
+                response,
+                usage={"input_tokens": 1_000_000_001, "total_tokens": 1},
+            )
+
+    result = run_embedding_pipeline(
+        config,
+        UnsafeObservedUsageAdapter(),
+        limit=1,
+    )
+
+    assert result.embeddings == 1
+    assert result.succeeded == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            "SELECT observed_input_tokens FROM hosted_request_reservations"
+        ).fetchall() == [(None,)]
 
 
 def test_indexed_deterministic_image_retries_alone_to_durable_limit(tmp_path):
@@ -2109,6 +2548,54 @@ def test_indexed_deterministic_image_retries_alone_to_durable_limit(tmp_path):
     assert replay.calls == []
     assert replay_result.reused == 1
     assert replay_result.terminal == 1
+
+
+def test_over_token_budget_header_is_terminal_without_losing_text_sibling(
+    tmp_path,
+):
+    """Break caught: a valid 2,000px image aborts the whole hosted scheduler."""
+
+    config = write_generated_preprocessing_fixture(tmp_path)
+    source_bytes = b"generated large but valid image"
+    attach_generated_header_image(config, source_bytes)
+    codec = ScenarioImageCodec(
+        {source_bytes: ImageInfo("PNG", 2_000, 2_000)}
+    )
+
+    class LargeImageBatchAdapter(RecordingBatchAdapter):
+        profile = replace(
+            RecordingBatchAdapter.profile,
+            image_input_rules=ScenarioImageCodec.input_rules,
+            image_transform=ScenarioImageCodec.transform_id,
+            client_configuration_version="synthetic-large-image-budget-v1",
+        )
+
+    adapter = LargeImageBatchAdapter()
+    result = run_embedding_pipeline(
+        config,
+        adapter,
+        limit=1,
+        image_codec=codec,
+    )
+
+    assert [[item.kind for item in call] for call in adapter.calls] == [["text"]]
+    assert result.succeeded == 1
+    assert result.terminal == 1
+    assert result.header_failed == 1
+    with duckdb.connect(str(config.embedding_catalog), read_only=True) as db:
+        assert db.execute(
+            """
+            SELECT modality, state, attempt_count, error_code
+            FROM embedding_work_items
+            ORDER BY modality
+            """
+        ).fetchall() == [
+            ("article_text", "succeeded", 1, None),
+            ("header_image", "terminal", 0, "deterministic_request"),
+        ]
+        assert db.execute(
+            "SELECT modality FROM embeddings ORDER BY modality"
+        ).fetchall() == [("article_text",)]
 
 
 @pytest.mark.parametrize("code", ("authentication", "authorization"))
@@ -7626,7 +8113,7 @@ def test_rendition_cleanup_checks_one_candidate_and_preserves_history(tmp_path):
     assert not (namespace / orphan_name).exists()
 
 
-def test_embedding_catalog_has_exact_version_sixteen_observed_model_schema(
+def test_embedding_catalog_has_exact_version_seventeen_quota_schema(
     tmp_path,
 ):
     database_path = tmp_path / "catalog.duckdb"
@@ -7708,6 +8195,7 @@ def test_embedding_catalog_has_exact_version_sixteen_observed_model_schema(
         "embedding_configurations": "BASE TABLE",
         "embedding_generation_history": "BASE TABLE",
         "full_run_articles": "BASE TABLE",
+        "hosted_request_reservations": "BASE TABLE",
         "image_input_provenance": "BASE TABLE",
         "embedding_work_items": "VIEW",
         "embedding_work_storage": "BASE TABLE",
@@ -7724,7 +8212,226 @@ def test_embedding_catalog_has_exact_version_sixteen_observed_model_schema(
     assert view_columns == EXPECTED_EMBEDDING_VIEW_COLUMNS
     assert constraints == expected_constraints
     assert indexes == []
-    assert metadata == [("schema_version", "16")]
+    assert metadata == [("schema_version", "17")]
+
+
+def test_catalog_reserves_dual_rolling_quota_and_expires_old_capacity(tmp_path):
+    database_path = tmp_path / "catalog.duckdb"
+    profile = FakeEmbeddingAdapter.profile
+    configuration_identifier = configuration_id(profile)
+    started = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+
+    with EmbeddingCatalog.open(database_path) as catalog:
+        with catalog.transaction():
+            catalog.begin_run("run-quota", configuration_identifier, profile, 1)
+        reservation_ids: list[str] = []
+        for _ in range(45):
+            with catalog.transaction():
+                decision = catalog.reserve_hosted_requests(
+                    run_id="run-quota",
+                    configuration_identifier=configuration_identifier,
+                    estimated_tokens=(1_000, 1_000),
+                    reserved_at=started,
+                    profile=profile,
+                )
+            assert decision.retry_after_seconds == 0.0
+            reservation_ids.extend(decision.reservation_ids)
+
+        with catalog.transaction():
+            blocked = catalog.reserve_hosted_requests(
+                run_id="run-quota",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(1,),
+                reserved_at=started,
+                profile=profile,
+            )
+        assert blocked.reservation_ids == ()
+        assert blocked.retry_after_seconds == 60.0
+
+        with catalog.transaction():
+            admitted = catalog.reserve_hosted_requests(
+                run_id="run-quota",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(45_000,),
+                reserved_at=started + timedelta(seconds=60),
+                profile=profile,
+            )
+        assert len(admitted.reservation_ids) == 1
+        assert admitted.retry_after_seconds == 0.0
+
+        with catalog.transaction():
+            catalog.reconcile_hosted_request_usage(
+                reservation_ids=admitted.reservation_ids,
+                observed_input_tokens=45_001,
+            )
+        assert catalog.connection.execute(
+            """
+            SELECT estimated_tokens, observed_input_tokens
+            FROM hosted_request_reservations
+            WHERE reservation_id = ?
+            """,
+            [admitted.reservation_ids[0]],
+        ).fetchone() == (45_000, 45_001)
+        assert catalog.connection.execute(
+            "SELECT count(*) FROM hosted_request_reservations"
+        ).fetchone() == (1,)
+        assert len(reservation_ids) == 90
+
+
+def test_catalog_admits_two_maximum_requests_but_blocks_a_third(tmp_path):
+    database_path = tmp_path / "catalog.duckdb"
+    profile = FakeEmbeddingAdapter.profile
+    configuration_identifier = configuration_id(profile)
+    started = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+
+    with EmbeddingCatalog.open(database_path) as catalog:
+        with catalog.transaction():
+            catalog.begin_run("run-wave", configuration_identifier, profile, 1)
+            admitted = catalog.reserve_hosted_requests(
+                run_id="run-wave",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(45_000, 45_000),
+                reserved_at=started,
+                profile=profile,
+            )
+        with catalog.transaction():
+            blocked = catalog.reserve_hosted_requests(
+                run_id="run-wave",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(1,),
+                reserved_at=started,
+                profile=profile,
+            )
+
+    assert len(admitted.reservation_ids) == 2
+    assert blocked == embedding_catalog_module.QuotaReservationDecision((), 60.0)
+
+
+def test_catalog_fails_closed_on_future_dated_quota_reservation(tmp_path):
+    database_path = tmp_path / "catalog.duckdb"
+    profile = FakeEmbeddingAdapter.profile
+    configuration_identifier = configuration_id(profile)
+    now = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+
+    with EmbeddingCatalog.open(database_path) as catalog:
+        with catalog.transaction():
+            catalog.begin_run("run-future-quota", configuration_identifier, profile, 1)
+            catalog.connection.execute(
+                """
+                INSERT INTO hosted_request_reservations
+                    (reservation_id, run_id, configuration_id, reserved_at,
+                     estimated_tokens, observed_input_tokens)
+                VALUES ('future', 'run-future-quota', ?, ?, 1, NULL)
+                """,
+                [configuration_identifier, now + timedelta(seconds=1)],
+            )
+
+        with (
+            pytest.raises(
+                EmbeddingCatalogError,
+                match="invalid hosted quota reservation state",
+            ),
+            catalog.transaction(),
+        ):
+            catalog.reserve_hosted_requests(
+                run_id="run-future-quota",
+                configuration_identifier=configuration_identifier,
+                estimated_tokens=(1,),
+                reserved_at=now,
+                profile=profile,
+            )
+
+
+def test_validator_rejects_malformed_hosted_quota_reservation(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, RecordingBatchAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            UPDATE hosted_request_reservations
+            SET observed_input_tokens = estimated_tokens - 1
+            """
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_hosted_quota_reservation" in codes
+
+
+def test_validator_rejects_future_dated_hosted_quota_reservation(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    run_embedding_pipeline(config, RecordingBatchAdapter(), limit=1)
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute(
+            """
+            UPDATE hosted_request_reservations
+            SET reserved_at = current_timestamp + INTERVAL 1 DAY
+            """
+        )
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_hosted_quota_reservation" in codes
+
+
+@pytest.mark.parametrize(
+    "profile_changes",
+    (
+        {"quota_max_requests": 0},
+        {"quota_max_estimated_tokens": -1},
+        {"quota_window_seconds": 0},
+        {"quota_max_requests": 1, "batch_max_concurrency": 2},
+        {
+            "quota_max_estimated_tokens": 1_999,
+            "batch_max_estimated_tokens": 1_000,
+            "batch_max_concurrency": 2,
+        },
+    ),
+)
+def test_validator_rejects_malformed_hosted_quota_policy(
+    tmp_path, profile_changes
+):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    profile = replace(
+        FakeEmbeddingAdapter.profile,
+        **profile_changes,
+        client_configuration_version="synthetic-invalid-quota-policy-v1",
+    )
+    identifier = configuration_id(profile)
+    with (
+        EmbeddingCatalog.open(config.embedding_catalog) as catalog,
+        catalog.transaction(),
+    ):
+        catalog.begin_run("invalid-quota-run", identifier, profile, 0)
+
+    codes = {issue.code for issue in validate_embedding_outputs(config).issues}
+
+    assert "invalid_hosted_quota_policy" in codes
+
+
+def test_pipeline_refuses_exact_version_sixteen_catalog_without_migration(tmp_path):
+    config = write_generated_preprocessing_fixture(tmp_path)
+    config.embedding_output_root.mkdir()
+    with EmbeddingCatalog.open(config.embedding_catalog):
+        pass
+    with duckdb.connect(str(config.embedding_catalog)) as db:
+        db.execute("DROP TABLE hosted_request_reservations")
+        for column in (
+            "quota_max_requests",
+            "quota_max_estimated_tokens",
+            "quota_window_seconds",
+        ):
+            db.execute(
+                f"ALTER TABLE embedding_configurations DROP COLUMN {column}"
+            )
+        db.execute("UPDATE metadata SET value = '16' WHERE key = 'schema_version'")
+    before = config.embedding_catalog.read_bytes()
+
+    with pytest.raises(EmbeddingCatalogError, match="unsupported embedding catalog"):
+        run_embedding_pipeline(config, FakeEmbeddingAdapter(), limit=1)
+
+    assert config.embedding_catalog.read_bytes() == before
 
 
 def test_pipeline_refuses_exact_version_fifteen_catalog_without_migration(
@@ -7764,6 +8471,7 @@ def test_pipeline_refuses_exact_version_fourteen_catalog_without_migration(
         pass
     with duckdb.connect(str(config.embedding_catalog)) as db:
         db.execute("DROP VIEW embeddings")
+        db.execute("DROP TABLE hosted_request_reservations")
         for column in (
             "derivation_kind",
             "raw_response_sha256",
@@ -7847,11 +8555,15 @@ def test_pipeline_refuses_exact_version_fourteen_catalog_without_migration(
                     "configuration_id",
                     "model",
                     "observed_model",
-                    "client_api_contract_version",
-                    "batch_max_response_bytes",
+                        "client_api_contract_version",
+                        "batch_max_response_bytes",
+                        "quota_max_requests",
+                        "quota_max_estimated_tokens",
+                        "quota_window_seconds",
                 }
             ),
         )
+        expected_v14.pop("hosted_request_reservations")
         for table, columns in tuple(expected_v14.items()):
             excluded = {
                 "embedding_storage": {
@@ -8139,6 +8851,7 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
         db.execute("DROP TABLE full_run_articles")
         db.execute("DROP TABLE image_input_provenance")
         db.execute("DROP TABLE long_text_part_generations")
+        db.execute("DROP TABLE hosted_request_reservations")
         db.execute(
             "ALTER TABLE embedding_work_storage RENAME TO embedding_work_items"
         )
@@ -8158,6 +8871,9 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             "batch_max_attempts",
             "batch_initial_backoff_seconds",
             "batch_max_backoff_seconds",
+            "quota_max_requests",
+            "quota_max_estimated_tokens",
+            "quota_window_seconds",
         ):
             db.execute(
                 f"ALTER TABLE embedding_configurations DROP COLUMN {column}"
@@ -8198,6 +8914,7 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
             "image_input_provenance",
             "long_text_part_generations",
             "reconciliation_actions",
+            "hosted_request_reservations",
         }
         v8_table_names = {
             "embedding_work_storage": "embedding_work_items",
@@ -8226,6 +8943,9 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
                 "batch_max_attempts",
                 "batch_initial_backoff_seconds",
                 "batch_max_backoff_seconds",
+                "quota_max_requests",
+                "quota_max_estimated_tokens",
+                "quota_window_seconds",
             }
         )
         expected_v8_columns["runs"] = tuple(
@@ -8414,6 +9134,9 @@ def test_pipeline_refuses_exact_version_eight_catalog_without_migration(tmp_path
                 "batch_max_attempts",
                 "batch_initial_backoff_seconds",
                 "batch_max_backoff_seconds",
+                "quota_max_requests",
+                "quota_max_estimated_tokens",
+                "quota_window_seconds",
             }
         )
 

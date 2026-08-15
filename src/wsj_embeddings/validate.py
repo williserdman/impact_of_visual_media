@@ -56,6 +56,7 @@ from wsj_embeddings.pipeline import (
     _vector_hash,
     _verified_source_vector,
 )
+from wsj_embeddings.quota import hosted_quota_policy_is_valid
 from wsj_embeddings.run_metrics import safe_usage_is_valid
 from wsj_embeddings.source_image import (
     SourceImageError,
@@ -740,6 +741,7 @@ def _validate_configurations(
     issues: list[EmbeddingValidationIssue],
 ) -> None:
     invalid = False
+    invalid_quota_policy = False
     rows = stream_rows(
         connection,
         """
@@ -753,6 +755,8 @@ def _validate_configurations(
                batch_max_response_bytes,
                batch_max_concurrency, batch_max_attempts,
                batch_initial_backoff_seconds, batch_max_backoff_seconds,
+               quota_max_requests, quota_max_estimated_tokens,
+               quota_window_seconds,
                image_input_rules,
                image_transform, multimodal_formula,
                client_configuration_version
@@ -782,21 +786,33 @@ def _validate_configurations(
             batch_max_attempts=row[19],
             batch_initial_backoff_seconds=row[20],
             batch_max_backoff_seconds=row[21],
-            image_input_rules=row[22],
-            image_transform=row[23],
-            multimodal_formula=row[24],
-            client_configuration_version=row[25],
+            quota_max_requests=row[22],
+            quota_max_estimated_tokens=row[23],
+            quota_window_seconds=row[24],
+            image_input_rules=row[25],
+            image_transform=row[26],
+            multimodal_formula=row[27],
+            client_configuration_version=row[28],
         )
         if (
             row[0] != profile_configuration_id(profile)
             or not _is_safe_response_model(row[2])
         ):
             invalid = True
+        if not hosted_quota_policy_is_valid(profile):
+            invalid_quota_policy = True
     if invalid:
         issues.append(
             EmbeddingValidationIssue(
                 "invalid_configuration_id",
                 "embedding configurations do not match their profile identity",
+            )
+        )
+    if invalid_quota_policy:
+        issues.append(
+            EmbeddingValidationIssue(
+                "invalid_hosted_quota_policy",
+                "embedding configurations contain an invalid hosted quota policy",
             )
         )
     if connection.execute(
@@ -810,6 +826,30 @@ def _validate_configurations(
             EmbeddingValidationIssue(
                 "missing_run_configuration_reference",
                 "embedding runs lack a configuration reference",
+            )
+        )
+    if connection.execute(
+        """
+        SELECT count(*)
+        FROM hosted_request_reservations AS reservation
+        LEFT JOIN runs USING (run_id)
+        LEFT JOIN embedding_configurations AS configuration
+          ON configuration.configuration_id = reservation.configuration_id
+        WHERE runs.run_id IS NULL
+           OR configuration.configuration_id IS NULL
+           OR runs.configuration_id != reservation.configuration_id
+           OR reservation.reserved_at > current_timestamp
+           OR reservation.estimated_tokens < 0
+           OR reservation.estimated_tokens
+                > configuration.batch_max_estimated_tokens
+           OR reservation.observed_input_tokens < reservation.estimated_tokens
+           OR reservation.observed_input_tokens > 1000000000
+        """
+    ).fetchone()[0]:
+        issues.append(
+            EmbeddingValidationIssue(
+                "invalid_hosted_quota_reservation",
+                "hosted request reservations violate quota identity or numeric bounds",
             )
         )
     if connection.execute(

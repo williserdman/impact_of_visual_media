@@ -88,10 +88,10 @@ flowchart LR
 10. The downstream coordinator reads the winning `articles` row and canonical
     Markdown without mutating preprocessing. Before any selected work is
     registered, it resolves the three pairwise-disjoint roots, verifies schema
-    version 16, and registers the immutable configuration. Its
+    version 17, and registers the immutable configuration. Its
     `configuration_id` binds the requested and observed model, tokenizer and
-    long-text rules, batching policy, image policy, multimodal formula, and
-    client contract.
+    long-text rules, batching and proactive quota policy, image policy,
+    multimodal formula, and client contract.
 11. In separate bounded transactions, each applicable modality becomes
     durably `eligible`, then admitted work becomes `queued`. This is the first
     replay boundary: interruption before admission leaves eligible work;
@@ -172,8 +172,8 @@ are valid only with that scope. Configuration defaults to four workers.
 | `wsj_embeddings/canonical_markdown.py` | descriptor-relative, no-follow, replacement-detecting canonical Markdown reads | preprocessing publication |
 | `wsj_embeddings/source_image.py` | descriptor-relative, no-follow, replacement-detecting local header-image reads | remote URL retrieval |
 | `wsj_embeddings/image_rendition.py` | bounded image decode, exact-byte eligibility, deterministic Pillow rendition, and atomic derived-file installation | source-image mutation or hosted requests |
-| `wsj_embeddings/batching.py` | mixed-input payload packing, bounded concurrency, rate-aware retry waves, and safe observations | HTTP serialization or catalog publication |
-| `wsj_embeddings/catalog.py` | separate schema version 16, canonical current views, and bounded lifecycle/generation/provenance/reconciliation transactions | preprocessing catalog mutation or hosted calls |
+| `wsj_embeddings/batching.py` | mixed-input payload packing, bounded concurrency, proactive-admission callbacks, rate-aware retry waves, and safe observations | HTTP serialization or catalog publication |
+| `wsj_embeddings/catalog.py` | separate schema version 17, durable hosted reservations, canonical current views, and bounded lifecycle/generation/provenance/reconciliation transactions | preprocessing catalog mutation or hosted calls |
 | `wsj_embeddings/pipeline.py` | the coordinator: read-only eligibility inventory, authorization gate, bounded selection/traversal, modality orchestration, publication, and reconciliation | hosted credential loading or transport implementation |
 | `wsj_embeddings/validate.py` | read-only schema, corpus coverage, cross-catalog, provenance, hash, metadata, and vector checks | repair |
 | `wsj_embeddings/smoke.py` | generated canonical fixture and unchanged-input assertion | licensed archive access |
@@ -315,10 +315,10 @@ ORDER BY published_at_utc, article_id;
 
 The embedding pipeline writes a second `catalog.duckdb` only below its disjoint
 embedding output root. It never adds fields or tables to the preprocessing
-catalog. Embedding schema version 16 has exactly thirteen base tables, two
+catalog. Embedding schema version 17 has exactly fourteen base tables, two
 canonical views, and no indexes. Exact validation includes normalized
 behavior-bearing SQL fingerprints for both views, so a same-column view that
-bypasses the visibility overlay is malformed. Versions 1 through 15 and
+bypasses the visibility overlay is malformed. Versions 1 through 16 and
 malformed output are refused without migration. `full_run_articles` stores
 only run/article identity and the optional source-relative header association,
 never Markdown or image bytes.
@@ -326,9 +326,10 @@ never Markdown or image bytes.
 | Table | Ordered columns and DuckDB types | Primary key |
 |---|---|---|
 | `metadata` | `key VARCHAR`, `value VARCHAR` | `key` |
-| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `client_api_contract_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_response_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
+| `embedding_configurations` | `configuration_id VARCHAR`, `model VARCHAR`, `observed_model VARCHAR`, `client_api_contract_version VARCHAR`, `task VARCHAR`, `dimensions INTEGER`, `output_type VARCHAR`, `normalization VARCHAR`, `tokenizer_revision VARCHAR`, `tokenizer_engine VARCHAR`, `context_token_limit INTEGER`, `context_rules VARCHAR`, `long_text_aggregation VARCHAR`, `long_text_part_attempt_limit INTEGER`, `batch_max_items INTEGER`, `batch_max_estimated_tokens INTEGER`, `batch_max_encoded_bytes BIGINT`, `batch_max_response_bytes BIGINT`, `batch_max_concurrency INTEGER`, `batch_max_attempts INTEGER`, `batch_initial_backoff_seconds DOUBLE`, `batch_max_backoff_seconds DOUBLE`, `quota_max_requests INTEGER`, `quota_max_estimated_tokens INTEGER`, `quota_window_seconds INTEGER`, `image_input_rules VARCHAR`, `image_transform VARCHAR`, `multimodal_formula VARCHAR`, `client_configuration_version VARCHAR` | `configuration_id` |
 | `runs` | `run_id VARCHAR`, `configuration_id VARCHAR`, `scope VARCHAR`, `status VARCHAR`, `discovery_complete BOOLEAN`, `reconciliation_complete BOOLEAN`, `articles INTEGER`, `embeddings INTEGER`, `reused INTEGER`, `attempted INTEGER`, `succeeded INTEGER`, `retryable INTEGER`, `terminal INTEGER`, `interrupted INTEGER`, `header_absent INTEGER`, `header_failed INTEGER`, `hosted_requests INTEGER`, `hosted_retries INTEGER`, `usage_json VARCHAR`, `throttles INTEGER`, `elapsed_seconds DOUBLE`, `started_at TIMESTAMPTZ`, `finished_at TIMESTAMPTZ` | `run_id` |
 | `full_run_articles` | `run_id VARCHAR`, `article_id VARCHAR`, `header_image_path VARCHAR` | `(run_id, article_id)` |
+| `hosted_request_reservations` | `reservation_id VARCHAR`, `run_id VARCHAR`, `configuration_id VARCHAR`, `reserved_at TIMESTAMPTZ`, `estimated_tokens INTEGER`, `observed_input_tokens INTEGER` | `reservation_id` |
 | `embedding_work_storage` | physical columns exposed by `embedding_work_items` | `(article_id, modality, configuration_id)` |
 | `embedding_storage` | physical columns exposed by `embeddings` | `(article_id, modality, configuration_id)` |
 | `reconciliation_actions` | exact target disposition and expected source/input/state/generation/vector identity plus `staged_at` | `(run_id, article_id, modality, configuration_id)` |
@@ -361,8 +362,9 @@ and implemented-against API
 contract version,
 task, dimensions, output type, normalization, tokenizer artifact/engine,
 context rules/ceiling, long-text aggregation/attempt limit, batching
-payload/response/concurrency/retry policy, image rules/transform, multimodal formula,
-and client configuration version. Production runs require the pilot observation
+payload/response/concurrency/retry policy, proactive request/token/window
+quota, image rules/transform, multimodal formula, and client configuration
+version. Production runs require the pilot observation
 before output mutation, and each hosted generation must return that exact model
 or fail content-free without publication. Hosted generations retain SHA-256 for canonical compact
 JSON bytes of the raw embedding array and for normalized little-endian float32
@@ -479,6 +481,35 @@ response ceiling. At most the immutable profile's request concurrency is
 active. Indexed results are validated and committed one item at a time on the
 coordinator as each wave response is processed, before any later retry sleep or
 wave; a response cannot publish against the wrong payload index.
+
+Before each hosted wave, the coordinator reserves every request and its summed
+estimated input-token cost in `hosted_request_reservations`. The immutable
+policy allows at most 90 reservations and 90,000 effective input tokens in a
+rolling 60-second window, at most 45,000 estimated tokens per request, and two
+concurrent requests. Text estimates use the pinned tokenizer; image estimates
+use `ceil(width / 28) * ceil(height / 28) * 10`. Safe returned input usage may
+increase an associated reservation but never lower its estimate; malformed or
+implausibly large usage is ignored for quota accounting. Policy validation
+requires positive request, token, and window limits and ensures one configured
+request/concurrency wave can fit. An input that cannot fit the request ceiling
+becomes an item-local terminal outcome without preventing valid siblings.
+
+An inadmissible wave waits until the earliest point at which enough request and
+token debt has expired. The reservation transaction closes before sleeping;
+after admission, attempt checkpoints commit immediately before transport.
+Expired reservations are removed in bounded pages during later admissions, so
+they remain minimal operational state rather than permanent request history.
+
+Every transport retry reserves again. A committed reservation is deliberately
+not refunded after a transport/fatal outcome or crash before transmission; a
+replay may therefore wait for at most the 60-second window. This conservative
+state survives coordinator restarts and full-run page boundaries. It
+coordinates only processes sharing this catalog/output and cannot see another
+client using the same account. The generated pilot applies the same pure
+earliest-safe calculation in memory across all probes. It authenticates with
+the generated 224x224 PNG before loading the pinned tokenizer, then counts normal,
+boundary, and concurrency text before reservation and transport. It retains
+its no-catalog/no-output contract.
 
 Durable prior attempts reduce each item's remaining budget. Retryable request
 or indexed-item failures use bounded exponential backoff plus production jitter
@@ -730,6 +761,8 @@ access and is not migrated, repaired, or overwritten.
 | before configuration/work registration commits | no selected work is visible | rerun registers the immutable configuration and `eligible` item |
 | after `eligible` or `queued` commits | durable attemptable work with no unproven success | rerun admits or resumes it without discarding provenance |
 | after `in_progress`, before a classified outcome | attempt start and count remain; recovered abandoned work becomes `interrupted` | rerun admits the interruption subject to its remaining budget |
+| after hosted quota reservation, before transport | content-free request/token debt remains, with no claimed vector outcome | rerun waits for any remaining portion of the 60-second window, then resumes |
+| one item exceeds the immutable request token/byte ceiling | that item becomes content-free `terminal` without a hosted attempt; valid siblings remain schedulable | ordinary replay preserves the terminal item and reuses completed siblings |
 | retryable provider, transport, or indexed-item result | `retryable` with safe status/retry metadata and committed attempt count | later admission retries only that item |
 | deterministic indexed image rejection before its limit | retryable image checkpoint; successful sibling text remains current | later admission spends only the image's remaining attempt budget |
 | deterministic item rejection at its limit, unsafe local image, or request-wide deterministic rejection | `terminal`, no placeholder vector; a request-wide rejection first terminalizes every unresolved indexed item | ordinary replay reuses the terminal disposition and does not repurchase it |
@@ -931,7 +964,7 @@ README queries, and this glossary together. Decide explicitly whether the
 modality is provider-backed or locally derived; a local modality must name and
 validate its source generations and must not invent hosted response provenance.
 
-### Change embedding schema version 16
+### Change embedding schema version 17
 
 Start with exact relation/column/key/constraint/view-SQL tests and refusal tests
 for the previous and malformed schemas. Then update `wsj_embeddings/catalog.py`

@@ -381,7 +381,7 @@ class JinaEmbeddingAdapter:
         image_transform=PRODUCTION_IMAGE_TRANSFORM_ID,
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
         batch_max_response_bytes=2_000_000,
-        client_configuration_version="wsj-embeddings-config-v5",
+        client_configuration_version="wsj-embeddings-config-v6",
     )
     rate_aware_batching = True
 
@@ -954,7 +954,7 @@ class FakeEmbeddingAdapter:
         image_input_rules=PRODUCTION_IMAGE_INPUT_RULES,
         image_transform=PRODUCTION_IMAGE_TRANSFORM_ID,
         multimodal_formula="l2-normalize-0.5-text-0.5-image-v1",
-        client_configuration_version="wsj-embeddings-config-v5",
+        client_configuration_version="wsj-embeddings-config-v6",
     )
     image_codec = FixturePassthroughImageCodec()
 
